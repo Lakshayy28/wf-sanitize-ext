@@ -1,0 +1,55 @@
+{
+  "name": "safe-copilot-context",
+  "displayName": "Safe Copilot Context",
+  "description": "A security-focused Chat Participant that sanitizes sensitive context before sending it to GitHub Copilot.",
+  "version": "0.0.1",
+  "publisher": "safechat",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Chat",
+    "Other"
+  ],
+  "keywords": [
+    "copilot",
+    "security",
+    "sanitizer",
+    "pii",
+    "secrets"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "safecopilot.safeChat",
+        "name": "safechat",
+        "fullName": "Safe Copilot Context",
+        "description": "Sanitizes context before sending to Copilot",
+        "isSticky": true
+      }
+    ],
+    "commands": [
+      {
+        "command": "safecopilot.viewDiff",
+        "title": "View Masked Diff"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.0"
+  }
+}
