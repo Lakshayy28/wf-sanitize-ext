@@ -37,61 +37,66 @@ exports.regexSanitize = regexSanitize;
 exports.sanitizeAndCache = sanitizeAndCache;
 exports.viewDiffCommand = viewDiffCommand;
 const vscode = __importStar(require("vscode"));
-const child_process_1 = require("child_process");
-const path = __importStar(require("path"));
-// ────────────────────────────────────────────────────────────────────────────
-// Presidio NLP bridge (Tier 1 — advanced PII masking)
-// ────────────────────────────────────────────────────────────────────────────
+const http = __importStar(require("http"));
+const https = __importStar(require("https"));
+/** Reads the configured Presidio server base URL from VS Code settings. */
+function getPresidioApiUrl() {
+    const config = vscode.workspace.getConfiguration('safechat');
+    return (config.get('presidioApiUrl') || 'http://localhost:8000').replace(/\/$/, '');
+}
 /**
- * Spawns the Presidio Python engine as a child process.
- * Sends `text` via stdin, collects anonymized output from stdout.
- *
- * Rejects if:
- *  - Python is not installed
- *  - Presidio dependencies are missing (exit code 2)
- *  - The process errors out for any other reason
- *
- * Prerequisites (remind developers):
- *   pip install presidio-analyzer presidio-anonymizer
- *   python -m spacy download en_core_web_lg
+ * Calls the `/sanitize` endpoint on the running Presidio HTTP server.
+ * Rejects if the server is unreachable or returns a non-2xx status.
  */
-function runPresidio(text, extensionPath) {
+function callPresidioApi(text) {
     return new Promise((resolve, reject) => {
-        const scriptPath = path.join(extensionPath, 'src', 'presidio_engine.py');
-        // Resolve Python interpreter — prefer the bundled .venv, then system python3/python.
-        const venvPython = path.join(extensionPath, '.venv', process.platform === 'win32' ? path.join('Scripts', 'python.exe') : path.join('bin', 'python'));
-        const systemPython = process.platform === 'win32' ? 'python' : 'python3';
-        const pythonBin = require('fs').existsSync(venvPython) ? venvPython : systemPython;
-        const child = (0, child_process_1.spawn)(pythonBin, [scriptPath], {
-            stdio: ['pipe', 'pipe', 'pipe'],
+        const baseUrl = getPresidioApiUrl();
+        let urlObj;
+        try {
+            urlObj = new URL('/sanitize', baseUrl);
+        }
+        catch {
+            reject(new Error(`Invalid presidioApiUrl: ${baseUrl}`));
+            return;
+        }
+        const body = JSON.stringify({ text });
+        const options = {
+            hostname: urlObj.hostname,
+            port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+            path: urlObj.pathname,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+            },
+        };
+        const transport = urlObj.protocol === 'https:' ? https : http;
+        const req = transport.request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk.toString(); });
+            res.on('end', () => {
+                if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+                    try {
+                        resolve(JSON.parse(data));
+                    }
+                    catch {
+                        reject(new Error(`Invalid JSON from Presidio server: ${data.slice(0, 200)}`));
+                    }
+                }
+                else {
+                    reject(new Error(`Presidio server returned HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+                }
+            });
         });
-        let stdout = '';
-        let stderr = '';
-        child.stdout.on('data', (chunk) => {
-            stdout += chunk.toString();
+        req.on('error', (err) => {
+            reject(new Error(`Presidio server unreachable at ${baseUrl}: ${err.message}`));
         });
-        child.stderr.on('data', (chunk) => {
-            stderr += chunk.toString();
+        req.setTimeout(10000, () => {
+            req.destroy();
+            reject(new Error('Presidio server request timed out after 10 s'));
         });
-        child.on('error', (err) => {
-            // Typically "ENOENT" — python not found on PATH
-            reject(new Error(`Failed to launch Python: ${err.message}`));
-        });
-        child.on('close', (code) => {
-            if (code === 0) {
-                resolve(stdout);
-            }
-            else if (code === 2) {
-                // Special exit code from presidio_engine.py → Presidio not installed
-                reject(new Error('Presidio is not installed on this machine.'));
-            }
-            else {
-                reject(new Error(`Presidio process exited with code ${code}: ${stderr.trim()}`));
-            }
-        });
-        // Write the raw text to the child's stdin and close the stream.
-        child.stdin.write(text);
-        child.stdin.end();
+        req.write(body);
+        req.end();
     });
 }
 // ────────────────────────────────────────────────────────────────────────────
@@ -211,19 +216,19 @@ async function ensureCacheRoot(baseUri) {
  *  3. The regex pass always runs *after* Presidio to catch secrets that
  *     NLP alone might miss (e.g., `api_key=...` patterns).
  */
-async function sanitizeAndCache(rawText, extensionPath) {
+async function sanitizeAndCache(rawText, _extensionPath) {
     let presidioText = rawText;
     let presidioModified = false;
-    // ── Tier 1: Presidio NLP masking ───────────────────────────────────
-    if (extensionPath) {
-        try {
-            presidioText = await runPresidio(rawText, extensionPath);
-            presidioModified = presidioText !== rawText;
-        }
-        catch {
-            // Presidio unavailable — continue with regex-only.
-            // This is expected on machines without Python / Presidio.
-        }
+    let presidioError;
+    // ── Tier 1: Presidio API masking ────────────────────────────────────
+    try {
+        const result = await callPresidioApi(rawText);
+        presidioText = result.sanitized_text;
+        presidioModified = result.was_modified;
+    }
+    catch (err) {
+        // Server unreachable or returned an error — fall back to regex.
+        presidioError = err instanceof Error ? err.message : String(err);
     }
     // ── Tier 2: Regex secret masking (always runs as a second pass) ────
     const { cleanText, wasModified: regexModified } = regexSanitize(presidioText);
@@ -245,10 +250,10 @@ async function sanitizeAndCache(rawText, extensionPath) {
             // Update the in-memory pointer so the command-palette fallback works
             // after an extension reload (no button argument available then).
             latestCacheEntryUri = entryDir;
-            return { cleanText, wasModified, cacheEntryUri: entryDir };
+            return { cleanText, wasModified, cacheEntryUri: entryDir, presidioError };
         }
     }
-    return { cleanText, wasModified };
+    return { cleanText, wasModified, presidioError };
 }
 /**
  * Opens the VS Code diff editor comparing the original and masked context files.

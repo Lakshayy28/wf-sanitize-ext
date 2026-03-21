@@ -1,75 +1,78 @@
 import * as vscode from 'vscode';
-import { spawn } from 'child_process';
-import * as path from 'path';
+import * as http from 'http';
+import * as https from 'https';
 
 // ────────────────────────────────────────────────────────────────────────────
-// Presidio NLP bridge (Tier 1 — advanced PII masking)
+// Presidio HTTP bridge (Tier 1 — advanced PII masking via local API server)
 // ────────────────────────────────────────────────────────────────────────────
+
+interface SanitizeResponse {
+  sanitized_text: string;
+  was_modified: boolean;
+  entities_found: Array<{ entity_type: string; start: number; end: number; score: number }>;
+}
+
+/** Reads the configured Presidio server base URL from VS Code settings. */
+function getPresidioApiUrl(): string {
+  const config = vscode.workspace.getConfiguration('safechat');
+  return (config.get<string>('presidioApiUrl') || 'http://localhost:8000').replace(/\/$/, '');
+}
 
 /**
- * Spawns the Presidio Python engine as a child process.
- * Sends `text` via stdin, collects anonymized output from stdout.
- *
- * Rejects if:
- *  - Python is not installed
- *  - Presidio dependencies are missing (exit code 2)
- *  - The process errors out for any other reason
- *
- * Prerequisites (remind developers):
- *   pip install presidio-analyzer presidio-anonymizer
- *   python -m spacy download en_core_web_lg
+ * Calls the `/sanitize` endpoint on the running Presidio HTTP server.
+ * Rejects if the server is unreachable or returns a non-2xx status.
  */
-function runPresidio(text: string, extensionPath: string): Promise<string> {
+function callPresidioApi(text: string): Promise<SanitizeResponse> {
   return new Promise((resolve, reject) => {
-    const scriptPath = path.join(extensionPath, 'src', 'presidio_engine.py');
+    const baseUrl = getPresidioApiUrl();
+    let urlObj: URL;
+    try {
+      urlObj = new URL('/sanitize', baseUrl);
+    } catch {
+      reject(new Error(`Invalid presidioApiUrl: ${baseUrl}`));
+      return;
+    }
 
-    // Resolve Python interpreter — prefer the bundled .venv, then system python3/python.
-    const venvPython = path.join(
-      extensionPath,
-      '.venv',
-      process.platform === 'win32' ? path.join('Scripts', 'python.exe') : path.join('bin', 'python')
-    );
-    const systemPython = process.platform === 'win32' ? 'python' : 'python3';
-    const pythonBin = require('fs').existsSync(venvPython) ? venvPython : systemPython;
+    const body = JSON.stringify({ text });
+    const options: http.RequestOptions = {
+      hostname: urlObj.hostname,
+      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+      path: urlObj.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
 
-    const child = spawn(pythonBin, [scriptPath], {
-      stdio: ['pipe', 'pipe', 'pipe'],
+    const transport = urlObj.protocol === 'https:' ? https : http;
+    const req = transport.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+      res.on('end', () => {
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+          try {
+            resolve(JSON.parse(data) as SanitizeResponse);
+          } catch {
+            reject(new Error(`Invalid JSON from Presidio server: ${data.slice(0, 200)}`));
+          }
+        } else {
+          reject(new Error(`Presidio server returned HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+        }
+      });
     });
 
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString();
+    req.on('error', (err: Error) => {
+      reject(new Error(`Presidio server unreachable at ${baseUrl}: ${err.message}`));
     });
 
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
+    req.setTimeout(10000, () => {
+      req.destroy();
+      reject(new Error('Presidio server request timed out after 10 s'));
     });
 
-    child.on('error', (err: Error) => {
-      // Typically "ENOENT" — python not found on PATH
-      reject(new Error(`Failed to launch Python: ${err.message}`));
-    });
-
-    child.on('close', (code: number | null) => {
-      if (code === 0) {
-        resolve(stdout);
-      } else if (code === 2) {
-        // Special exit code from presidio_engine.py → Presidio not installed
-        reject(new Error('Presidio is not installed on this machine.'));
-      } else {
-        reject(
-          new Error(
-            `Presidio process exited with code ${code}: ${stderr.trim()}`
-          )
-        );
-      }
-    });
-
-    // Write the raw text to the child's stdin and close the stream.
-    child.stdin.write(text);
-    child.stdin.end();
+    req.write(body);
+    req.end();
   });
 }
 
@@ -213,20 +216,25 @@ async function ensureCacheRoot(baseUri: vscode.Uri): Promise<void> {
  */
 export async function sanitizeAndCache(
   rawText: string,
-  extensionPath?: string
-): Promise<{ cleanText: string; wasModified: boolean; cacheEntryUri?: vscode.Uri }> {
+  _extensionPath?: string
+): Promise<{
+  cleanText: string;
+  wasModified: boolean;
+  cacheEntryUri?: vscode.Uri;
+  presidioError?: string;
+}> {
   let presidioText = rawText;
   let presidioModified = false;
+  let presidioError: string | undefined;
 
-  // ── Tier 1: Presidio NLP masking ───────────────────────────────────
-  if (extensionPath) {
-    try {
-      presidioText = await runPresidio(rawText, extensionPath);
-      presidioModified = presidioText !== rawText;
-    } catch {
-      // Presidio unavailable — continue with regex-only.
-      // This is expected on machines without Python / Presidio.
-    }
+  // ── Tier 1: Presidio API masking ────────────────────────────────────
+  try {
+    const result = await callPresidioApi(rawText);
+    presidioText = result.sanitized_text;
+    presidioModified = result.was_modified;
+  } catch (err) {
+    // Server unreachable or returned an error — fall back to regex.
+    presidioError = err instanceof Error ? err.message : String(err);
   }
 
   // ── Tier 2: Regex secret masking (always runs as a second pass) ────
@@ -255,11 +263,11 @@ export async function sanitizeAndCache(
       // after an extension reload (no button argument available then).
       latestCacheEntryUri = entryDir;
 
-      return { cleanText, wasModified, cacheEntryUri: entryDir };
+      return { cleanText, wasModified, cacheEntryUri: entryDir, presidioError };
     }
   }
 
-  return { cleanText, wasModified };
+  return { cleanText, wasModified, presidioError };
 }
 
 /**

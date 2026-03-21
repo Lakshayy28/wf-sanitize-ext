@@ -36,7 +36,17 @@
         "command": "safecopilot.viewDiff",
         "title": "View Masked Diff"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Safe Copilot Context",
+      "properties": {
+        "safechat.presidioApiUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "markdownDescription": "Base URL of the Presidio sanitization server. Start the server with:\n```bash\ncd presidio_server\nuvicorn main:app --port 8000\n```"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

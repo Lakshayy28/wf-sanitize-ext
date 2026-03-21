@@ -64,7 +64,16 @@ async function chatRequestHandler(
   }
 
   // ── Step 2: Sanitize the context ─────────────────────────────────────
-  const { cleanText, wasModified, cacheEntryUri } = await sanitizeAndCache(rawContext, extensionPath);
+  const { cleanText, wasModified, cacheEntryUri, presidioError } =
+    await sanitizeAndCache(rawContext, extensionPath);
+
+  if (presidioError) {
+    stream.markdown(
+      `> ⚠️ **Advanced PII detection unavailable** (Presidio server unreachable). ` +
+      `Falling back to regex-only masking.\n` +
+      `> Start the server: \`uvicorn presidio_server.main:app --port 8000\`\n\n`
+    );
+  }
 
   if (wasModified) {
     stream.markdown(
