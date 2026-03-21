@@ -149,7 +149,14 @@ export function regexSanitize(rawText: string): { cleanText: string; wasModified
 // Cache directory helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-function getCacheUri(): vscode.Uri | undefined {
+/**
+ * In-memory pointer to the most recently written cache entry.
+ * Used by viewDiffCommand so the button always opens the latest diff.
+ */
+let latestCacheEntryUri: vscode.Uri | undefined;
+
+/** Returns the root `.vscode/.temp_cache` base directory URI. */
+function getCacheBaseUri(): vscode.Uri | undefined {
   const folders = vscode.workspace.workspaceFolders;
   if (!folders || folders.length === 0) {
     return undefined;
@@ -158,18 +165,36 @@ function getCacheUri(): vscode.Uri | undefined {
 }
 
 /**
- * Ensure the cache directory exists and contains a wildcard .gitignore
- * so the cached files are never accidentally committed.
+ * Generates a filesystem-safe timestamp string for use as a subfolder name.
+ * e.g. "2026-03-21_10-30-00-042"
  */
-async function ensureCacheDir(cacheDir: vscode.Uri): Promise<void> {
-  // createDirectory is idempotent — it won't throw if the dir already exists.
-  await vscode.workspace.fs.createDirectory(cacheDir);
-
-  const gitignoreUri = vscode.Uri.joinPath(cacheDir, '.gitignore');
-  await vscode.workspace.fs.writeFile(
-    gitignoreUri,
-    Buffer.from('*\n', 'utf-8')
+function timestampSlug(): string {
+  const now = new Date();
+  const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+  return (
+    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    `_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}` +
+    `-${pad(now.getMilliseconds(), 3)}`
   );
+}
+
+/**
+ * Ensures the base cache root exists and contains a wildcard .gitignore.
+ * Only writes the .gitignore once (cheap stat-check first).
+ */
+async function ensureCacheRoot(baseUri: vscode.Uri): Promise<void> {
+  await vscode.workspace.fs.createDirectory(baseUri);
+
+  const gitignoreUri = vscode.Uri.joinPath(baseUri, '.gitignore');
+  try {
+    await vscode.workspace.fs.stat(gitignoreUri);
+  } catch {
+    // Doesn't exist yet — create it.
+    await vscode.workspace.fs.writeFile(
+      gitignoreUri,
+      Buffer.from('*\n', 'utf-8')
+    );
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -189,7 +214,7 @@ async function ensureCacheDir(cacheDir: vscode.Uri): Promise<void> {
 export async function sanitizeAndCache(
   rawText: string,
   extensionPath?: string
-): Promise<{ cleanText: string; wasModified: boolean }> {
+): Promise<{ cleanText: string; wasModified: boolean; cacheEntryUri?: vscode.Uri }> {
   let presidioText = rawText;
   let presidioModified = false;
 
@@ -209,17 +234,28 @@ export async function sanitizeAndCache(
   const wasModified = presidioModified || regexModified;
 
   if (wasModified) {
-    const cacheDir = getCacheUri();
-    if (cacheDir) {
-      await ensureCacheDir(cacheDir);
+    const baseUri = getCacheBaseUri();
+    if (baseUri) {
+      await ensureCacheRoot(baseUri);
 
-      const originalUri = vscode.Uri.joinPath(cacheDir, 'original_context.txt');
-      const maskedUri = vscode.Uri.joinPath(cacheDir, 'masked_context.txt');
+      // Each prompt gets its own timestamped subfolder — previous diffs are
+      // never overwritten and remain on disk for manual inspection.
+      const entryDir = vscode.Uri.joinPath(baseUri, timestampSlug());
+      await vscode.workspace.fs.createDirectory(entryDir);
+
+      const originalUri = vscode.Uri.joinPath(entryDir, 'original_context.txt');
+      const maskedUri   = vscode.Uri.joinPath(entryDir, 'masked_context.txt');
 
       await Promise.all([
         vscode.workspace.fs.writeFile(originalUri, Buffer.from(rawText, 'utf-8')),
         vscode.workspace.fs.writeFile(maskedUri, Buffer.from(cleanText, 'utf-8')),
       ]);
+
+      // Update the in-memory pointer so the command-palette fallback works
+      // after an extension reload (no button argument available then).
+      latestCacheEntryUri = entryDir;
+
+      return { cleanText, wasModified, cacheEntryUri: entryDir };
     }
   }
 
@@ -230,33 +266,60 @@ export async function sanitizeAndCache(
  * Opens the VS Code diff editor comparing the original and masked context files.
  * Bound to the `safecopilot.viewDiff` command.
  */
-export async function viewDiffCommand(): Promise<void> {
-  const cacheDir = getCacheUri();
-  if (!cacheDir) {
-    vscode.window.showWarningMessage(
-      'SafeChat: No workspace folder found — cannot display diff.'
+export async function viewDiffCommand(entryUriString?: string): Promise<void> {
+  // If the button passed a specific entry URI, use it directly.
+  // This ensures each chat button always opens its own prompt's diff,
+  // regardless of how many prompts have run since.
+  if (entryUriString) {
+    const entryUri = vscode.Uri.parse(entryUriString);
+    const originalUri = vscode.Uri.joinPath(entryUri, 'original_context.txt');
+    const maskedUri   = vscode.Uri.joinPath(entryUri, 'masked_context.txt');
+    await vscode.commands.executeCommand(
+      'vscode.diff',
+      originalUri,
+      maskedUri,
+      `Original ↔ Sanitized  [${entryUri.path.split('/').pop()}]`
     );
     return;
   }
 
-  const originalUri = vscode.Uri.joinPath(cacheDir, 'original_context.txt');
-  const maskedUri = vscode.Uri.joinPath(cacheDir, 'masked_context.txt');
+  // Fallback path: command palette invocation (no argument) — recover
+  // the most recent entry from memory or disk.
+  if (!latestCacheEntryUri) {
+    // No in-memory pointer — extension may have reloaded. Try to recover the
+    // most recent timestamped subfolder from disk.
+    const baseUri = getCacheBaseUri();
+    if (baseUri) {
+      try {
+        const entries = await vscode.workspace.fs.readDirectory(baseUri);
+        const dirs = entries
+          .filter(([, type]) => type === vscode.FileType.Directory)
+          .map(([name]) => name)
+          .sort() // ISO timestamps sort lexicographically = chronologically
+          .reverse();
+        if (dirs.length > 0) {
+          latestCacheEntryUri = vscode.Uri.joinPath(baseUri, dirs[0]);
+        }
+      } catch {
+        // base dir not created yet — fall through to the warning below.
+      }
+    }
+  }
 
-  try {
-    // Quick existence check — will throw if the file doesn't exist.
-    await vscode.workspace.fs.stat(originalUri);
-    await vscode.workspace.fs.stat(maskedUri);
-  } catch {
+  if (!latestCacheEntryUri) {
     vscode.window.showWarningMessage(
       'SafeChat: No cached diff available yet. Attach a file to @safechat first.'
     );
     return;
   }
 
+  const originalUri = vscode.Uri.joinPath(latestCacheEntryUri, 'original_context.txt');
+  const maskedUri   = vscode.Uri.joinPath(latestCacheEntryUri, 'masked_context.txt');
+
   await vscode.commands.executeCommand(
     'vscode.diff',
     originalUri,
     maskedUri,
-    'Original ↔ Sanitized Context'
+    `Original ↔ Sanitized  [${latestCacheEntryUri.path.split('/').pop()}]`
   );
 }

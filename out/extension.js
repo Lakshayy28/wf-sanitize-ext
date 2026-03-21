@@ -80,12 +80,15 @@ async function chatRequestHandler(request, _chatContext, stream, token) {
         }
     }
     // ── Step 2: Sanitize the context ─────────────────────────────────────
-    const { cleanText, wasModified } = await (0, sanitizer_1.sanitizeAndCache)(rawContext, extensionPath);
+    const { cleanText, wasModified, cacheEntryUri } = await (0, sanitizer_1.sanitizeAndCache)(rawContext, extensionPath);
     if (wasModified) {
         stream.markdown('🛡️ **Sensitive data was detected and masked** before sending to Copilot.\n\n');
         stream.button({
             command: 'safecopilot.viewDiff',
             title: '$(diff) View Masked Diff',
+            // Pass this prompt's specific cache URI as an argument so the button
+            // always opens its own diff, even after subsequent prompts have run.
+            arguments: cacheEntryUri ? [cacheEntryUri.toString()] : [],
         });
     }
     // ── Step 3: Select a Copilot Language Model ──────────────────────────

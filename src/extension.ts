@@ -64,7 +64,7 @@ async function chatRequestHandler(
   }
 
   // ── Step 2: Sanitize the context ─────────────────────────────────────
-  const { cleanText, wasModified } = await sanitizeAndCache(rawContext, extensionPath);
+  const { cleanText, wasModified, cacheEntryUri } = await sanitizeAndCache(rawContext, extensionPath);
 
   if (wasModified) {
     stream.markdown(
@@ -73,6 +73,9 @@ async function chatRequestHandler(
     stream.button({
       command: 'safecopilot.viewDiff',
       title: '$(diff) View Masked Diff',
+      // Pass this prompt's specific cache URI as an argument so the button
+      // always opens its own diff, even after subsequent prompts have run.
+      arguments: cacheEntryUri ? [cacheEntryUri.toString()] : [],
     });
   }
 
