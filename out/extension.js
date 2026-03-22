@@ -38,11 +38,8 @@ exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const sanitizer_1 = require("./sanitizer");
 let extensionPath;
-/** Efficiency cache — keyed by URI string, survives across conversations. */
 const fileStateCache = new Map();
-/** Files referenced in the current conversation — cleared on new chat. */
 let conversationFileKeys = new Set();
-/** Latest per-file diff cache directory for command-palette fallback. */
 let latestCacheEntryUri;
 // ── Activation ──────────────────────────────────────────────────────────────
 function activate(context) {
@@ -79,7 +76,6 @@ async function chatRequestHandler(request, chatContext, stream, token) {
         if (stat.type !== vscode.FileType.File) {
             continue;
         }
-        // Unchanged since last scan → reuse cached result
         const cached = fileStateCache.get(key);
         if (cached && cached.mtime === stat.mtime) {
             continue;
@@ -93,7 +89,6 @@ async function chatRequestHandler(request, chatContext, stream, token) {
         catch {
             continue;
         }
-        // Should this file type be sanitized?
         let isSensitive;
         if (includeExts && includeExts.length > 0) {
             const ext = getFileExtension(fileUri);
@@ -103,7 +98,7 @@ async function chatRequestHandler(request, chatContext, stream, token) {
             });
         }
         else {
-            isSensitive = true; // no filter → scan everything
+            isSensitive = true;
         }
         if (isSensitive) {
             const result = await (0, sanitizer_1.sanitizeOnly)(text, filterConfig);
@@ -144,7 +139,7 @@ async function chatRequestHandler(request, chatContext, stream, token) {
             });
         }
     }
-    // ── Step 4: Write per-file diff cache (only when new masks appeared) ─
+    // ── Step 4: Write per-file diff cache ────────────────────────────────
     if (newMasks > 0 && maskedFiles.length > 0) {
         await writePerFileDiffCache(maskedFiles);
     }
@@ -162,30 +157,42 @@ async function chatRequestHandler(request, chatContext, stream, token) {
             arguments: latestCacheEntryUri ? [latestCacheEntryUri.toString()] : [],
         });
     }
-    // ── Step 5: Select a Copilot Language Model ──────────────────────────
+    // ── Step 5: Use the user's selected model (same as Copilot uses) ─────
     stream.progress('Sending sanitized context to Copilot…');
-    let model;
-    try {
-        const models = await vscode.lm.selectChatModels({
-            vendor: 'copilot',
-            family: 'gpt-4o',
-        });
-        model = models?.[0];
+    const model = request.model;
+    // ── Step 6: Gather all available tools for full agentic behaviour ────
+    const MAX_TOOLS = 128;
+    // Prioritize tools the user explicitly attached
+    const priorityNames = new Set(request.toolReferences.map(r => r.name));
+    const allTools = [];
+    // Add priority (user-referenced) tools first
+    for (const t of vscode.lm.tools) {
+        if (priorityNames.has(t.name)) {
+            allTools.push({ name: t.name, description: t.description, inputSchema: t.inputSchema });
+        }
     }
-    catch { /* fall through */ }
-    if (!model) {
-        stream.markdown('> ⚠️ No Copilot language model found. Make sure GitHub Copilot Chat is installed and signed in.\n');
-        return;
+    // Fill remaining slots with other tools
+    for (const t of vscode.lm.tools) {
+        if (allTools.length >= MAX_TOOLS) {
+            break;
+        }
+        if (!priorityNames.has(t.name)) {
+            allTools.push({ name: t.name, description: t.description, inputSchema: t.inputSchema });
+        }
     }
-    // ── Step 6: Build messages with conversation history ─────────────────
+    // ── Step 7: Build messages with conversation history ─────────────────
     const messages = [];
     // System prompt
-    messages.push(vscode.LanguageModelChatMessage.User('You are a helpful coding assistant. Some of the provided file context has been ' +
-        'pre-sanitized to remove sensitive information. Treat any `[MASKED_BY_SAFECHAT]` ' +
-        'or `<ENTITY_TYPE>` placeholders as redacted secrets — do not attempt to guess ' +
-        'their original values. Other files are provided as-is without modification. ' +
-        'Maintain full awareness of all provided context across the conversation.'));
-    // Replay previous conversation turns for multi-turn continuity
+    messages.push(vscode.LanguageModelChatMessage.User('You are a highly skilled coding assistant with full access to the workspace. ' +
+        'You have tools available to search code, read files, list directories, run commands, and more. ' +
+        'Use these tools proactively to gather context, explore the codebase, and provide thorough, detailed answers. ' +
+        'Think step by step. When the user asks about code, search the codebase, read the relevant files, ' +
+        'and provide comprehensive analysis.\n\n' +
+        'IMPORTANT: Some of the provided file context has been pre-sanitized to protect sensitive data. ' +
+        'Treat any `[MASKED_BY_SAFECHAT]` or `<ENTITY_TYPE>` placeholders as redacted secrets — ' +
+        'do not attempt to guess their original values. ' +
+        'Other files are provided as-is without modification.'));
+    // Replay previous conversation turns
     for (const turn of chatContext.history) {
         if (turn instanceof vscode.ChatRequestTurn) {
             if (turn.participant === 'safecopilot.safeChat') {
@@ -212,20 +219,57 @@ async function chatRequestHandler(request, chatContext, stream, token) {
         ? `Context (${conversationFileKeys.size} file(s)):\n\`\`\`\n${fullContext}\n\`\`\`\n\nUser question: ${request.prompt}`
         : request.prompt;
     messages.push(vscode.LanguageModelChatMessage.User(currentMessage));
-    // ── Step 7: Stream the LLM response ──────────────────────────────────
-    try {
-        const chatResponse = await model.sendRequest(messages, {}, token);
-        for await (const fragment of chatResponse.text) {
-            stream.markdown(fragment);
+    // ── Step 8: Agentic tool-calling loop ────────────────────────────────
+    const MAX_TOOL_ROUNDS = 15;
+    const requestOptions = allTools.length > 0
+        ? { tools: allTools, toolMode: vscode.LanguageModelChatToolMode.Auto }
+        : {};
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        const chatResponse = await model.sendRequest(messages, requestOptions, token);
+        // Collect tool calls and text from this round
+        const toolCalls = [];
+        let assistantText = '';
+        for await (const chunk of chatResponse.stream) {
+            if (chunk instanceof vscode.LanguageModelTextPart) {
+                stream.markdown(chunk.value);
+                assistantText += chunk.value;
+            }
+            else if (chunk instanceof vscode.LanguageModelToolCallPart) {
+                toolCalls.push(chunk);
+            }
         }
-    }
-    catch (err) {
-        if (err instanceof vscode.LanguageModelError) {
-            stream.markdown(`> ⚠️ Language model error (${err.code ?? 'unknown'}): ${err.message}\n`);
+        // No tool calls → model is done, exit the loop
+        if (toolCalls.length === 0) {
+            break;
         }
-        else {
-            throw err;
+        // Record the assistant's response (text + tool calls) in the message history
+        const assistantParts = [];
+        if (assistantText) {
+            assistantParts.push(new vscode.LanguageModelTextPart(assistantText));
         }
+        assistantParts.push(...toolCalls);
+        messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
+        // Invoke each tool and collect results
+        const toolResultParts = [];
+        for (const call of toolCalls) {
+            stream.progress(`Running tool: ${call.name}…`);
+            let resultContent;
+            try {
+                const result = await vscode.lm.invokeTool(call.name, {
+                    input: call.input,
+                    toolInvocationToken: request.toolInvocationToken,
+                }, token);
+                resultContent = result.content;
+            }
+            catch (err) {
+                resultContent = [
+                    new vscode.LanguageModelTextPart(`Tool error: ${err instanceof Error ? err.message : String(err)}`),
+                ];
+            }
+            toolResultParts.push(new vscode.LanguageModelToolResultPart(call.callId, resultContent));
+        }
+        // Feed tool results back as a User message
+        messages.push(vscode.LanguageModelChatMessage.User(toolResultParts));
     }
 }
 function deactivate() { }

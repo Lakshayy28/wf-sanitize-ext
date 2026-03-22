@@ -14,13 +14,8 @@ interface FileState {
   wasMasked: boolean;
 }
 
-/** Efficiency cache — keyed by URI string, survives across conversations. */
 const fileStateCache = new Map<string, FileState>();
-
-/** Files referenced in the current conversation — cleared on new chat. */
 let conversationFileKeys = new Set<string>();
-
-/** Latest per-file diff cache directory for command-palette fallback. */
 let latestCacheEntryUri: vscode.Uri | undefined;
 
 // ── Activation ──────────────────────────────────────────────────────────────
@@ -77,7 +72,6 @@ async function chatRequestHandler(
     } catch { continue; }
     if (stat.type !== vscode.FileType.File) { continue; }
 
-    // Unchanged since last scan → reuse cached result
     const cached = fileStateCache.get(key);
     if (cached && cached.mtime === stat.mtime) { continue; }
 
@@ -88,7 +82,6 @@ async function chatRequestHandler(
       text = Buffer.from(bytes).toString('utf-8');
     } catch { continue; }
 
-    // Should this file type be sanitized?
     let isSensitive: boolean;
     if (includeExts && includeExts.length > 0) {
       const ext = getFileExtension(fileUri);
@@ -97,7 +90,7 @@ async function chatRequestHandler(
         return ext === norm;
       });
     } else {
-      isSensitive = true; // no filter → scan everything
+      isSensitive = true;
     }
 
     if (isSensitive) {
@@ -135,7 +128,7 @@ async function chatRequestHandler(
     }
   }
 
-  // ── Step 4: Write per-file diff cache (only when new masks appeared) ─
+  // ── Step 4: Write per-file diff cache ────────────────────────────────
   if (newMasks > 0 && maskedFiles.length > 0) {
     await writePerFileDiffCache(maskedFiles);
   }
@@ -160,38 +153,50 @@ async function chatRequestHandler(
     });
   }
 
-  // ── Step 5: Select a Copilot Language Model ──────────────────────────
+  // ── Step 5: Use the user's selected model (same as Copilot uses) ─────
   stream.progress('Sending sanitized context to Copilot…');
 
-  let model: vscode.LanguageModelChat | undefined;
-  try {
-    const models = await vscode.lm.selectChatModels({
-      vendor: 'copilot',
-      family: 'gpt-4o',
-    });
-    model = models?.[0];
-  } catch { /* fall through */ }
+  const model = request.model;
 
-  if (!model) {
-    stream.markdown(
-      '> ⚠️ No Copilot language model found. Make sure GitHub Copilot Chat is installed and signed in.\n',
-    );
-    return;
+  // ── Step 6: Gather all available tools for full agentic behaviour ────
+  const MAX_TOOLS = 128;
+
+  // Prioritize tools the user explicitly attached
+  const priorityNames = new Set(request.toolReferences.map(r => r.name));
+  const allTools: vscode.LanguageModelChatTool[] = [];
+
+  // Add priority (user-referenced) tools first
+  for (const t of vscode.lm.tools) {
+    if (priorityNames.has(t.name)) {
+      allTools.push({ name: t.name, description: t.description, inputSchema: t.inputSchema });
+    }
   }
 
-  // ── Step 6: Build messages with conversation history ─────────────────
+  // Fill remaining slots with other tools
+  for (const t of vscode.lm.tools) {
+    if (allTools.length >= MAX_TOOLS) { break; }
+    if (!priorityNames.has(t.name)) {
+      allTools.push({ name: t.name, description: t.description, inputSchema: t.inputSchema });
+    }
+  }
+
+  // ── Step 7: Build messages with conversation history ─────────────────
   const messages: vscode.LanguageModelChatMessage[] = [];
 
   // System prompt
   messages.push(vscode.LanguageModelChatMessage.User(
-    'You are a helpful coding assistant. Some of the provided file context has been ' +
-    'pre-sanitized to remove sensitive information. Treat any `[MASKED_BY_SAFECHAT]` ' +
-    'or `<ENTITY_TYPE>` placeholders as redacted secrets — do not attempt to guess ' +
-    'their original values. Other files are provided as-is without modification. ' +
-    'Maintain full awareness of all provided context across the conversation.',
+    'You are a highly skilled coding assistant with full access to the workspace. ' +
+    'You have tools available to search code, read files, list directories, run commands, and more. ' +
+    'Use these tools proactively to gather context, explore the codebase, and provide thorough, detailed answers. ' +
+    'Think step by step. When the user asks about code, search the codebase, read the relevant files, ' +
+    'and provide comprehensive analysis.\n\n' +
+    'IMPORTANT: Some of the provided file context has been pre-sanitized to protect sensitive data. ' +
+    'Treat any `[MASKED_BY_SAFECHAT]` or `<ENTITY_TYPE>` placeholders as redacted secrets — ' +
+    'do not attempt to guess their original values. ' +
+    'Other files are provided as-is without modification.',
   ));
 
-  // Replay previous conversation turns for multi-turn continuity
+  // Replay previous conversation turns
   for (const turn of chatContext.history) {
     if (turn instanceof vscode.ChatRequestTurn) {
       if (turn.participant === 'safecopilot.safeChat') {
@@ -220,20 +225,67 @@ async function chatRequestHandler(
 
   messages.push(vscode.LanguageModelChatMessage.User(currentMessage));
 
-  // ── Step 7: Stream the LLM response ──────────────────────────────────
-  try {
-    const chatResponse = await model.sendRequest(messages, {}, token);
-    for await (const fragment of chatResponse.text) {
-      stream.markdown(fragment);
+  // ── Step 8: Agentic tool-calling loop ────────────────────────────────
+  const MAX_TOOL_ROUNDS = 15;
+
+  const requestOptions: vscode.LanguageModelChatRequestOptions = allTools.length > 0
+    ? { tools: allTools, toolMode: vscode.LanguageModelChatToolMode.Auto }
+    : {};
+
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const chatResponse = await model.sendRequest(messages, requestOptions, token);
+
+    // Collect tool calls and text from this round
+    const toolCalls: vscode.LanguageModelToolCallPart[] = [];
+    let assistantText = '';
+
+    for await (const chunk of chatResponse.stream) {
+      if (chunk instanceof vscode.LanguageModelTextPart) {
+        stream.markdown(chunk.value);
+        assistantText += chunk.value;
+      } else if (chunk instanceof vscode.LanguageModelToolCallPart) {
+        toolCalls.push(chunk);
+      }
     }
-  } catch (err) {
-    if (err instanceof vscode.LanguageModelError) {
-      stream.markdown(
-        `> ⚠️ Language model error (${(err as vscode.LanguageModelError).code ?? 'unknown'}): ${err.message}\n`,
-      );
-    } else {
-      throw err;
+
+    // No tool calls → model is done, exit the loop
+    if (toolCalls.length === 0) {
+      break;
     }
+
+    // Record the assistant's response (text + tool calls) in the message history
+    const assistantParts: (vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart)[] = [];
+    if (assistantText) {
+      assistantParts.push(new vscode.LanguageModelTextPart(assistantText));
+    }
+    assistantParts.push(...toolCalls);
+    messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
+
+    // Invoke each tool and collect results
+    const toolResultParts: vscode.LanguageModelToolResultPart[] = [];
+
+    for (const call of toolCalls) {
+      stream.progress(`Running tool: ${call.name}…`);
+
+      let resultContent: (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[];
+      try {
+        const result = await vscode.lm.invokeTool(call.name, {
+          input: call.input,
+          toolInvocationToken: request.toolInvocationToken,
+        }, token);
+
+        resultContent = result.content as (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[];
+      } catch (err) {
+        resultContent = [
+          new vscode.LanguageModelTextPart(`Tool error: ${err instanceof Error ? err.message : String(err)}`),
+        ];
+      }
+
+      toolResultParts.push(new vscode.LanguageModelToolResultPart(call.callId, resultContent));
+    }
+
+    // Feed tool results back as a User message
+    messages.push(vscode.LanguageModelChatMessage.User(toolResultParts));
   }
 }
 
