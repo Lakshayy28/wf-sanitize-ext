@@ -44,6 +44,11 @@
           "type": "string",
           "default": "http://localhost:8000",
           "markdownDescription": "Base URL of the Presidio sanitization server. Start the server with:\n```bash\ncd presidio_server\nuvicorn main:app --port 8000\n```"
+        },
+        "safechat.rulesFile": {
+          "type": "string",
+          "default": ".vscode/safechat-rules.yaml",
+          "markdownDescription": "Workspace-relative path to the YAML file that defines per-entity anonymization rules.\n\nExample `.vscode/safechat-rules.yaml`:\n```yaml\nrules:\n  AccountNumber: Mask     # → ****\n  PhoneNumber: Replace    # → <PHONE_NUMBER>\n```\n\nSupported operations: `Mask` (asterisks) · `Replace` (entity-type placeholder).\nIf the file is absent or an entity is not listed, the server default (`Replace`) is used."
         }
       }
     }

@@ -1,0 +1,39 @@
+# SafeChat Sanitization Rules
+# ─────────────────────────────────────────────────────────────────────────────
+# Define how each PII entity type should be anonymized when detected.
+#
+# Format:
+#   <EntityKey>: <Operation>
+#
+# Operations:
+#   Replace  — substitute with a labelled placeholder  e.g.  <PHONE_NUMBER>
+#   Mask     — substitute with asterisks               e.g.  ****
+#
+# EntityKey can be a Presidio entity type OR a friendly alias (case-insensitive):
+#
+#   Alias                     Presidio entity type
+#   ─────────────────────     ──────────────────────────
+#   PhoneNumber / Phone     → PHONE_NUMBER
+#   AccountNumber           → US_BANK_NUMBER
+#   Email / EmailAddress    → EMAIL_ADDRESS
+#   CreditCard / CC         → CREDIT_CARD
+#   SSN                     → US_SSN
+#   IPAddress / IP          → IP_ADDRESS
+#   Person / Name           → PERSON
+#   IBAN / IBANCode         → IBAN_CODE
+#   Crypto / Bitcoin        → CRYPTO
+#   Location                → LOCATION
+#   Date / DateTime         → DATE_TIME
+#   URL                     → URL
+#   Passport                → US_PASSPORT
+#   DrivingLicense          → US_DRIVER_LICENSE
+#   MedicalLicense          → MEDICAL_LICENSE
+#   NRP                     → NRP
+#
+# Rules listed here override the server default (Replace) for that entity type.
+# Entity types NOT listed use the server default replacement format.
+# ─────────────────────────────────────────────────────────────────────────────
+
+rules:
+  AccountNumber: Mask      # bank account numbers  → ****
+  PhoneNumber: Replace     # phone numbers         → <PHONE_NUMBER>

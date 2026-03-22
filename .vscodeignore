@@ -15,3 +15,5 @@ package-extension.sh
 PACKAGING.md
 SETUP.md
 prompts/**
+*.yaml
+*.yml

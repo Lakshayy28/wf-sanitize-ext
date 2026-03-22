@@ -44,11 +44,109 @@ function getPresidioApiUrl() {
     const config = vscode.workspace.getConfiguration('safechat');
     return (config.get('presidioApiUrl') || 'http://localhost:8000').replace(/\/$/, '');
 }
+// ────────────────────────────────────────────────────────────────────────────
+// Rules config (user-defined per-entity anonymization overrides)
+// ────────────────────────────────────────────────────────────────────────────
+/** Maps friendly alias names → canonical Presidio entity type strings. */
+const ENTITY_ALIAS_MAP = {
+    phonenumber: 'PHONE_NUMBER',
+    phone: 'PHONE_NUMBER',
+    accountnumber: 'US_BANK_NUMBER',
+    bankaccount: 'US_BANK_NUMBER',
+    email: 'EMAIL_ADDRESS',
+    emailaddress: 'EMAIL_ADDRESS',
+    emailaddr: 'EMAIL_ADDRESS',
+    creditcard: 'CREDIT_CARD',
+    cc: 'CREDIT_CARD',
+    ssn: 'US_SSN',
+    socialsecuritynumber: 'US_SSN',
+    ipaddress: 'IP_ADDRESS',
+    ip: 'IP_ADDRESS',
+    person: 'PERSON',
+    name: 'PERSON',
+    url: 'URL',
+    location: 'LOCATION',
+    date: 'DATE_TIME',
+    datetime: 'DATE_TIME',
+    iban: 'IBAN_CODE',
+    ibancode: 'IBAN_CODE',
+    crypto: 'CRYPTO',
+    bitcoin: 'CRYPTO',
+    passport: 'US_PASSPORT',
+    drivinglicense: 'US_DRIVER_LICENSE',
+    driverslicense: 'US_DRIVER_LICENSE',
+    medicallicense: 'MEDICAL_LICENSE',
+    nrp: 'NRP',
+};
+/** Converts an alias or arbitrary casing to the canonical Presidio entity type. */
+function normalizeEntityKey(key) {
+    const slug = key.toLowerCase().replace(/[_\s-]/g, '');
+    return ENTITY_ALIAS_MAP[slug] ?? key.toUpperCase().replace(/[\s-]/g, '_');
+}
+/**
+ * Parses the subset of YAML needed for the rules file — no external deps.
+ * Handles:
+ *   rules:
+ *     KeyName: Operation   # optional inline comment
+ */
+function parseRulesYaml(content) {
+    const result = {};
+    let inRules = false;
+    for (const raw of content.split('\n')) {
+        const line = raw.replace(/#.*$/, '').trimEnd(); // strip inline comments
+        const trimmed = line.trim();
+        if (!trimmed) {
+            continue;
+        }
+        if (trimmed === 'rules:') {
+            inRules = true;
+            continue;
+        }
+        if (inRules) {
+            if (/^\s/.test(line)) {
+                const m = trimmed.match(/^([A-Za-z0-9_]+)\s*:\s*([A-Za-z]+)/);
+                if (m) {
+                    result[m[1]] = m[2];
+                }
+            }
+            else {
+                inRules = false;
+            }
+        }
+    }
+    return result;
+}
+/**
+ * Reads `.vscode/safechat-rules.yaml` (or the path from VS Code settings),
+ * parses it, and returns a map of Presidio entity type → operation.
+ * Returns `undefined` if the file doesn't exist (no overrides applied).
+ */
+async function readRulesConfig() {
+    const config = vscode.workspace.getConfiguration('safechat');
+    const rulesPath = config.get('rulesFile') || '.vscode/safechat-rules.yaml';
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders?.length) {
+        return undefined;
+    }
+    const rulesUri = vscode.Uri.joinPath(folders[0].uri, rulesPath);
+    try {
+        const bytes = await vscode.workspace.fs.readFile(rulesUri);
+        const raw = parseRulesYaml(Buffer.from(bytes).toString('utf-8'));
+        const normalized = {};
+        for (const [k, v] of Object.entries(raw)) {
+            normalized[normalizeEntityKey(k)] = v;
+        }
+        return Object.keys(normalized).length > 0 ? normalized : undefined;
+    }
+    catch {
+        return undefined; // file absent or unreadable → use server defaults
+    }
+}
 /**
  * Calls the `/sanitize` endpoint on the running Presidio HTTP server.
  * Rejects if the server is unreachable or returns a non-2xx status.
  */
-function callPresidioApi(text) {
+function callPresidioApi(text, rules) {
     return new Promise((resolve, reject) => {
         const baseUrl = getPresidioApiUrl();
         let urlObj;
@@ -59,7 +157,11 @@ function callPresidioApi(text) {
             reject(new Error(`Invalid presidioApiUrl: ${baseUrl}`));
             return;
         }
-        const body = JSON.stringify({ text });
+        const payload = { text };
+        if (rules && Object.keys(rules).length > 0) {
+            payload.rules = rules;
+        }
+        const body = JSON.stringify(payload);
         const options = {
             hostname: urlObj.hostname,
             port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
@@ -221,8 +323,9 @@ async function sanitizeAndCache(rawText, _extensionPath) {
     let presidioModified = false;
     let presidioError;
     // ── Tier 1: Presidio API masking ────────────────────────────────────
+    const rules = await readRulesConfig();
     try {
-        const result = await callPresidioApi(rawText);
+        const result = await callPresidioApi(rawText, rules);
         presidioText = result.sanitized_text;
         presidioModified = result.was_modified;
     }
