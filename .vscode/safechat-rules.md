@@ -10,13 +10,11 @@ This file is the single control panel for the `@safechat` VS Code extension. Eve
 
 1. [How it fits into the pipeline](#1-how-it-fits-into-the-pipeline)
 2. [Section: `include_extensions`](#2-section-include_extensions)
-3. [Section: `ignore_files`](#3-section-ignore_files)
-4. [Section: `ignore_folders`](#4-section-ignore_folders)
-5. [Section: `rules`](#5-section-rules)
-6. [Section: `custom_recognizers`](#6-section-custom_recognizers)
-7. [Entity alias reference](#7-entity-alias-reference)
-8. [Complete annotated example](#8-complete-annotated-example)
-9. [Common recipes](#9-common-recipes)
+3. [Section: `rules`](#3-section-rules)
+4. [Section: `custom_recognizers`](#4-section-custom_recognizers)
+5. [Entity alias reference](#5-entity-alias-reference)
+6. [Complete annotated example](#6-complete-annotated-example)
+7. [Common recipes](#7-common-recipes)
 
 ---
 
@@ -27,18 +25,8 @@ User attaches file(s) to @safechat
             │
             ▼
   ┌─────────────────────┐
-  │  ignore_folders?    │ ── yes ──► ℹ️ Skipped (inside ignored folder)
-  └─────────────────────┘
-            │ no
-            ▼
-  ┌─────────────────────┐
-  │  ignore_files?      │ ── yes ──► ℹ️ Skipped (in ignore list)
-  └─────────────────────┘
-            │ no
-            ▼
-  ┌─────────────────────┐
   │  include_extensions │
-  │  present & non-     │ ── no match ──► ℹ️ Skipped (extension not in allowlist)
+  │  present & non-     │ ── no match ──► 📄 Forwarded as-is to Copilot (no PII scan)
   │  empty?             │
   └─────────────────────┘
             │ match (or section absent = scan all)
@@ -63,20 +51,20 @@ User attaches file(s) to @safechat
      Sanitized text → Copilot
 ```
 
-Skipped files are **never read and never forwarded** — they are dropped entirely before any I/O happens.
+Files that do not match `include_extensions` are **forwarded as-is** to Copilot — they are not blocked, just not scanned for PII.
 
 ---
 
 ## 2. Section: `include_extensions`
 
-Controls which file types are eligible for scanning.
+Controls which file types are scanned for PII before forwarding to Copilot.
 
 ### Rules
 
 | Condition | Behaviour |
 |---|---|
 | Section absent or empty | **All** attached files are scanned (default — backwards compatible) |
-| Section present with entries | Only files whose extension matches the list are scanned; everything else is skipped |
+| Section present with entries | Files matching the list are sanitized; **all other files are forwarded as-is** (no scanning, no blocking) |
 
 ### Syntax
 
@@ -117,87 +105,11 @@ include_extensions:
   - .key
 ```
 
-With this active, attaching a TypeScript file (`.ts`) produces:
-```
-ℹ️ Skipped `src/app.service.ts` — extension `.ts` is not in the
-`include_extensions` allowlist. Add it to `.vscode/safechat-rules.yaml` to enable sanitization.
-```
+With this active, attaching a TypeScript file (`.ts`) forwards it **as-is** to Copilot (no PII scanning). Config/secret files like `.yaml` or `.env` are sanitized first.
 
 ---
 
-## 3. Section: `ignore_files`
-
-Lists specific workspace-relative file paths that must **never** be read, sanitized, or forwarded to Copilot regardless of any other setting.
-
-### Syntax
-
-```yaml
-ignore_files:
-  - relative/path/to/file.ext
-```
-
-- Use **forward slashes** on all platforms
-- A leading `./` is stripped automatically
-- Paths are matched **exactly** (no glob patterns)
-
-### Example
-
-```yaml
-ignore_files:
-  - .env.local
-  - .env.test
-  - config/local-override.yaml
-  - secrets/dev-credentials.json
-  - infra/terraform.tfvars
-```
-
-Attaching `.env.local` produces:
-```
-ℹ️ Skipped `.env.local` (in ignore list)
-```
-
----
-
-## 4. Section: `ignore_folders`
-
-Lists workspace-relative folder paths whose **entire contents** are skipped at any nesting depth. Use this instead of listing every file individually when you want to exclude a whole directory tree.
-
-### Syntax
-
-```yaml
-ignore_folders:
-  - folder/path
-```
-
-- Use **forward slashes** on all platforms
-- A leading `./` and trailing `/` are both stripped automatically
-- A file at `secrets/db/prod.yaml` is skipped if `secrets` **or** `secrets/db` is listed
-
-### Example
-
-```yaml
-ignore_folders:
-  - .vscode/.temp_cache    # diff cache — always exclude
-  - secrets
-  - infra/tfvars
-  - config/local
-```
-
-Any file under `secrets/` (e.g. `secrets/db/prod.yaml`, `secrets/api-keys.json`) produces:
-```
-ℹ️ Skipped `secrets/db/prod.yaml` (inside ignored folder)
-```
-
-### `ignore_files` vs `ignore_folders`
-
-| Use | When |
-|---|---|
-| `ignore_files` | You know the exact path of a specific file |
-| `ignore_folders` | You want to exclude everything under a directory |
-
----
-
-## 5. Section: `rules`
+## 3. Section: `rules`
 
 Defines how each detected entity type is anonymized. Any entity type not listed defaults to `replace`.
 
@@ -246,7 +158,7 @@ export SAFECHAT_ENCRYPT_KEY="my32characterlongsecretkey123456"
 
 ---
 
-## 6. Section: `custom_recognizers`
+## 4. Section: `custom_recognizers`
 
 Adds your own regex-based entity detectors without modifying the server. Each recognizer is active for the duration of the request — no restart required.
 
@@ -364,7 +276,7 @@ rules:
 
 ---
 
-## 7. Entity alias reference
+## 5. Entity alias reference
 
 You can use either the friendly alias or the canonical Presidio type — both are accepted, case-insensitively.
 
@@ -391,7 +303,7 @@ For the full catalogue of 70+ entity types (financial, developer, infrastructure
 
 ---
 
-## 8. Complete annotated example
+## 6. Complete annotated example
 
 ```yaml
 # ── Only scan data/config files — skip all code files ─────────────────────────
@@ -407,17 +319,6 @@ include_extensions:
   - .crt
   - .pfx
   - .key
-
-# ── Specific files to never forward ───────────────────────────────────────────
-ignore_files:
-  - .env.local          # local developer overrides
-  - .env.test           # test credentials
-  - secrets/master.key  # Rails master key
-
-# ── Entire folders to never forward ───────────────────────────────────────────
-ignore_folders:
-  - .vscode/.temp_cache  # diff cache
-  - secrets              # blanket exclusion of secrets directory
 
 # ── Per-entity anonymization operations ───────────────────────────────────────
 rules:
@@ -454,7 +355,7 @@ custom_recognizers:
 
 ---
 
-## 9. Common recipes
+## 7. Common recipes
 
 ### Scan everything (default behaviour)
 
@@ -510,10 +411,6 @@ include_extensions:
   - .pem
   - .key
   - .crt
-
-ignore_folders:
-  - .terraform       # provider cache — large, no secrets
-  - .git
 ```
 
 ### Mask everything aggressively

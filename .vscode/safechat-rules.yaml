@@ -6,16 +6,11 @@
 # FILE FILTERING (new)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# include_extensions  — whitelist of file extensions to sanitize.
-#   Only files whose extension is in this list will be scanned.
-#   Files with no matching extension are SKIPPED (not sent to Copilot unsanitized,
-#   just passed through as-is).
+# include_extensions  — list of file extensions that need PII sanitization.
+#   Files whose extension matches this list are scanned and sanitized before Copilot sees them.
+#   Files with no matching extension are forwarded AS-IS to Copilot (no blocking, no scanning).
 #   If this section is absent or empty, ALL referenced files are scanned (default).
 #   Dotfiles like ".env" are matched by their full basename.
-#
-# ignore_files  — workspace-relative paths of files to skip entirely.
-#   These files are not read, not sanitized, and not forwarded to Copilot.
-#   Use forward slashes; a leading "./" is stripped automatically.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 #
@@ -204,31 +199,6 @@ include_extensions:
 #   - .proto       # Protocol Buffer definitions (service URLs, auth metadata)
 #   - .wsdl        # SOAP Web Service Description Language
 #   - .xsd         # XML Schema Definition
-
-# ── File Ignore List ──────────────────────────────────────────────────────────
-# Workspace-relative paths of files that should NEVER be sanitized or forwarded.
-# Use forward slashes. Leading "./" is stripped automatically.
-#
-# ignore_files:
-#   - .env.local
-#   - .env.test
-#   - config/local-override.yaml
-#   - secrets/dev-credentials.json
-#   - infra/terraform.tfvars
-
-# ── Folder Ignore List ────────────────────────────────────────────────────────
-# Workspace-relative folder paths whose entire contents should NEVER be
-# sanitized or forwarded. All files inside these folders (at any depth) are
-# skipped.  Use forward slashes.  Leading "./" and trailing "/" are stripped
-# automatically.
-#
-ignore_folders:
-  - .vscode/.temp_cache    # auto-generated diff cache (always exclude)
-# Uncomment to ignore additional folders:
-#   - secrets
-#   - infra/tfvars
-#   - config/local
-#   - .private
 
 
 

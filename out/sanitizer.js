@@ -35,6 +35,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.readRulesConfig = readRulesConfig;
 exports.regexSanitize = regexSanitize;
+exports.sanitizeOnly = sanitizeOnly;
 exports.sanitizeAndCache = sanitizeAndCache;
 exports.viewDiffCommand = viewDiffCommand;
 const vscode = __importStar(require("vscode"));
@@ -101,8 +102,6 @@ function parseRulesYaml(content) {
     const rules = {};
     const customRecognizers = [];
     const includeExtensions = [];
-    const ignoreFiles = [];
-    const ignoreFolders = [];
     let section = 'none';
     let currentItem = {};
     let currentContext = [];
@@ -140,16 +139,6 @@ function parseRulesYaml(content) {
             section = 'include_extensions';
             continue;
         }
-        if (trimmed === 'ignore_files:') {
-            flushItem();
-            section = 'ignore_files';
-            continue;
-        }
-        if (trimmed === 'ignore_folders:') {
-            flushItem();
-            section = 'ignore_folders';
-            continue;
-        }
         // Must be indented to be inside a section
         if (!/^\s/.test(line)) {
             flushItem();
@@ -167,21 +156,6 @@ function parseRulesYaml(content) {
             const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
             if (val) {
                 includeExtensions.push(val.startsWith('.') ? val.toLowerCase() : '.' + val.toLowerCase());
-            }
-            continue;
-        }
-        if (section === 'ignore_files' && trimmed.startsWith('- ')) {
-            const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
-            if (val) {
-                ignoreFiles.push(val.replace(/^\.\//, '').replace(/\\/g, '/'));
-            }
-            continue;
-        }
-        if (section === 'ignore_folders' && trimmed.startsWith('- ')) {
-            const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
-            // Normalise: strip leading ./ and trailing /, force forward slashes
-            if (val) {
-                ignoreFolders.push(val.replace(/^\.\//, '').replace(/\\/g, '/').replace(/\/$/, ''));
             }
             continue;
         }
@@ -237,8 +211,6 @@ function parseRulesYaml(content) {
         rules: Object.keys(rules).length > 0 ? rules : undefined,
         customRecognizers: customRecognizers.length > 0 ? customRecognizers : undefined,
         includeExtensions: includeExtensions.length > 0 ? includeExtensions : undefined,
-        ignoreFiles: ignoreFiles.length > 0 ? ignoreFiles : undefined,
-        ignoreFolders: ignoreFolders.length > 0 ? ignoreFolders : undefined,
     };
 }
 /**
@@ -272,8 +244,6 @@ async function readRulesConfig() {
             rules: normalizedRules,
             customRecognizers: parsed.customRecognizers,
             includeExtensions: parsed.includeExtensions,
-            ignoreFiles: parsed.ignoreFiles,
-            ignoreFolders: parsed.ignoreFolders,
         };
     }
     catch {
@@ -449,6 +419,32 @@ async function ensureCacheRoot(baseUri) {
 // ────────────────────────────────────────────────────────────────────────────
 // Public API
 // ────────────────────────────────────────────────────────────────────────────
+/**
+ * Sanitize text without writing any cache files.
+ * Used by the per-file sanitization pipeline in extension.ts.
+ *
+ * Strategy:
+ *  1. Try Presidio (Tier 1) for NLP-based PII masking.
+ *  2. If Presidio is unavailable, fall back to the regex engine (Tier 2).
+ *  3. The regex pass always runs *after* Presidio to catch secrets that
+ *     NLP alone might miss (e.g., `api_key=...` patterns).
+ */
+async function sanitizeOnly(rawText, rulesConfig) {
+    let presidioText = rawText;
+    let presidioModified = false;
+    let presidioError;
+    try {
+        const result = await callPresidioApi(rawText, rulesConfig);
+        presidioText = result.sanitized_text;
+        presidioModified = result.was_modified;
+    }
+    catch (err) {
+        presidioError = err instanceof Error ? err.message : String(err);
+    }
+    const { cleanText, wasModified: regexModified } = regexSanitize(presidioText);
+    const wasModified = presidioModified || regexModified;
+    return { cleanText, wasModified, presidioError };
+}
 /**
  * Sanitize `rawText`, cache original + masked versions for diffing, and
  * return the clean text together with a modification flag.
