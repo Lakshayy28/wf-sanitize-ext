@@ -58,24 +58,65 @@ async function chatRequestHandler(request, _chatContext, stream, token) {
     // ── Step 1: Extract raw context from attached references ─────────────
     stream.progress('Scanning attached context for sensitive data…');
     let rawContext = '';
+    // Load filter config once — used to decide which files to include
+    const filterConfig = await (0, sanitizer_1.readRulesConfig)();
+    const includeExts = filterConfig?.includeExtensions; // e.g. [".yaml", ".json", ".env"]
+    const ignoreFiles = filterConfig?.ignoreFiles; // e.g. ["config/local.yaml"]
+    const ignoreFolders = filterConfig?.ignoreFolders; // e.g. ["secrets", "infra/tfvars"]
     for (const ref of request.references) {
         const refValue = ref.value;
+        // Resolve the URI regardless of whether it's a Uri or Location reference
+        let baseUri;
         if (refValue instanceof vscode.Uri) {
-            try {
-                const fileBytes = await vscode.workspace.fs.readFile(refValue);
-                rawContext += Buffer.from(fileBytes).toString('utf-8') + '\n';
-            }
-            catch (err) {
-                stream.markdown(`> ⚠️ Could not read reference \`${refValue.fsPath}\`: ${err}\n\n`);
-            }
+            baseUri = refValue;
         }
         else if (refValue instanceof vscode.Location) {
+            baseUri = refValue.uri;
+        }
+        if (!baseUri) {
+            continue;
+        }
+        // Expand directories → flat list of file URIs (silently skips unreadable entries)
+        const fileUris = await collectFiles(baseUri);
+        for (const fileUri of fileUris) {
+            const relPath = vscode.workspace.asRelativePath(fileUri, false);
+            const normalizedRel = relPath.replace(/\\/g, '/');
+            // ── Folder ignore list check ────────────────────────────────────
+            if (ignoreFolders && ignoreFolders.length > 0) {
+                const inIgnoredFolder = ignoreFolders.some(folder => normalizedRel === folder || normalizedRel.startsWith(folder + '/'));
+                if (inIgnoredFolder) {
+                    stream.markdown(`> ℹ️ Skipped \`${relPath}\` (inside ignored folder)\n\n`);
+                    continue;
+                }
+            }
+            // ── File ignore list check ──────────────────────────────────────
+            if (ignoreFiles && ignoreFiles.length > 0) {
+                if (ignoreFiles.includes(normalizedRel)) {
+                    stream.markdown(`> ℹ️ Skipped \`${relPath}\` (in ignore list)\n\n`);
+                    continue;
+                }
+            }
+            // ── Extension allowlist check ───────────────────────────────────
+            if (includeExts && includeExts.length > 0) {
+                const ext = getFileExtension(fileUri);
+                const allowed = includeExts.some(e => {
+                    const norm = (e.startsWith('.') ? e : '.' + e).toLowerCase();
+                    return ext === norm;
+                });
+                if (!allowed) {
+                    const extLabel = ext || '(no extension)';
+                    stream.markdown(`> ℹ️ Skipped \`${relPath}\` — extension \`${extLabel}\` is not in the ` +
+                        `\`include_extensions\` allowlist. Add it to \`.vscode/safechat-rules.yaml\` to enable sanitization.\n\n`);
+                    continue;
+                }
+            }
+            // ── Read the file ─────────────────────────────────────────────
             try {
-                const fileBytes = await vscode.workspace.fs.readFile(refValue.uri);
+                const fileBytes = await vscode.workspace.fs.readFile(fileUri);
                 rawContext += Buffer.from(fileBytes).toString('utf-8') + '\n';
             }
             catch (err) {
-                stream.markdown(`> ⚠️ Could not read location reference \`${refValue.uri.fsPath}\`: ${err}\n\n`);
+                stream.markdown(`> ⚠️ Could not read \`${relPath}\`: ${err}\n\n`);
             }
         }
     }
@@ -138,5 +179,60 @@ async function chatRequestHandler(request, _chatContext, stream, token) {
 }
 function deactivate() {
     // Nothing to clean up.
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// File-filtering helpers
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Stats a URI and returns a flat list of all file URIs beneath it.
+ * - If the URI is a plain file, returns [uri].
+ * - If the URI is a directory, recursively enumerates all files inside it.
+ * - Symlinks and unreadable entries are silently skipped.
+ */
+async function collectFiles(uri) {
+    let stat;
+    try {
+        stat = await vscode.workspace.fs.stat(uri);
+    }
+    catch {
+        return []; // unreadable / broken symlink
+    }
+    if (stat.type === vscode.FileType.File) {
+        return [uri];
+    }
+    if (stat.type === vscode.FileType.Directory) {
+        let entries;
+        try {
+            entries = await vscode.workspace.fs.readDirectory(uri);
+        }
+        catch {
+            return [];
+        }
+        const results = [];
+        for (const [name, type] of entries) {
+            if (type === vscode.FileType.File || type === vscode.FileType.Directory) {
+                results.push(...await collectFiles(vscode.Uri.joinPath(uri, name)));
+            }
+        }
+        return results;
+    }
+    return []; // symlinks, unknown types
+}
+/**
+ * Returns the file extension from a URI path, lower-cased.
+ * Dotfiles without a second dot (e.g. ".env") return their full basename (".env").
+ * Files with no extension return an empty string.
+ */
+function getFileExtension(uri) {
+    const basename = uri.path.split('/').pop() ?? '';
+    // Dotfiles like ".env", ".gitignore" — no second extension separator
+    if (basename.startsWith('.') && !basename.slice(1).includes('.')) {
+        return basename.toLowerCase(); // e.g. ".env"
+    }
+    const lastDot = basename.lastIndexOf('.');
+    if (lastDot <= 0) {
+        return '';
+    }
+    return basename.slice(lastDot).toLowerCase(); // e.g. ".yaml"
 }
 //# sourceMappingURL=extension.js.map

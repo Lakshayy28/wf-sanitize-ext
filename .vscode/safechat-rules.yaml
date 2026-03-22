@@ -81,17 +81,25 @@
 # are matched by their full basename.  Files like ".env.local" have extension
 # ".local" and must be listed separately.
 #
-# include_extensions:
-#
+include_extensions:
+  - .yaml        # Kubernetes, Helm, CI/CD, Spring Boot, GitLab CI, app config
+  - .yml         # same as .yaml (alternate spelling)
+  - .json        # package.json, appsettings.json, tsconfig.json, API responses
+  - .xml         # Maven pom.xml, web.config, Spring context, NuGet packages.config
+  - .conf        # Nginx, Apache, HAProxy, Redis, PostgreSQL, sshd_config
+  - .env         # dotenv secret files (.env, .env.production — matched by basename)
+  - .properties  # Java application.properties, gradle.properties
+  - .pem         # PEM-encoded certificate or private key
+  - .crt         # X.509 certificate (PEM or DER)
+  - .cer         # Windows DER/PEM certificate
+  - .pfx         # Windows PKCS#12 keystore (cert + private key bundle)
+  - .key         # private key file (RSA, EC, PKCS#8)
+# ── Full reference — uncomment any of the lines below to add more types ──────
+# include_extensions (additional options):
 #   # ── Universal config & data formats ───────────────────────────────────────
-#   - .yaml        # Kubernetes, Helm, CI/CD, Spring Boot, GitLab CI, app config
-#   - .yml         # same as .yaml (alternate spelling)
-#   - .json        # package.json, appsettings.json, tsconfig.json, API responses
-#   - .xml         # Maven pom.xml, web.config, Spring context, NuGet packages.config
 #   - .toml        # Cargo.toml, pyproject.toml, Pipfile, config.toml, Poetry
 #   - .ini         # classic config (php.ini, mypy.ini, tox.ini, pytest.ini)
 #   - .cfg         # setup.cfg, pip.cfg, flake8, mypy
-#   - .conf        # Nginx, Apache, HAProxy, Redis, PostgreSQL, sshd_config
 #   - .config      # NuGet.config, app.config, web.config (.NET / IIS)
 #   - .properties  # Java application.properties, gradle.properties, log4j
 #
@@ -214,7 +222,9 @@
 # skipped.  Use forward slashes.  Leading "./" and trailing "/" are stripped
 # automatically.
 #
-# ignore_folders:
+ignore_folders:
+  - .vscode/.temp_cache    # auto-generated diff cache (always exclude)
+# Uncomment to ignore additional folders:
 #   - secrets
 #   - infra/tfvars
 #   - config/local

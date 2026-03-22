@@ -50,62 +50,66 @@ async function chatRequestHandler(
     const refValue = ref.value;
 
     // Resolve the URI regardless of whether it's a Uri or Location reference
-    let fileUri: vscode.Uri | undefined;
+    let baseUri: vscode.Uri | undefined;
     if (refValue instanceof vscode.Uri) {
-      fileUri = refValue;
+      baseUri = refValue;
     } else if (refValue instanceof vscode.Location) {
-      fileUri = refValue.uri;
+      baseUri = refValue.uri;
     }
-    if (!fileUri) { continue; }
+    if (!baseUri) { continue; }
 
-    const relPath = vscode.workspace.asRelativePath(fileUri, false);
+    // Expand directories → flat list of file URIs (silently skips unreadable entries)
+    const fileUris = await collectFiles(baseUri);
 
-    // ── Folder ignore list check ──────────────────────────────────────
-    if (ignoreFolders && ignoreFolders.length > 0) {
+    for (const fileUri of fileUris) {
+      const relPath = vscode.workspace.asRelativePath(fileUri, false);
       const normalizedRel = relPath.replace(/\\/g, '/');
-      const inIgnoredFolder = ignoreFolders.some(
-        folder => normalizedRel === folder || normalizedRel.startsWith(folder + '/')
-      );
-      if (inIgnoredFolder) {
-        stream.markdown(`> ℹ️ Skipped \`${relPath}\` (inside ignored folder)\n\n`);
-        continue;
-      }
-    }
 
-    // ── File ignore list check ────────────────────────────────────────
-    if (ignoreFiles && ignoreFiles.length > 0) {
-      const normalizedRel = relPath.replace(/\\/g, '/');
-      if (ignoreFiles.includes(normalizedRel)) {
-        stream.markdown(`> ℹ️ Skipped \`${relPath}\` (in ignore list)\n\n`);
-        continue;
-      }
-    }
-
-    // ── Extension allowlist check ─────────────────────────────────────
-    if (includeExts && includeExts.length > 0) {
-      const ext = getFileExtension(fileUri);
-      const allowed = includeExts.some(e => {
-        const norm = (e.startsWith('.') ? e : '.' + e).toLowerCase();
-        return ext === norm;
-      });
-      if (!allowed) {
-        const extLabel = ext || '(no extension)';
-        stream.markdown(
-          `> ℹ️ Skipped \`${relPath}\` — extension \`${extLabel}\` is not in the ` +
-          `\`include_extensions\` allowlist. Add it to \`.vscode/safechat-rules.yaml\` to enable sanitization.\n\n`
+      // ── Folder ignore list check ────────────────────────────────────
+      if (ignoreFolders && ignoreFolders.length > 0) {
+        const inIgnoredFolder = ignoreFolders.some(
+          folder => normalizedRel === folder || normalizedRel.startsWith(folder + '/')
         );
-        continue;
+        if (inIgnoredFolder) {
+          stream.markdown(`> ℹ️ Skipped \`${relPath}\` (inside ignored folder)\n\n`);
+          continue;
+        }
       }
-    }
 
-    // ── Read the file ─────────────────────────────────────────────────
-    try {
-      const fileBytes = await vscode.workspace.fs.readFile(fileUri);
-      rawContext += Buffer.from(fileBytes).toString('utf-8') + '\n';
-    } catch (err) {
-      stream.markdown(
-        `> ⚠️ Could not read reference \`${relPath}\`: ${err}\n\n`
-      );
+      // ── File ignore list check ──────────────────────────────────────
+      if (ignoreFiles && ignoreFiles.length > 0) {
+        if (ignoreFiles.includes(normalizedRel)) {
+          stream.markdown(`> ℹ️ Skipped \`${relPath}\` (in ignore list)\n\n`);
+          continue;
+        }
+      }
+
+      // ── Extension allowlist check ───────────────────────────────────
+      if (includeExts && includeExts.length > 0) {
+        const ext = getFileExtension(fileUri);
+        const allowed = includeExts.some(e => {
+          const norm = (e.startsWith('.') ? e : '.' + e).toLowerCase();
+          return ext === norm;
+        });
+        if (!allowed) {
+          const extLabel = ext || '(no extension)';
+          stream.markdown(
+            `> ℹ️ Skipped \`${relPath}\` — extension \`${extLabel}\` is not in the ` +
+            `\`include_extensions\` allowlist. Add it to \`.vscode/safechat-rules.yaml\` to enable sanitization.\n\n`
+          );
+          continue;
+        }
+      }
+
+      // ── Read the file ─────────────────────────────────────────────
+      try {
+        const fileBytes = await vscode.workspace.fs.readFile(fileUri);
+        rawContext += Buffer.from(fileBytes).toString('utf-8') + '\n';
+      } catch (err) {
+        stream.markdown(
+          `> ⚠️ Could not read \`${relPath}\`: ${err}\n\n`
+        );
+      }
     }
   }
 
@@ -197,6 +201,43 @@ export function deactivate() {
 // ─────────────────────────────────────────────────────────────────────────────
 // File-filtering helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Stats a URI and returns a flat list of all file URIs beneath it.
+ * - If the URI is a plain file, returns [uri].
+ * - If the URI is a directory, recursively enumerates all files inside it.
+ * - Symlinks and unreadable entries are silently skipped.
+ */
+async function collectFiles(uri: vscode.Uri): Promise<vscode.Uri[]> {
+  let stat: vscode.FileStat;
+  try {
+    stat = await vscode.workspace.fs.stat(uri);
+  } catch {
+    return []; // unreadable / broken symlink
+  }
+
+  if (stat.type === vscode.FileType.File) {
+    return [uri];
+  }
+
+  if (stat.type === vscode.FileType.Directory) {
+    let entries: [string, vscode.FileType][];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(uri);
+    } catch {
+      return [];
+    }
+    const results: vscode.Uri[] = [];
+    for (const [name, type] of entries) {
+      if (type === vscode.FileType.File || type === vscode.FileType.Directory) {
+        results.push(...await collectFiles(vscode.Uri.joinPath(uri, name)));
+      }
+    }
+    return results;
+  }
+
+  return []; // symlinks, unknown types
+}
 
 /**
  * Returns the file extension from a URI path, lower-cased.

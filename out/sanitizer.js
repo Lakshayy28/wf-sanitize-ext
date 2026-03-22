@@ -33,6 +33,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.readRulesConfig = readRulesConfig;
 exports.regexSanitize = regexSanitize;
 exports.sanitizeAndCache = sanitizeAndCache;
 exports.viewDiffCommand = viewDiffCommand;
@@ -88,38 +89,162 @@ function normalizeEntityKey(key) {
  * Handles:
  *   rules:
  *     KeyName: Operation   # optional inline comment
+ *   custom_recognizers:
+ *     - name: EMPLOYEE_ID
+ *       pattern: "EMP-\\d{6}"
+ *       score: 0.85
+ *       context:
+ *         - employee
+ *         - staff
  */
 function parseRulesYaml(content) {
-    const result = {};
-    let inRules = false;
+    const rules = {};
+    const customRecognizers = [];
+    const includeExtensions = [];
+    const ignoreFiles = [];
+    const ignoreFolders = [];
+    let section = 'none';
+    let currentItem = {};
+    let currentContext = [];
+    const flushItem = () => {
+        if (currentItem.name && currentItem.pattern) {
+            customRecognizers.push({
+                name: currentItem.name,
+                pattern: currentItem.pattern,
+                score: currentItem.score ?? 0.85,
+                context: currentContext.length > 0 ? currentContext : undefined,
+            });
+        }
+        currentItem = {};
+        currentContext = [];
+    };
     for (const raw of content.split('\n')) {
-        const line = raw.replace(/#.*$/, '').trimEnd(); // strip inline comments
+        const line = raw.replace(/#.*$/, '').trimEnd();
         const trimmed = line.trim();
         if (!trimmed) {
             continue;
         }
+        // Top-level section headers
         if (trimmed === 'rules:') {
-            inRules = true;
+            flushItem();
+            section = 'rules';
             continue;
         }
-        if (inRules) {
-            if (/^\s/.test(line)) {
-                const m = trimmed.match(/^([A-Za-z0-9_]+)\s*:\s*([A-Za-z]+)/);
-                if (m) {
-                    result[m[1]] = m[2];
-                }
+        if (trimmed === 'custom_recognizers:') {
+            flushItem();
+            section = 'custom_recognizers';
+            continue;
+        }
+        if (trimmed === 'include_extensions:') {
+            flushItem();
+            section = 'include_extensions';
+            continue;
+        }
+        if (trimmed === 'ignore_files:') {
+            flushItem();
+            section = 'ignore_files';
+            continue;
+        }
+        if (trimmed === 'ignore_folders:') {
+            flushItem();
+            section = 'ignore_folders';
+            continue;
+        }
+        // Must be indented to be inside a section
+        if (!/^\s/.test(line)) {
+            flushItem();
+            section = 'none';
+            continue;
+        }
+        if (section === 'rules') {
+            const m = trimmed.match(/^([A-Za-z0-9_]+)\s*:\s*([A-Za-z]+)/);
+            if (m) {
+                rules[m[1]] = m[2];
             }
-            else {
-                inRules = false;
+        }
+        // Simple string-list sections
+        if (section === 'include_extensions' && trimmed.startsWith('- ')) {
+            const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
+            if (val) {
+                includeExtensions.push(val.startsWith('.') ? val.toLowerCase() : '.' + val.toLowerCase());
+            }
+            continue;
+        }
+        if (section === 'ignore_files' && trimmed.startsWith('- ')) {
+            const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
+            if (val) {
+                ignoreFiles.push(val.replace(/^\.\//, '').replace(/\\/g, '/'));
+            }
+            continue;
+        }
+        if (section === 'ignore_folders' && trimmed.startsWith('- ')) {
+            const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
+            // Normalise: strip leading ./ and trailing /, force forward slashes
+            if (val) {
+                ignoreFolders.push(val.replace(/^\.\//, '').replace(/\\/g, '/').replace(/\/$/, ''));
+            }
+            continue;
+        }
+        if (section === 'custom_recognizers' || section === 'custom_item' || section === 'custom_context') {
+            // New list item starts with "- name:"
+            if (trimmed.startsWith('- ')) {
+                flushItem();
+                section = 'custom_item';
+                const m = trimmed.match(/^-\s+name\s*:\s*(.+)/);
+                if (m) {
+                    currentItem.name = m[1].trim().replace(/^["']|["']$/g, '');
+                }
+                continue;
+            }
+            if (section === 'custom_context') {
+                // Collect context list items
+                if (trimmed.startsWith('- ')) {
+                    currentContext.push(trimmed.slice(2).trim().replace(/^["']|["']$/g, ''));
+                    continue;
+                }
+                // No longer in context list
+                section = 'custom_item';
+            }
+            if (section === 'custom_item') {
+                const kvMatch = trimmed.match(/^(\w+)\s*:\s*(.*)/);
+                if (kvMatch) {
+                    const key = kvMatch[1].toLowerCase();
+                    const val = kvMatch[2].trim().replace(/^["']|["']$/g, '');
+                    if (key === 'name') {
+                        currentItem.name = val;
+                    }
+                    else if (key === 'pattern') {
+                        currentItem.pattern = val;
+                    }
+                    else if (key === 'score') {
+                        currentItem.score = parseFloat(val) || 0.85;
+                    }
+                    else if (key === 'context') {
+                        // context can be inline [a, b] or a multi-line list
+                        if (val.startsWith('[')) {
+                            currentContext = val.replace(/[\[\]]/g, '').split(',').map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+                        }
+                        else if (!val) {
+                            section = 'custom_context';
+                        }
+                    }
+                }
             }
         }
     }
-    return result;
+    flushItem();
+    return {
+        rules: Object.keys(rules).length > 0 ? rules : undefined,
+        customRecognizers: customRecognizers.length > 0 ? customRecognizers : undefined,
+        includeExtensions: includeExtensions.length > 0 ? includeExtensions : undefined,
+        ignoreFiles: ignoreFiles.length > 0 ? ignoreFiles : undefined,
+        ignoreFolders: ignoreFolders.length > 0 ? ignoreFolders : undefined,
+    };
 }
 /**
  * Reads `.vscode/safechat-rules.yaml` (or the path from VS Code settings),
- * parses it, and returns a map of Presidio entity type → operation.
- * Returns `undefined` if the file doesn't exist (no overrides applied).
+ * parses it, and returns the rules config including any custom recognizers.
+ * Returns `undefined` if the file doesn't exist.
  */
 async function readRulesConfig() {
     const config = vscode.workspace.getConfiguration('safechat');
@@ -131,12 +256,25 @@ async function readRulesConfig() {
     const rulesUri = vscode.Uri.joinPath(folders[0].uri, rulesPath);
     try {
         const bytes = await vscode.workspace.fs.readFile(rulesUri);
-        const raw = parseRulesYaml(Buffer.from(bytes).toString('utf-8'));
-        const normalized = {};
-        for (const [k, v] of Object.entries(raw)) {
-            normalized[normalizeEntityKey(k)] = v;
+        const parsed = parseRulesYaml(Buffer.from(bytes).toString('utf-8'));
+        // Normalize rule keys to canonical Presidio entity types
+        let normalizedRules;
+        if (parsed.rules) {
+            normalizedRules = {};
+            for (const [k, v] of Object.entries(parsed.rules)) {
+                normalizedRules[normalizeEntityKey(k)] = v;
+            }
+            if (Object.keys(normalizedRules).length === 0) {
+                normalizedRules = undefined;
+            }
         }
-        return Object.keys(normalized).length > 0 ? normalized : undefined;
+        return {
+            rules: normalizedRules,
+            customRecognizers: parsed.customRecognizers,
+            includeExtensions: parsed.includeExtensions,
+            ignoreFiles: parsed.ignoreFiles,
+            ignoreFolders: parsed.ignoreFolders,
+        };
     }
     catch {
         return undefined; // file absent or unreadable → use server defaults
@@ -146,7 +284,7 @@ async function readRulesConfig() {
  * Calls the `/sanitize` endpoint on the running Presidio HTTP server.
  * Rejects if the server is unreachable or returns a non-2xx status.
  */
-function callPresidioApi(text, rules) {
+function callPresidioApi(text, rulesConfig) {
     return new Promise((resolve, reject) => {
         const baseUrl = getPresidioApiUrl();
         let urlObj;
@@ -158,8 +296,11 @@ function callPresidioApi(text, rules) {
             return;
         }
         const payload = { text };
-        if (rules && Object.keys(rules).length > 0) {
-            payload.rules = rules;
+        if (rulesConfig?.rules && Object.keys(rulesConfig.rules).length > 0) {
+            payload.rules = rulesConfig.rules;
+        }
+        if (rulesConfig?.customRecognizers && rulesConfig.customRecognizers.length > 0) {
+            payload.custom_recognizers = rulesConfig.customRecognizers;
         }
         const body = JSON.stringify(payload);
         const options = {
@@ -323,9 +464,9 @@ async function sanitizeAndCache(rawText, _extensionPath) {
     let presidioModified = false;
     let presidioError;
     // ── Tier 1: Presidio API masking ────────────────────────────────────
-    const rules = await readRulesConfig();
+    const rulesConfig = await readRulesConfig();
     try {
-        const result = await callPresidioApi(rawText, rules);
+        const result = await callPresidioApi(rawText, rulesConfig);
         presidioText = result.sanitized_text;
         presidioModified = result.was_modified;
     }
