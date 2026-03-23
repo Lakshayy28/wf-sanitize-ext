@@ -7,4 +7,7 @@ presidio_server/bdd/reports/allure-results
 **/.pytest_cache/
 presidio_server/bdd/reports
 test.yaml
+_test_splunk.py
+_rewrite_recognizers.py
+_validate_recognizers.py
 presidio_server

@@ -215,31 +215,8 @@ rules:
   # URL: Replace
 
   # ── Financial (custom recognizers) ───────────────────────────────────────
-  # SWIFT_BIC_CODE: Mask         # SWIFT/BIC bank codes           → ****
-  # US_ROUTING_NUMBER: Mask      # ABA routing numbers            → ****
-  # UK_SORT_CODE: Mask           # UK sort codes                  → ****
-  # BSB_CODE: Mask               # Australian BSB codes           → ****
   # CARD_CVV: Mask               # Card CVV/CVC codes             → ****
   # CARD_EXPIRY: Mask            # Card expiry dates              → ****
-  # ISIN_CODE: Replace           # ISIN securities IDs            → <ISIN_CODE>
-  # CUSIP: Replace               # CUSIP securities IDs           → <CUSIP>
-  # SEDOL: Replace               # SEDOL securities IDs           → <SEDOL>
-  # TAX_EIN: Mask                # US Employer ID Numbers         → ****
-  # VAT_NUMBER: Replace          # VAT registration numbers       → <VAT_NUMBER>
-  # PAYMENT_REFERENCE: Replace   # Transaction reference IDs      → <PAYMENT_REFERENCE>
-  # LOAN_ACCOUNT: Mask           # Loan / mortgage account nos    → ****
-  #
-  # ── US Credit Bureau, FICO & Consumer-Finance ────────────────────────────
-  # CREDIT_SCORE: Mask           # FICO / VantageScore / Beacon credit scores (300–850) → ****
-  # CREDIT_BUREAU_FILE: Mask     # Experian/Equifax/TransUnion subscriber codes & file nos → ****
-  # NMLS_ID: Mask                # Nationwide Mortgage Licensing System originator IDs    → ****
-  # ACH_TRACE_NUMBER: Mask       # NACHA ACH 15-digit trace numbers                       → ****
-  # LEI_CODE: Replace            # ISO 17442 Legal Entity Identifiers (20-char)           → <LEI_CODE>
-  # MERS_MIN: Mask               # MERS 18-digit Mortgage Identification Numbers           → ****
-  # FEDWIRE_IMAD: Mask           # Fedwire IMAD / OMAD message accountability IDs         → ****
-  # BANKRUPTCY_CASE: Replace     # US federal bankruptcy court case numbers               → <BANKRUPTCY_CASE>
-  # UCC_FILING_NUMBER: Replace   # UCC-1 financing statement file numbers                 → <UCC_FILING_NUMBER>
-  # FICO_REASON_CODE: Replace    # FICO score reason / adverse action factor codes        → <FICO_REASON_CODE>
 
   # ── Developer secrets (custom recognizers) ───────────────────────────────
   # AWS_ACCESS_KEY: Mask         # AWS IAM access key IDs         → ****
@@ -250,7 +227,6 @@ rules:
   # JWT_TOKEN: Mask              # JSON Web Tokens                → ****
   # STRIPE_KEY: Mask             # Stripe API keys                → ****
   # SENDGRID_KEY: Mask           # SendGrid API keys              → ****
-  # TWILIO_SID: Mask             # Twilio Account SIDs            → ****
   # NPM_TOKEN: Mask              # NPM registry tokens            → ****
   # HASHICORP_VAULT_TOKEN: Mask  # HashiCorp Vault tokens         → ****
   # GENERIC_API_KEY: Mask        # Generic API key assignments    → ****
@@ -266,26 +242,17 @@ rules:
   # MONGO_URL: Mask              # MongoDB URIs                   → ****
   # INTERNAL_HOSTNAME: Replace   # Internal hostnames             → <INTERNAL_HOSTNAME>
   # PRIVATE_IP_ADDRESS: Replace  # RFC 1918 / loopback IPs        → <PRIVATE_IP_ADDRESS>
-  # MAC_ADDRESS: Mask            # Network MAC addresses          → ****
   # ENV_VARIABLE_VALUE: Mask     # .env secret assignments        → ****
-  # K8S_SECRET_VALUE: Mask       # K8s Secret base64 values       → ****
-  # CERTIFICATE_THUMBPRINT: Mask # Cert SHA-1/SHA-256 thumbprints → ****
 
   # ── CI/CD & Platform (custom recognizers) ────────────────────────────────
-  # JENKINS_TOKEN: Mask              # Jenkins API tokens             → ****
-  # CIRCLECI_TOKEN: Mask             # CircleCI API tokens            → ****
-  # GITLAB_CI_TOKEN: Mask            # GitLab CI/runner tokens        → ****
   # SONARQUBE_TOKEN: Mask            # SonarQube analysis tokens      → ****
   # OPENSHIFT_TOKEN: Mask            # OpenShift / OCP API tokens     → ****
-  # K8S_SA_TOKEN: Mask               # K8s service account tokens     → ****
   # DOCKER_REGISTRY_CREDENTIAL: Mask # Docker registry auth entries   → ****
   # HELM_SECRET: Mask                # SOPS-encrypted Helm values     → ****
   # TERRAFORM_TOKEN: Mask            # Terraform Cloud tokens         → ****
   # ANSIBLE_VAULT: Mask              # Ansible Vault encrypted blocks → ****
   # GCP_SA_KEY: Mask                 # GCP service account keys       → ****
-  # AZURE_SP_SECRET: Mask            # Azure SP client secrets/IDs    → ****
   # BITBUCKET_APP_PASSWORD: Mask     # Bitbucket app passwords        → ****
-  # ARGOCD_TOKEN: Mask               # Argo CD API tokens             → ****
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Custom Recognizers
