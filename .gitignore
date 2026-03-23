@@ -1,3 +1,10 @@
 node_modules
 prompts
+test.yaml
+presidio_server/bdd/reports/allure-results
+**/__pycache__/
+*.pyc
+**/.pytest_cache/
+presidio_server/bdd/reports
+test.yaml
 presidio_server

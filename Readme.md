@@ -24,6 +24,10 @@ You type: @safechat explain this config #file:config.yaml
                         │ clean text
                  Sent to Copilot LM
                         │
+          Full agentic tool loop:
+          search code, read files, run
+          commands (up to 15 rounds)
+                        │
              Copilot response streamed
              back to Chat panel
 ```
@@ -38,9 +42,9 @@ The original and masked versions of each prompt are cached locally under `.vscod
 - **Two-tier sanitization** — Microsoft Presidio (NLP) as the primary engine with regex as an always-on fallback.
 - **70+ PII entity types** — names, emails, phone numbers, credit cards, SSNs, IBANs, SWIFT codes, API keys, JWTs, AWS keys, database URLs, K8s secrets, CI/CD tokens, and more.
 - **5 anonymizer operations** — `replace`, `mask`, `redact`, `hash`, or `encrypt` per entity type, configured in a single YAML file.
-- **File type allowlist** — restrict scanning to only data/config file extensions (`.yaml`, `.json`, `.env`, etc.); code files are excluded by default when enabled.
-- **File ignore list** — specify workspace-relative paths that are never read, sanitized, or forwarded.
-- **Folder ignore list** — exclude entire directory trees (e.g. `secrets/`, `infra/tfvars`) in one entry.
+- **File type allowlist** — restrict scanning to only data/config file extensions (`.yaml`, `.json`, `.env`, etc.); non-matching files (`.ts`, `.py`, `.go`, etc.) are **forwarded as-is** to Copilot without modification.
+- **Full agentic behaviour** — passes all available VS Code tools to the LLM and runs an agentic tool-calling loop (up to 15 rounds): search code, read files, run commands — identical to native Copilot Agent mode.
+- **Conversation continuity** — per-file state cache with `mtime`-based invalidation keeps all attached file context live across multiple turns in the same chat.
 - **User-defined custom recognizers** — add your own regex patterns (employee IDs, ticket numbers, internal references) via the YAML config; no server restart needed.
 - **5 sanitization profiles** — `financial`, `developer`, `infrastructure`, `cicd`, `full` — load the right set of recognizers for your context.
 - **Diff viewer** — every prompt with detected PII gets a "View Masked Diff" button that opens a side-by-side comparison of original vs. sanitized context.
@@ -55,7 +59,7 @@ The original and masked versions of each prompt are cached locally under `.vscod
 
 | Requirement | Version |
 |---|---|
-| VS Code | 1.90.0 or later |
+| VS Code | 1.95.0 or later |
 | GitHub Copilot Chat extension | Latest |
 | Python | 3.9 or later |
 | Node.js | 18 or later (development only) |
@@ -225,7 +229,7 @@ All user controls live in a single file: `.vscode/safechat-rules.yaml`. This fil
 
 > **Tip:** A fully-commented template with all entity types, examples, and hints is pre-installed at `.vscode/safechat-rules.yaml`. An interactive YAML generator is also available at `http://localhost:8000/docs/ui`.
 
-The file has four independent sections — use any combination:
+The file has three independent sections — use any combination:
 
 ```yaml
 # 1. Which file types to scan (absent = scan everything)
@@ -234,25 +238,14 @@ include_extensions:
   - .json
   - .env
 
-# 2. Specific files to never forward to Copilot
-ignore_files:
-  - .env.local
-  - secrets/dev-creds.json
-
-# 3. Entire folders to never forward to Copilot
-ignore_folders:
-  - secrets
-  - infra/tfvars
-  - config/local
-
-# 3. Per-entity anonymizer operations
+# 2. Per-entity anonymizer operations
 rules:
   AccountNumber: mask
   PhoneNumber: replace
   US_SSN: redact
   CREDIT_CARD: hash
 
-# 4. User-defined regex recognizers (no restart needed)
+# 3. User-defined regex recognizers (no restart needed)
 custom_recognizers:
   - name: EMPLOYEE_ID
     pattern: "EMP-\\d{6}"
@@ -266,7 +259,7 @@ custom_recognizers:
 
 ### Section 1 — File extension allowlist (`include_extensions`)
 
-When present, only files whose extension matches the list are scanned and sanitized. Files that do not match are **skipped** — an `ℹ️ Skipped` notice appears in chat. If the section is absent or empty, all attached files are scanned (the original behaviour).
+When present, only files whose extension matches the list are scanned and sanitized. Files that do not match are **forwarded as-is** to Copilot — no blocking, no scanning. If the section is absent or empty, all attached files are scanned.
 
 This lets you exclude code files (`.ts`, `.py`, `.go`, `.java`) while still catching secrets in config and data files. A commented template with every supported extension is pre-installed in `.vscode/safechat-rules.yaml`. Key groups:
 
@@ -350,38 +343,7 @@ Dotfiles with no secondary extension (`.env`, `.npmrc`, `.netrc`) are matched by
 
 ---
 
-### Section 2 — File ignore list (`ignore_files`)
-
-Workspace-relative paths listed here are **never read, never sanitized, and never forwarded to Copilot**. A leading `./` is stripped automatically. Use forward slashes on all platforms.
-
-```yaml
-ignore_files:
-  - .env.local
-  - .env.test
-  - config/local-override.yaml
-  - secrets/dev-credentials.json
-  - infra/terraform.tfvars
-```
-
----
-
-### Section 2b — Folder ignore list (`ignore_folders`)
-
-Any file whose workspace-relative path falls inside one of these folders is skipped entirely — at any nesting depth. A leading `./` and trailing `/` are stripped automatically.
-
-```yaml
-ignore_folders:
-  - secrets            # skips secrets/*, secrets/**/*
-  - infra/tfvars       # skips infra/tfvars/**/*
-  - config/local       # skips config/local/**/*
-  - .private
-```
-
-Files skipped by either list show an `ℹ️ Skipped` notice in the chat with the file name and reason.
-
----
-
-### Section 3 — Anonymizer operations (`rules`)
+### Section 2 — Anonymizer operations (`rules`)
 
 Controls how each detected entity type is transformed:
 
@@ -431,7 +393,7 @@ Any entity type **not listed** in `rules` defaults to `replace`. For the full ca
 
 ---
 
-### Section 4 — Custom recognizers (`custom_recognizers`)
+### Section 3 — Custom recognizers (`custom_recognizers`)
 
 Define your own regex-based recognizers without touching the server. Each recognizer is active for the duration of the request — no restart required.
 
@@ -660,7 +622,7 @@ python -m spacy download en_core_web_lg
 ```
 
 **VSIX install succeeds but extension is not active**
-- Check VS Code version is 1.90.0 or later.
+- Check VS Code version is 1.95.0 or later.
 - Open the Extensions panel and confirm "Safe Copilot Context" is listed and enabled.
 
 ---

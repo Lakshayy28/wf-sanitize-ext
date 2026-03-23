@@ -228,6 +228,18 @@ rules:
   # VAT_NUMBER: Replace          # VAT registration numbers       → <VAT_NUMBER>
   # PAYMENT_REFERENCE: Replace   # Transaction reference IDs      → <PAYMENT_REFERENCE>
   # LOAN_ACCOUNT: Mask           # Loan / mortgage account nos    → ****
+  #
+  # ── US Credit Bureau, FICO & Consumer-Finance ────────────────────────────
+  # CREDIT_SCORE: Mask           # FICO / VantageScore / Beacon credit scores (300–850) → ****
+  # CREDIT_BUREAU_FILE: Mask     # Experian/Equifax/TransUnion subscriber codes & file nos → ****
+  # NMLS_ID: Mask                # Nationwide Mortgage Licensing System originator IDs    → ****
+  # ACH_TRACE_NUMBER: Mask       # NACHA ACH 15-digit trace numbers                       → ****
+  # LEI_CODE: Replace            # ISO 17442 Legal Entity Identifiers (20-char)           → <LEI_CODE>
+  # MERS_MIN: Mask               # MERS 18-digit Mortgage Identification Numbers           → ****
+  # FEDWIRE_IMAD: Mask           # Fedwire IMAD / OMAD message accountability IDs         → ****
+  # BANKRUPTCY_CASE: Replace     # US federal bankruptcy court case numbers               → <BANKRUPTCY_CASE>
+  # UCC_FILING_NUMBER: Replace   # UCC-1 financing statement file numbers                 → <UCC_FILING_NUMBER>
+  # FICO_REASON_CODE: Replace    # FICO score reason / adverse action factor codes        → <FICO_REASON_CODE>
 
   # ── Developer secrets (custom recognizers) ───────────────────────────────
   # AWS_ACCESS_KEY: Mask         # AWS IAM access key IDs         → ****
