@@ -579,6 +579,26 @@ npm run watch     # compile on save
 npm run lint      # ESLint
 ```
 
+### Rebuilding the extension
+
+After making changes to `src/extension.ts` or `src/sanitizer.ts`, rebuild and repackage the extension:
+
+```bash
+# Compile TypeScript
+npm run compile
+
+# Repackage the VSIX
+npx @vscode/vsce package --allow-missing-repository
+```
+
+This produces an updated `safe-copilot-context-0.0.1.vsix` (42+ KB) that includes all compiled changes. Then reinstall it:
+
+```bash
+code --install-extension safe-copilot-context-0.0.1.vsix
+```
+
+Or in VS Code: **Extensions** → **···** → **Install from VSIX…** and select the file.
+
 ### Packaging a VSIX
 
 ```bash

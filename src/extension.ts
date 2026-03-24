@@ -12,11 +12,13 @@ interface FileState {
   originalContent: string;
   sanitizedContent: string;
   wasMasked: boolean;
+  rulesHash: string;
 }
 
 const fileStateCache = new Map<string, FileState>();
 let conversationFileKeys = new Set<string>();
 let latestCacheEntryUri: vscode.Uri | undefined;
+let lastRulesHash: string | undefined;
 
 // ── Activation ──────────────────────────────────────────────────────────────
 
@@ -52,15 +54,45 @@ async function chatRequestHandler(
 
   stream.progress('Scanning attached context for sensitive data…');
 
+  // ── DEBUG: log references received from VS Code ──────────────────────
+  const refDebug = request.references.map(r => ({
+    id: r.id,
+    valueType: r.value === undefined ? 'undefined'
+      : r.value instanceof vscode.Uri ? 'Uri'
+      : r.value instanceof vscode.Location ? 'Location'
+      : typeof r.value,
+    value: r.value instanceof vscode.Uri ? r.value.toString()
+      : r.value instanceof vscode.Location ? r.value.uri.toString()
+      : typeof r.value === 'string' ? r.value : JSON.stringify(r.value),
+  }));
+  console.log('[SafeChat] request.prompt:', JSON.stringify(request.prompt));
+  console.log('[SafeChat] request.references (' + request.references.length + '):', JSON.stringify(refDebug, null, 2));
+
   const filterConfig = await readRulesConfig();
   const includeExts = filterConfig?.includeExtensions;
 
+  // ── Cache invalidation checks ────────────────────────────────────────
+  const rulesHash = computeConfigHash(filterConfig);
+  const diskExists = await diskCacheExists();
+  const rulesChanged = lastRulesHash !== undefined && lastRulesHash !== rulesHash;
+
+  if (rulesChanged || !diskExists) {
+    fileStateCache.clear();
+    latestCacheEntryUri = undefined;
+  }
+  lastRulesHash = rulesHash;
+
   // ── Step 1: Resolve file URIs from all attached references ───────────
-  const referencedUris = await resolveAllReferences(request.references);
+  const referencedUris = await resolveAllReferences(request.references, request.prompt);
+  console.log('[SafeChat] resolvedUris count:', referencedUris.length);
+  if (referencedUris.length > 0) {
+    console.log('[SafeChat] first 5 URIs:', referencedUris.slice(0, 5).map(u => u.toString()));
+  }
 
   // ── Step 2: Process each file — reuse cache or (re-)sanitize ─────────
   let newMasks = 0;
   let anyPresidioError: string | undefined;
+  const staleKeys = new Set<string>();
 
   for (const fileUri of referencedUris) {
     const key = fileUri.toString();
@@ -69,11 +101,11 @@ async function chatRequestHandler(
     let stat: vscode.FileStat;
     try {
       stat = await vscode.workspace.fs.stat(fileUri);
-    } catch { continue; }
+    } catch { staleKeys.add(key); continue; }
     if (stat.type !== vscode.FileType.File) { continue; }
 
     const cached = fileStateCache.get(key);
-    if (cached && cached.mtime === stat.mtime) { continue; }
+    if (cached && cached.mtime === stat.mtime && cached.rulesHash === rulesHash) { continue; }
 
     const relPath = vscode.workspace.asRelativePath(fileUri, false);
     let text: string;
@@ -99,16 +131,22 @@ async function chatRequestHandler(
       fileStateCache.set(key, {
         relPath, mtime: stat.mtime, isSensitive: true,
         originalContent: text, sanitizedContent: result.cleanText,
-        wasMasked: result.wasModified,
+        wasMasked: result.wasModified, rulesHash,
       });
       if (result.wasModified) { newMasks++; }
     } else {
       fileStateCache.set(key, {
         relPath, mtime: stat.mtime, isSensitive: false,
         originalContent: text, sanitizedContent: text,
-        wasMasked: false,
+        wasMasked: false, rulesHash,
       });
     }
+  }
+
+  // Prune stale keys (files that no longer exist on disk)
+  for (const key of staleKeys) {
+    conversationFileKeys.delete(key);
+    fileStateCache.delete(key);
   }
 
   // ── Step 3: Build context from ALL files in the conversation ─────────
@@ -129,7 +167,8 @@ async function chatRequestHandler(
   }
 
   // ── Step 4: Write per-file diff cache ────────────────────────────────
-  if (newMasks > 0 && maskedFiles.length > 0) {
+  // Rewrite when new masks appear OR when disk cache was deleted/cleared
+  if (maskedFiles.length > 0 && (newMasks > 0 || !diskExists)) {
     await writePerFileDiffCache(maskedFiles);
   }
 
@@ -165,17 +204,18 @@ async function chatRequestHandler(
   const priorityNames = new Set(request.toolReferences.map(r => r.name));
   const allTools: vscode.LanguageModelChatTool[] = [];
 
-  // Add priority (user-referenced) tools first
+  // Add priority (user-referenced) tools first — skip malformed schemas
   for (const t of vscode.lm.tools) {
-    if (priorityNames.has(t.name)) {
+    if (priorityNames.has(t.name) && isToolSchemaValid(t.inputSchema)) {
       allTools.push({ name: t.name, description: t.description, inputSchema: t.inputSchema });
     }
   }
 
-  // Fill remaining slots with other tools
+  // Fill remaining slots — skip tools with invalid schemas
+  // (e.g. MCP tools declaring type:"object" without "properties" cause 400 errors)
   for (const t of vscode.lm.tools) {
     if (allTools.length >= MAX_TOOLS) { break; }
-    if (!priorityNames.has(t.name)) {
+    if (!priorityNames.has(t.name) && isToolSchemaValid(t.inputSchema)) {
       allTools.push({ name: t.name, description: t.description, inputSchema: t.inputSchema });
     }
   }
@@ -291,24 +331,74 @@ async function chatRequestHandler(
 
 export function deactivate() {}
 
+// ── Cache Invalidation Helpers ──────────────────────────────────────────────
+
+/** Simple 32-bit hash for fast cache-key comparisons (not cryptographic). */
+function computeConfigHash(config: RulesConfig | undefined): string {
+  const str = JSON.stringify(config ?? {});
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) - h) + str.charCodeAt(i);
+    h |= 0;
+  }
+  return h.toString(36);
+}
+
+/** Returns true if the `.vscode/.temp_cache` folder exists on disk. */
+async function diskCacheExists(): Promise<boolean> {
+  const baseUri = getCacheBaseUri();
+  if (!baseUri) { return false; }
+  try {
+    await vscode.workspace.fs.stat(baseUri);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ── Tool Schema Validation ──────────────────────────────────────────────────
+
+/**
+ * Returns false if the JSON Schema would cause the Copilot API to reject the
+ * entire request (e.g. `{ type: "object" }` without `properties`).
+ */
+function isToolSchemaValid(schema: unknown): boolean {
+  if (schema === undefined || schema === null) { return true; }
+  return !hasObjectWithoutProperties(schema);
+}
+
+function hasObjectWithoutProperties(node: unknown): boolean {
+  if (typeof node !== 'object' || node === null) { return false; }
+  const s = node as Record<string, unknown>;
+  if (s['type'] === 'object' && !('properties' in s)) { return true; }
+  for (const val of Object.values(s)) {
+    if (typeof val === 'object' && val !== null) {
+      if (hasObjectWithoutProperties(val)) { return true; }
+    }
+  }
+  return false;
+}
+
 // ── Reference Resolution ────────────────────────────────────────────────────
 
 async function resolveAllReferences(
   references: readonly vscode.ChatPromptReference[],
+  promptText?: string,
 ): Promise<vscode.Uri[]> {
   const uris: vscode.Uri[] = [];
+  let codebaseRequested = false;
 
   for (const ref of references) {
     const refId = (ref.id ?? '').toLowerCase();
+    console.log('[SafeChat] processing ref — id:', JSON.stringify(ref.id),
+      'valueType:', ref.value === undefined ? 'undefined'
+        : ref.value instanceof vscode.Uri ? 'Uri'
+        : ref.value instanceof vscode.Location ? 'Location'
+        : typeof ref.value);
 
     // #codebase / workspace-wide reference
     if (refId.includes('codebase') || refId.includes('workspace')) {
-      const folders = vscode.workspace.workspaceFolders;
-      if (folders) {
-        for (const folder of folders) {
-          uris.push(...await collectFiles(folder.uri));
-        }
-      }
+      codebaseRequested = true;
       continue;
     }
 
@@ -346,6 +436,30 @@ async function resolveAllReferences(
     if (baseUri) {
       uris.push(...await collectFiles(baseUri));
     }
+  }
+
+  // Fallback: detect #codebase from prompt text if no reference matched
+  if (!codebaseRequested && promptText) {
+    const lower = promptText.toLowerCase();
+    if (lower.includes('#codebase') || lower.includes('#workspace')) {
+      codebaseRequested = true;
+      console.log('[SafeChat] #codebase detected from prompt text (not in references)');
+    }
+  }
+
+  // Collect all workspace files for #codebase
+  if (codebaseRequested) {
+    const folders = vscode.workspace.workspaceFolders;
+    console.log('[SafeChat] #codebase detected — workspaceFolders:',
+      folders ? folders.map(f => f.uri.toString()) : 'undefined');
+    if (folders) {
+      for (const folder of folders) {
+        uris.push(...await collectFiles(folder.uri));
+      }
+    } else {
+      console.log('[SafeChat] WARNING: workspaceFolders is undefined — no files will be collected for #codebase');
+    }
+    console.log('[SafeChat] #codebase collected', uris.length, 'files');
   }
 
   // Deduplicate by URI string
@@ -440,19 +554,21 @@ async function writePerFileDiffCache(
   try { await vscode.workspace.fs.stat(gitignoreUri); }
   catch { await vscode.workspace.fs.writeFile(gitignoreUri, Buffer.from('*\n', 'utf-8')); }
 
-  const entryDir = vscode.Uri.joinPath(baseUri, timestampSlug());
-  await vscode.workspace.fs.createDirectory(entryDir);
+  // Use a stable 'latest' directory — recreate to remove stale entries
+  const latestDir = vscode.Uri.joinPath(baseUri, 'latest');
+  try { await vscode.workspace.fs.delete(latestDir, { recursive: true }); } catch { /* first run */ }
+  await vscode.workspace.fs.createDirectory(latestDir);
 
   // Write per-file original + masked pairs
   for (const file of maskedFiles) {
     const safeName = file.relPath.replace(/[/\\]/g, '_');
     await Promise.all([
       vscode.workspace.fs.writeFile(
-        vscode.Uri.joinPath(entryDir, `${safeName}.original.txt`),
+        vscode.Uri.joinPath(latestDir, `${safeName}.original.txt`),
         Buffer.from(file.original, 'utf-8'),
       ),
       vscode.workspace.fs.writeFile(
-        vscode.Uri.joinPath(entryDir, `${safeName}.masked.txt`),
+        vscode.Uri.joinPath(latestDir, `${safeName}.masked.txt`),
         Buffer.from(file.masked, 'utf-8'),
       ),
     ]);
@@ -460,11 +576,11 @@ async function writePerFileDiffCache(
 
   // Manifest listing all masked file paths
   await vscode.workspace.fs.writeFile(
-    vscode.Uri.joinPath(entryDir, 'manifest.json'),
+    vscode.Uri.joinPath(latestDir, 'manifest.json'),
     Buffer.from(JSON.stringify(maskedFiles.map(f => f.relPath)), 'utf-8'),
   );
 
-  latestCacheEntryUri = entryDir;
+  latestCacheEntryUri = latestDir;
 }
 
 // ── Diff Viewer (per-file with QuickPick) ───────────────────────────────────
@@ -477,19 +593,13 @@ async function handleViewDiff(entryUriString?: string): Promise<void> {
   } else {
     entryUri = latestCacheEntryUri;
     if (!entryUri) {
-      // Try to recover the most recent cache entry from disk
+      // Try to recover from the stable 'latest' cache directory
       const baseUri = getCacheBaseUri();
       if (baseUri) {
         try {
-          const entries = await vscode.workspace.fs.readDirectory(baseUri);
-          const dirs = entries
-            .filter(([, type]) => type === vscode.FileType.Directory)
-            .map(([name]) => name)
-            .sort()
-            .reverse();
-          if (dirs.length > 0) {
-            entryUri = vscode.Uri.joinPath(baseUri, dirs[0]);
-          }
+          const latestDir = vscode.Uri.joinPath(baseUri, 'latest');
+          await vscode.workspace.fs.stat(latestDir);
+          entryUri = latestDir;
         } catch { /* no cache yet */ }
       }
     }
