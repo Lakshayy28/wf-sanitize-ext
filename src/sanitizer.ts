@@ -443,6 +443,107 @@ function looksLikeSecret(s: string): boolean {
   return false;
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Content-aware heuristic sanitizer (Tier 2b — unstructured text)
+// ────────────────────────────────────────────────────────────────────────────
+
+/** ANSI escape code stripper (SGR, cursor movement, erase sequences). */
+const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]|\x1b\]\d*;[^\x07]*(?:\x07|\x1b\\)|\x1b[^\[\]][A-Za-z]/g;
+
+/** Strip ANSI escape sequences while preserving all visible text. */
+export function stripAnsiCodes(text: string): string {
+  return text.replace(ANSI_RE, '');
+}
+
+/**
+ * PEM private key block pattern.
+ * Matches the full BEGIN/END block including the base64 body.
+ */
+const PEM_BLOCK_RE = /-----BEGIN\s+(?:RSA\s+|EC\s+|DSA\s+|OPENSSH\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:RSA\s+|EC\s+|DSA\s+|OPENSSH\s+)?PRIVATE\s+KEY-----/g;
+
+/**
+ * Inline secret assignment patterns commonly found in code.
+ * Catches hardcoded strings like `const apiKey = "sk-abc123..."` or
+ * `password: 'hunter2'` across multiple programming languages.
+ */
+const INLINE_SECRET_ASSIGN_RE = new RegExp(
+  '(?:' +
+    // JS/TS/Python/Ruby assignment: variable = 'value'
+    '(?:const|let|var|val|def|my|local)?\\s*' +
+    '(?:password|passwd|secret|api_?key|api_?secret|token|access_?token|auth_?token|' +
+    'private_?key|client_?secret|jwt_?secret|session_?secret|signing_?key|encryption_?key|' +
+    'database_?url|connection_?string|db_?password|redis_?password|mongo_?uri)' +
+    '\\s*[:=]\\s*' +
+  ')' +
+  // Quoted value or bare value
+  '(?:' +
+    '(["\'])([^"\'>]{4,}?)\\1' +  // quoted (groups 1,2)
+    '|' +
+    '([^\\s;,}{\\]\\)"\'>]{8,})' +  // bare (group 3)
+  ')',
+  'gi'
+);
+
+/**
+ * Generic hex/base64 tokens that appear as bare string literals.
+ * Targets long strings (32+ chars) of hex or base64 with known prefixes.
+ */
+const GENERIC_TOKEN_RE = /(?:^|["'`=:\s])([A-Za-z0-9+/\-_]{32,}={0,3})(?:["'`\s;,}\])]|$)/gm;
+
+/**
+ * Content-aware heuristic sanitizer for unstructured text.
+ *
+ * Processes raw multiline text (e.g., search result snippets) to catch:
+ * - PEM private key blocks
+ * - Inline hardcoded secrets in code (`const apiKey = "..."` etc.)
+ * - Bare high-entropy tokens (32+ chars with Shannon entropy > 4)
+ *
+ * This function is intended to run AFTER `regexSanitize` as an additional
+ * pass that catches secrets not in key=value format.
+ */
+export function contentSanitize(text: string): { cleanText: string; wasModified: boolean } {
+  let wasModified = false;
+  let result = text;
+
+  // 1. Redact entire PEM private key blocks
+  result = result.replace(PEM_BLOCK_RE, () => {
+    wasModified = true;
+    return MASK + '_PEM_KEY';
+  });
+
+  // 2. Inline secret assignments in code snippets
+  result = result.replace(INLINE_SECRET_ASSIGN_RE, (match, quote, quotedVal, bareVal) => {
+    wasModified = true;
+    const val = quotedVal || bareVal;
+    // Preserve the key/assignment portion, mask only the value
+    return match.replace(val, MASK);
+  });
+
+  // 3. Line-by-line scan for bare high-entropy tokens
+  const lines = result.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    // Reset regex state
+    GENERIC_TOKEN_RE.lastIndex = 0;
+    let lineModified = false;
+    lines[i] = lines[i].replace(GENERIC_TOKEN_RE, (full, captured: string) => {
+      // Skip tokens that look like file paths, URLs, or common programming identifiers
+      if (/^(?:\/|\.\/|[a-z]:[/\\]|https?:|file:)/i.test(captured)) { return full; }
+      if (/^(?:node_modules|package|function|return|import|export|require|undefined)/i.test(captured)) { return full; }
+      if (looksLikeSecret(captured)) {
+        lineModified = true;
+        return full.replace(captured, MASK);
+      }
+      return full;
+    });
+    if (lineModified) { wasModified = true; }
+  }
+  if (wasModified) {
+    result = lines.join('\n');
+  }
+
+  return { cleanText: result, wasModified };
+}
+
 /**
  * Terminal-specific sanitizer: applies narrow, targeted regexes for secrets
  * commonly seen in terminal/CLI output (curl headers, env vars, JSON fields,
@@ -501,6 +602,55 @@ export function terminalSanitize(text: string): { cleanText: string; wasModified
   );
 
   return { cleanText: result, wasModified };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Unified sanitization pipeline
+// ────────────────────────────────────────────────────────────────────────────
+
+export type SanitizeMode = 'terminal' | 'general' | 'search';
+
+/**
+ * Unified sanitization pipeline — the single entry point for all tool output.
+ *
+ * Applies the appropriate sequence of sanitizers depending on the content's
+ * origin:
+ *
+ *  **general** (default):   regexSanitize → contentSanitize
+ *  **terminal**:            stripAnsiCodes → terminalSanitize → regexSanitize → contentSanitize
+ *  **search**:              regexSanitize → contentSanitize  (same as general,
+ *                           but semantically distinct for logging/future tuning)
+ *
+ * Every path ends with `contentSanitize` — the heuristic catch-all for
+ * unstructured secrets (PEM keys, inline tokens, high-entropy strings).
+ */
+export function sanitizePipeline(
+  text: string,
+  mode: SanitizeMode = 'general',
+): { cleanText: string; wasModified: boolean } {
+  let current = text;
+  let modified = false;
+
+  // ── Terminal pre-processing: strip ANSI codes first ──────────────────
+  if (mode === 'terminal') {
+    current = stripAnsiCodes(current);
+    // Terminal-specific patterns (CLI flags, curl headers, env vars, etc.)
+    const termResult = terminalSanitize(current);
+    current = termResult.cleanText;
+    if (termResult.wasModified) { modified = true; }
+  }
+
+  // ── Tier 2: regex-based key=value + PII masking ──────────────────────
+  const regexResult = regexSanitize(current);
+  current = regexResult.cleanText;
+  if (regexResult.wasModified) { modified = true; }
+
+  // ── Tier 2b: content-aware heuristic scan ────────────────────────────
+  const contentResult = contentSanitize(current);
+  current = contentResult.cleanText;
+  if (contentResult.wasModified) { modified = true; }
+
+  return { cleanText: current, wasModified: modified };
 }
 
 // ────────────────────────────────────────────────────────────────────────────

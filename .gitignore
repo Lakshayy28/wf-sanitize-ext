@@ -1,13 +1,8 @@
 node_modules
 prompts
 test.yaml
-presidio_server/bdd/reports/allure-results
 **/__pycache__/
 *.pyc
 **/.pytest_cache/
-presidio_server/bdd/reports
 test.yaml
-_test_splunk.py
-_rewrite_recognizers.py
-_validate_recognizers.py
-presidio_server
+.DS_Store

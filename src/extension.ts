@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { sanitizeOnly, readRulesConfig, regexSanitize, terminalSanitize, RulesConfig } from './sanitizer';
+import { sanitizeOnly, readRulesConfig, regexSanitize, terminalSanitize, sanitizePipeline, RulesConfig } from './sanitizer';
+import type { SanitizeMode } from './sanitizer';
 
 let extensionPath: string;
 
@@ -35,6 +36,9 @@ const sessionStateMap = new Map<string, string>();
  * Every file is sanitized regardless of extension (no allowlist filter).
  */
 class SafeReadFileTool implements vscode.LanguageModelTool<{ filePath: string }> {
+  /** Set by the chat handler so the tool can push UI feedback (buttons, markdown). */
+  _stream: vscode.ChatResponseStream | undefined;
+
   async invoke(
     options: vscode.LanguageModelToolInvocationOptions<{ filePath: string }>,
     _token: vscode.CancellationToken,
@@ -88,6 +92,18 @@ class SafeReadFileTool implements vscode.LanguageModelTool<{ filePath: string }>
       const raw = Buffer.from(bytes).toString('utf-8');
       const { cleanText, wasModified } = regexSanitize(raw);
       console.log('[SafeChat] safechat_read_file: read fresh, sanitized:', wasModified);
+
+      // Write diff cache + render UI button if masking occurred
+      if (wasModified) {
+        const relPath = vscode.workspace.asRelativePath(fileUri, false);
+        await appendToDiffCache([{ relPath, original: raw, masked: cleanText }]);
+        populateSessionStateMap([{ relPath, uri: fileUri.toString() }]);
+        if (this._stream) {
+          this._stream.markdown('\n\n🛡️ **Tool execution masked sensitive data.**\n\n');
+          this._stream.button({ command: 'safecopilot.viewDiff', title: '$(diff) View Masked Diff' });
+        }
+      }
+
       return new vscode.LanguageModelToolResult([
         new vscode.LanguageModelTextPart(cleanText),
       ]);
@@ -102,6 +118,202 @@ class SafeReadFileTool implements vscode.LanguageModelTool<{ filePath: string }>
 
 /** Shared instance for direct invocation in the redirect guard */
 const safeReadFileToolInstance = new SafeReadFileTool();
+
+// ── SafeReadDirectoryTool — Custom LM Tool for sanitized directory reads ────
+
+interface SafeReadDirInput {
+  directoryPath: string;
+  maxDepth?: number;
+  maxFiles?: number;
+}
+
+/**
+ * A Language Model Tool that recursively reads a directory, sanitizes every
+ * file's contents, and returns an aggregate result. Registered as
+ * `safechat_read_directory`. Enforces depth and file-count safety limits and
+ * skips heavy/unsafe directories (node_modules, .git, etc.).
+ */
+class SafeReadDirectoryTool implements vscode.LanguageModelTool<SafeReadDirInput> {
+  /** Hard upper bounds to prevent runaway reads */
+  private static readonly ABSOLUTE_MAX_DEPTH = 10;
+  private static readonly ABSOLUTE_MAX_FILES = 200;
+
+  /** Set by the chat handler so the tool can push UI feedback (buttons, markdown). */
+  _stream: vscode.ChatResponseStream | undefined;
+
+  async invoke(
+    options: vscode.LanguageModelToolInvocationOptions<SafeReadDirInput>,
+    _token: vscode.CancellationToken,
+  ): Promise<vscode.LanguageModelToolResult> {
+    const { directoryPath } = options.input;
+    const maxDepth = Math.min(
+      options.input.maxDepth ?? 5,
+      SafeReadDirectoryTool.ABSOLUTE_MAX_DEPTH,
+    );
+    const maxFiles = Math.min(
+      options.input.maxFiles ?? 50,
+      SafeReadDirectoryTool.ABSOLUTE_MAX_FILES,
+    );
+
+    console.log('[SafeChat] safechat_read_directory invoked for:', directoryPath,
+      'maxDepth:', maxDepth, 'maxFiles:', maxFiles);
+
+    // Resolve the directory URI
+    let dirUri: vscode.Uri;
+    try {
+      if (directoryPath.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(directoryPath)) {
+        dirUri = vscode.Uri.file(directoryPath);
+      } else {
+        const folders = vscode.workspace.workspaceFolders;
+        if (folders?.length) {
+          dirUri = vscode.Uri.joinPath(folders[0].uri, directoryPath);
+        } else {
+          dirUri = vscode.Uri.file(directoryPath);
+        }
+      }
+    } catch {
+      return new vscode.LanguageModelToolResult([
+        new vscode.LanguageModelTextPart(`Error: Invalid directory path: ${directoryPath}`),
+      ]);
+    }
+
+    // Verify it's actually a directory
+    try {
+      const stat = await vscode.workspace.fs.stat(dirUri);
+      if (stat.type !== vscode.FileType.Directory) {
+        return new vscode.LanguageModelToolResult([
+          new vscode.LanguageModelTextPart(`Error: "${directoryPath}" is not a directory.`),
+        ]);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return new vscode.LanguageModelToolResult([
+        new vscode.LanguageModelTextPart(`Error: Cannot access directory "${directoryPath}": ${msg}`),
+      ]);
+    }
+
+    // Collect files with depth + count limits
+    const collectedFiles: vscode.Uri[] = [];
+    await this.collectFilesWithLimits(dirUri, 0, maxDepth, maxFiles, collectedFiles);
+
+    if (collectedFiles.length === 0) {
+      return new vscode.LanguageModelToolResult([
+        new vscode.LanguageModelTextPart(`Directory "${directoryPath}" is empty or contains only skipped directories.`),
+      ]);
+    }
+
+    // Read and sanitize each file
+    const parts: string[] = [];
+    const toolMaskedFiles: { relPath: string; original: string; masked: string; uri: string }[] = [];
+    let truncated = false;
+
+    for (const fileUri of collectedFiles) {
+      const relPath = vscode.workspace.asRelativePath(fileUri, false);
+
+      // Check SessionStateManager first
+      const maskedUri = resolveSessionState(fileUri.toString())
+        || resolveSessionState(fileUri.fsPath)
+        || resolveSessionState(relPath);
+
+      if (maskedUri) {
+        try {
+          const bytes = await vscode.workspace.fs.readFile(vscode.Uri.parse(maskedUri));
+          parts.push(`// File: ${relPath}\n${Buffer.from(bytes).toString('utf-8')}`);
+          continue;
+        } catch { /* fall through to fresh read */ }
+      }
+
+      // Check in-memory cache
+      const cached = findCachedState(fileUri.fsPath) || findCachedState(relPath);
+      if (cached) {
+        parts.push(`// File: ${relPath}\n${cached.sanitizedContent}`);
+        continue;
+      }
+
+      // Fresh read + sanitize
+      try {
+        const bytes = await vscode.workspace.fs.readFile(fileUri);
+        const raw = Buffer.from(bytes).toString('utf-8');
+        const { cleanText, wasModified } = regexSanitize(raw);
+        parts.push(`// File: ${relPath}\n${cleanText}`);
+        if (wasModified) {
+          toolMaskedFiles.push({ relPath, original: raw, masked: cleanText, uri: fileUri.toString() });
+        }
+      } catch {
+        parts.push(`// File: ${relPath}\n[Error: could not read file]`);
+      }
+    }
+
+    if (collectedFiles.length >= maxFiles) {
+      truncated = true;
+    }
+
+    // Write diff cache for any files that were masked during this directory scan
+    if (toolMaskedFiles.length > 0) {
+      await appendToDiffCache(toolMaskedFiles);
+      populateSessionStateMap(toolMaskedFiles.map(f => ({ relPath: f.relPath, uri: f.uri })));
+      if (this._stream) {
+        this._stream.markdown(`\n\n🛡️ **Tool execution masked sensitive data in ${toolMaskedFiles.length} file(s).**\n\n`);
+        this._stream.button({ command: 'safecopilot.viewDiff', title: '$(diff) View Masked Diff' });
+      }
+    }
+
+    const header = `Directory: ${directoryPath} (${collectedFiles.length} file(s)${
+      truncated ? `, truncated at maxFiles=${maxFiles}` : ''})\n${'─'.repeat(60)}`;
+
+    console.log('[SafeChat] safechat_read_directory: returned', collectedFiles.length,
+      'files, truncated:', truncated);
+
+    return new vscode.LanguageModelToolResult([
+      new vscode.LanguageModelTextPart(header + '\n\n' + parts.join('\n\n')),
+    ]);
+  }
+
+  /**
+   * Recursively collects files from a directory, respecting depth limits,
+   * file-count caps, and SKIP_DIRS.
+   */
+  private async collectFilesWithLimits(
+    dirUri: vscode.Uri,
+    currentDepth: number,
+    maxDepth: number,
+    maxFiles: number,
+    out: vscode.Uri[],
+  ): Promise<void> {
+    if (currentDepth >= maxDepth || out.length >= maxFiles) { return; }
+
+    let entries: [string, vscode.FileType][];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(dirUri);
+    } catch { return; }
+
+    // Sort: files first (for deterministic output), then directories
+    entries.sort((a, b) => {
+      if (a[1] === b[1]) { return a[0].localeCompare(b[0]); }
+      return a[1] === vscode.FileType.File ? -1 : 1;
+    });
+
+    for (const [name, type] of entries) {
+      if (out.length >= maxFiles) { break; }
+
+      if (type === vscode.FileType.File) {
+        out.push(vscode.Uri.joinPath(dirUri, name));
+      } else if (type === vscode.FileType.Directory) {
+        if (SKIP_DIRS.has(name)) { continue; }
+        await this.collectFilesWithLimits(
+          vscode.Uri.joinPath(dirUri, name),
+          currentDepth + 1,
+          maxDepth,
+          maxFiles,
+          out,
+        );
+      }
+    }
+  }
+}
+
+/** Shared instance for direct invocation in the redirect guard */
+const safeReadDirToolInstance = new SafeReadDirectoryTool();
 
 // ── Activation ──────────────────────────────────────────────────────────────
 
@@ -119,13 +331,17 @@ export function activate(context: vscode.ExtensionContext) {
     handleViewDiff,
   );
 
-  // Register the custom safechat_read_file tool
-  const toolDisposable = vscode.lm.registerTool(
+  // Register custom safe tools
+  const fileToolDisposable = vscode.lm.registerTool(
     'safechat_read_file',
     safeReadFileToolInstance,
   );
+  const dirToolDisposable = vscode.lm.registerTool(
+    'safechat_read_directory',
+    safeReadDirToolInstance,
+  );
 
-  context.subscriptions.push(participant, diffCmd, toolDisposable);
+  context.subscriptions.push(participant, diffCmd, fileToolDisposable, dirToolDisposable);
 }
 
 // ── Native Tool Detection ───────────────────────────────────────────────────
@@ -162,6 +378,55 @@ function isNativeFileReadTool(name: string, description: string): boolean {
   if (NATIVE_FILE_READ_PATTERNS.some(p => p.test(name))) { return true; }
   const descLower = description.toLowerCase();
   return FILE_READ_DESC_KEYWORDS.some(kw => descLower.includes(kw));
+}
+
+// ── Native Directory Tool Detection ─────────────────────────────────────────
+
+const NATIVE_DIR_PATTERNS: RegExp[] = [
+  /list_?dir(?:ectory)?/i,
+  /read_?dir(?:ectory)?/i,
+  /read_?folder/i,
+  /list_?folder/i,
+  /dir(?:ectory)?_?contents?/i,
+  /vscode_.*dir(?:ectory)?/i,
+  /mcp_.*(?:dir|folder)/i,
+];
+
+const DIR_READ_DESC_KEYWORDS = [
+  'list directory', 'read folder', 'directory contents',
+  'files in a folder', 'enumerate files', 'list files in',
+];
+
+/** Returns true if a tool is a native directory/folder-listing tool */
+function isNativeDirectoryTool(name: string, description: string): boolean {
+  if (name === 'safechat_read_directory') { return false; }
+  if (NATIVE_DIR_PATTERNS.some(p => p.test(name))) { return true; }
+  const descLower = description.toLowerCase();
+  return DIR_READ_DESC_KEYWORDS.some(kw => descLower.includes(kw));
+}
+
+// ── Native Search Tool Detection ────────────────────────────────────────────
+
+const NATIVE_SEARCH_PATTERNS: RegExp[] = [
+  /search_?workspace/i,
+  /workspace_?search/i,
+  /search_?in_?files?/i,
+  /find_?files?/i,
+  /grep/i,
+  /vscode_.*search/i,
+  /mcp_.*search/i,
+];
+
+const SEARCH_DESC_KEYWORDS = [
+  'search workspace', 'find in files', 'grep',
+  'search contents', 'find files matching',
+];
+
+/** Returns true if a tool is a native workspace-search tool */
+function isNativeSearchTool(name: string, description: string): boolean {
+  if (NATIVE_SEARCH_PATTERNS.some(p => p.test(name))) { return true; }
+  const descLower = description.toLowerCase();
+  return SEARCH_DESC_KEYWORDS.some(kw => descLower.includes(kw));
 }
 
 /** Returns true if a tool is a terminal/command-execution tool */
@@ -209,6 +474,10 @@ async function chatRequestHandler(
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
+  
+  // DEBUGGING: 🚨 ADD THIS TRAP HERE: Check if the folder is sneaking in via references
+  // vscode.window.showInformationMessage(`🚨 INCOMING REFERENCES: ${request.references.length}`);
+
   // New conversation → clear the conversation-scoped file set and session state.
   if (chatContext.history.length === 0) {
     conversationFileKeys.clear();
@@ -413,33 +682,41 @@ async function chatRequestHandler(
   // Prioritize tools the user explicitly attached
   const priorityNames = new Set(request.toolReferences.map(r => r.name));
   const allTools: vscode.LanguageModelChatTool[] = [];
-  let nativeReadBlocked = 0;
+  let nativeBlocked = 0;
 
-  // Add priority (user-referenced) tools first — skip malformed schemas and native read tools
+  /** Returns true if the tool should be stripped from the model's menu */
+  const shouldBlockTool = (name: string, desc: string): boolean => {
+    return isNativeFileReadTool(name, desc)
+      || isNativeDirectoryTool(name, desc)
+      || isNativeSearchTool(name, desc);
+  };
+
+  // Add priority (user-referenced) tools first — skip malformed schemas and blocked tools
   for (const t of vscode.lm.tools) {
     if (priorityNames.has(t.name) && isToolSchemaValid(t.inputSchema)) {
-      if (isNativeFileReadTool(t.name, t.description)) {
-        nativeReadBlocked++;
+      if (shouldBlockTool(t.name, t.description)) {
+        nativeBlocked++;
+        console.log(`[SafeChat] Blocked priority tool: ${t.name}`);
         continue;
       }
       allTools.push({ name: t.name, description: t.description, inputSchema: t.inputSchema });
     }
   }
 
-  // Fill remaining slots — skip tools with invalid schemas and native read tools
+  // Fill remaining slots — skip tools with invalid schemas and blocked tools
   for (const t of vscode.lm.tools) {
     if (allTools.length >= MAX_TOOLS) { break; }
     if (!priorityNames.has(t.name) && isToolSchemaValid(t.inputSchema)) {
-      if (isNativeFileReadTool(t.name, t.description)) {
-        nativeReadBlocked++;
+      if (shouldBlockTool(t.name, t.description)) {
+        nativeBlocked++;
         continue;
       }
       allTools.push({ name: t.name, description: t.description, inputSchema: t.inputSchema });
     }
   }
 
-  if (nativeReadBlocked > 0) {
-    console.log(`[SafeChat] Blocked ${nativeReadBlocked} native file-read tool(s) from tool menu`);
+  if (nativeBlocked > 0) {
+    console.log(`[SafeChat] Blocked ${nativeBlocked} native file-read/directory/search tool(s) from tool menu`);
   }
 
   // ── Step 7: Build messages with conversation history ─────────────────
@@ -452,11 +729,18 @@ async function chatRequestHandler(
     'Use these tools proactively to gather context, explore the codebase, and provide thorough, detailed answers. ' +
     'Think step by step. When the user asks about code, search the codebase, read the relevant files, ' +
     'and provide comprehensive analysis.\n\n' +
-    'CRITICAL FILE READING RULE: When you need to read or inspect any file in the workspace, ' +
+    'CRITICAL FILE READING RULE: When you need to read or inspect any file, ' +
     'you MUST use the `safechat_read_file` tool EXCLUSIVELY. Do NOT use any other file-reading tool ' +
-    '(such as readFile, read_file, vscode_readFile, etc.). The `safechat_read_file` tool automatically ' +
-    'sanitizes sensitive data like passwords, API keys, and PII before returning file contents. ' +
-    'Using any other file-read tool would bypass this security protection.\n\n' +
+    '(such as readFile, read_file, vscode_readFile, etc.).\n\n' +
+    'CRITICAL DIRECTORY READING RULE: When you need to list, read, or explore a directory or folder, ' +
+    'you MUST use the `safechat_read_directory` tool EXCLUSIVELY. Do NOT use any other directory-listing, ' +
+    'folder-reading, or workspace-search tool (such as list_dir, read_folder, listDirectory, ' +
+    'workspace_search, find_files, grep_search, etc.). The `safechat_read_directory` tool recursively ' +
+    'reads all files in a directory and sanitizes sensitive data before returning results. ' +
+    'It supports `maxDepth` and `maxFiles` parameters to control scope.\n\n' +
+    'Both `safechat_read_file` and `safechat_read_directory` automatically sanitize sensitive data ' +
+    'like passwords, API keys, and PII before returning contents. Using any other file or directory ' +
+    'tool would bypass this security protection.\n\n' +
     'IMPORTANT: Some of the provided file context has been pre-sanitized to protect sensitive data. ' +
     'Treat any `[MASKED_BY_SAFECHAT]` or `<ENTITY_TYPE>` placeholders as redacted secrets — ' +
     'do not attempt to guess their original values. ' +
@@ -493,6 +777,11 @@ async function chatRequestHandler(
   messages.push(vscode.LanguageModelChatMessage.User(currentMessage));
 
   // ── Step 8: Agentic tool-calling loop ────────────────────────────────
+  // Provide the response stream to our safe tools so they can render UI feedback
+  // ("View Masked Diff" buttons) when autonomous reads trigger masking.
+  safeReadFileToolInstance._stream = stream;
+  safeReadDirToolInstance._stream = stream;
+
   const MAX_TOOL_ROUNDS = 15;
 
   const requestOptions: vscode.LanguageModelChatRequestOptions = allTools.length > 0
@@ -537,11 +826,15 @@ async function chatRequestHandler(
 
       let resultContent: (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[];
       try {
-        // ── Defense-in-depth: redirect native file-read tools ──────────
-        // If the model somehow calls a native file-read tool that wasn't
-        // stripped from the menu, intercept and route through our safe tool.
+        // ── Defense-in-depth: redirect unsafe native tools ──────────────
+        // Intercept native file-read, directory, and search tools and route
+        // them through our sanitized alternatives.
         const toolDesc = vscode.lm.tools.find(t => t.name === call.name)?.description ?? '';
+
+        vscode.window.showInformationMessage(`🚨 TOOL INTERCEPT CHECK: ${call.name}`);
+
         if (isNativeFileReadTool(call.name, toolDesc)) {
+          // ── Redirect: native file-read → safechat_read_file ──────────
           console.log('[SafeChat] REDIRECT: native file-read tool', call.name, '→ safechat_read_file');
           const filePath = extractFilePathFromInput(call.input);
           if (filePath) {
@@ -553,6 +846,34 @@ async function chatRequestHandler(
           } else {
             resultContent = [new vscode.LanguageModelTextPart('Error: No file path found in tool input')];
           }
+
+        } else if (isNativeDirectoryTool(call.name, toolDesc)) {
+          // ── Redirect: native directory tool → safechat_read_directory ─
+          console.log('[SafeChat] REDIRECT: native directory tool', call.name, '→ safechat_read_directory');
+          const dirPath = extractDirectoryPathFromInput(call.input);
+          if (dirPath) {
+            const safeResult = await safeReadDirToolInstance.invoke(
+              { input: { directoryPath: dirPath }, toolInvocationToken: request.toolInvocationToken } as any,
+              token,
+            );
+            resultContent = safeResult.content as (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[];
+          } else {
+            resultContent = [new vscode.LanguageModelTextPart('Error: No directory path found in tool input')];
+          }
+
+        } else if (isNativeSearchTool(call.name, toolDesc)) {
+          // ── Intercept: native search tool — execute but force-sanitize ─
+          console.log('[SafeChat] INTERCEPT: native search tool', call.name, '— will force-sanitize results');
+          const result = await vscode.lm.invokeTool(call.name, {
+            input: call.input,
+            toolInvocationToken: request.toolInvocationToken,
+          }, token);
+          // Force-sanitize search results via the 'search' pipeline path
+          resultContent = sanitizeToolResultParts(
+            result.content as (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[],
+            'search',
+          );
+
         } else {
           const result = await vscode.lm.invokeTool(call.name, {
             input: call.input,
@@ -615,32 +936,24 @@ export function deactivate() {}
 
 
 /**
- * Sanitize the text parts of a tool result.
+ * Sanitize the text parts of a tool result via the unified pipeline.
  * Uses duck-typing (not instanceof) because tool result parts from
  * vscode.lm.invokeTool() may be deserialized plain objects.
- * @param mode - 'terminal' uses terminalSanitize (targeted CLI patterns),
- *               'general' uses regexSanitize (key=value secrets, PII).
- *               Both modes always run regexSanitize as a baseline.
+ *
+ * @param mode
+ *  - 'terminal': stripAnsiCodes → terminalSanitize → regexSanitize → contentSanitize
+ *  - 'general':  regexSanitize → contentSanitize
+ *  - 'search':   regexSanitize → contentSanitize  (same pipeline, distinct log label)
  */
 function sanitizeToolResultParts(
   parts: (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[],
-  mode: 'terminal' | 'general' = 'general',
+  mode: SanitizeMode = 'general',
 ): (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[] {
   return parts.map((part, i) => {
     // Duck-type: any part with a string `.value` is treated as a text part
     const val = (part as unknown as Record<string, unknown>).value;
     if (typeof val === 'string') {
-      // Always apply regexSanitize (baseline secret detection)
-      let { cleanText, wasModified } = regexSanitize(val);
-
-      // For terminal output, also apply terminal-specific patterns
-      if (mode === 'terminal') {
-        const termResult = terminalSanitize(cleanText);
-        if (termResult.wasModified) {
-          cleanText = termResult.cleanText;
-          wasModified = true;
-        }
-      }
+      const { cleanText, wasModified } = sanitizePipeline(val, mode);
 
       console.log(`[SafeChat] sanitizeToolResultParts[${i}] mode=${mode}: len=${val.length} modified=${wasModified}`);
       if (wasModified) {
@@ -664,6 +977,24 @@ function extractFilePathFromInput(input: unknown): string | undefined {
   if (typeof input !== 'object' || input === null) { return undefined; }
   const obj = input as Record<string, unknown>;
   for (const key of ['filePath', 'filepath', 'file_path', 'path', 'uri', 'file', 'fileName']) {
+    const val = obj[key];
+    if (typeof val === 'string' && val.length > 0) { return val; }
+  }
+  return undefined;
+}
+
+/**
+ * Try to extract a directory path from a tool call's input arguments.
+ * Checks directory-specific parameter names first, then falls back to generic ones.
+ */
+function extractDirectoryPathFromInput(input: unknown): string | undefined {
+  if (typeof input !== 'object' || input === null) { return undefined; }
+  const obj = input as Record<string, unknown>;
+  for (const key of [
+    'directoryPath', 'directory_path', 'dirPath', 'dir_path',
+    'folderPath', 'folder_path', 'folder', 'dir', 'directory',
+    'path', 'uri',
+  ]) {
     const val = obj[key];
     if (typeof val === 'string' && val.length > 0) { return val; }
   }
@@ -1027,6 +1358,72 @@ async function writePerFileDiffCache(
   );
 
   latestCacheEntryUri = latestDir;
+}
+
+/**
+ * Append new masked files to the existing `.temp_cache/latest/` directory
+ * without deleting existing entries. Reads the current manifest, deduplicates
+ * by relPath, writes new original/masked pairs, and updates the manifest.
+ *
+ * Used by SafeReadFileTool and SafeReadDirectoryTool when autonomous tool
+ * invocations during the agentic loop mask sensitive data.
+ */
+async function appendToDiffCache(
+  newMaskedFiles: { relPath: string; original: string; masked: string }[],
+): Promise<void> {
+  if (newMaskedFiles.length === 0) { return; }
+  const baseUri = getCacheBaseUri();
+  if (!baseUri) { return; }
+
+  await vscode.workspace.fs.createDirectory(baseUri);
+
+  // Ensure .gitignore exists
+  const gitignoreUri = vscode.Uri.joinPath(baseUri, '.gitignore');
+  try { await vscode.workspace.fs.stat(gitignoreUri); }
+  catch { await vscode.workspace.fs.writeFile(gitignoreUri, Buffer.from('*\n', 'utf-8')); }
+
+  const latestDir = vscode.Uri.joinPath(baseUri, 'latest');
+  await vscode.workspace.fs.createDirectory(latestDir);
+
+  // Read existing manifest (if any) to avoid duplicates
+  let existingPaths: string[] = [];
+  const manifestUri = vscode.Uri.joinPath(latestDir, 'manifest.json');
+  try {
+    const bytes = await vscode.workspace.fs.readFile(manifestUri);
+    existingPaths = JSON.parse(Buffer.from(bytes).toString('utf-8'));
+    if (!Array.isArray(existingPaths)) { existingPaths = []; }
+  } catch { /* first entry or corrupt — start fresh */ }
+
+  const existingSet = new Set(existingPaths);
+
+  // Write new file pairs (overwrites if same relPath was already cached)
+  for (const file of newMaskedFiles) {
+    const safeName = file.relPath.replace(/[\/\\]/g, '_');
+    await Promise.all([
+      vscode.workspace.fs.writeFile(
+        vscode.Uri.joinPath(latestDir, `${safeName}.original.txt`),
+        Buffer.from(file.original, 'utf-8'),
+      ),
+      vscode.workspace.fs.writeFile(
+        vscode.Uri.joinPath(latestDir, `${safeName}.masked.txt`),
+        Buffer.from(file.masked, 'utf-8'),
+      ),
+    ]);
+    if (!existingSet.has(file.relPath)) {
+      existingPaths.push(file.relPath);
+      existingSet.add(file.relPath);
+    }
+  }
+
+  // Write updated manifest
+  await vscode.workspace.fs.writeFile(
+    manifestUri,
+    Buffer.from(JSON.stringify(existingPaths), 'utf-8'),
+  );
+
+  latestCacheEntryUri = latestDir;
+  console.log('[SafeChat] appendToDiffCache: wrote', newMaskedFiles.length,
+    'file(s), manifest total:', existingPaths.length);
 }
 
 // ── Diff Viewer (per-file with QuickPick) ───────────────────────────────────
