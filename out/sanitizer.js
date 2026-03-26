@@ -329,18 +329,51 @@ function callPresidioApi(text, rulesConfig) {
  */
 const SECRET_KEY_REGEX = new RegExp(
 // ── Named-key = value patterns ───────────────────────────────────────
-'(' +
-    // Key names (case-insensitive)
+// Optional SET/export/ENV prefix (batch, shell, Dockerfile)
+'(?:^|\\b)(?:SET\\s+|export\\s+|ENV\\s+)?' +
+    '(' +
+    // Key names (case-insensitive, broad coverage)
     '(?:password|passwd|pwd|secret|api_?key|api[-_]?secret|token|access_?token|' +
     'auth_?token|refresh_?token|private_?key|client_?secret|credentials|' +
-    'database_?url|db_?password|connection_?string|encryption_?key|' +
-    'jwt_?secret|session_?secret|signing_?key|bearer)' +
+    'database_?url|db_?url|db_?password|db_?pass|connection_?string|encryption_?key|' +
+    'jwt_?secret|session_?secret|signing_?key|bearer|' +
+    // AWS / cloud
+    'aws_?access_?key_?id|aws_?secret_?access_?key|aws_?session_?token|' +
+    // Additional common secret keys
+    'secret_?key|auth_?key|admin_?password|admin_?secret|admin_?key|' +
+    'smtp_?password|mail_?password|email_?password|' +
+    'github_?token|gh_?token|gitlab_?token|npm_?token|' +
+    'slack_?token|slack_?webhook|discord_?token|' +
+    'stripe_?key|stripe_?secret|' +
+    'sendgrid_?key|twilio_?auth|' +
+    'redis_?url|redis_?password|mongo_?url|mongo_?uri|' +
+    'mysql_?password|postgres_?password|' +
+    'proxy_?password|ftp_?password|ssh_?password|' +
+    'cert_?password|keystore_?password|truststore_?password)' +
     // Assignment operators with optional surrounding whitespace
     '\\s*[:=]\\s*' +
     // Optional opening quote
     '["\']?' +
     ')' +
-    // The actual secret value (captured group)
+    // The actual secret value (captured group 2)
+    '([^\\s"\'`;,}{\\]\\)]+)' +
+    '|' +
+    // ── Email-like PII after common key names ────────────────────────────
+    '(' +
+    '(?:admin_?email|user_?email|contact_?email|email_?address|' +
+    'email|mailto|from_?email|to_?email|reply_?to|' +
+    'admin_?user|service_?account)' +
+    '\\s*[:=]\\s*["\']?' +
+    ')' +
+    '([^\\s"\'`;,}{\\]\\)]+)' +
+    '|' +
+    // ── Phone/IP/hostname after common key names ─────────────────────────
+    '(' +
+    '(?:contact_?phone|phone_?number|phone|mobile|' +
+    'server_?ip|host_?ip|ip_?address|remote_?addr|' +
+    'server_?host|db_?host|hostname)' +
+    '\\s*[:=]\\s*["\']?' +
+    ')' +
     '([^\\s"\'`;,}{\\]\\)]+)' +
     '|' +
     // ── Standalone patterns ──────────────────────────────────────────────
@@ -348,7 +381,7 @@ const SECRET_KEY_REGEX = new RegExp(
     '(Bearer\\s+)([A-Za-z0-9\\-._~+\\/]+=*)' +
     '|' +
     // AWS Access Key IDs
-    '(AKIA[0-9A-Z]{16})', 'gi');
+    '(AKIA[0-9A-Z]{16})', 'gim');
 const MASK = '[MASKED_BY_SAFECHAT]';
 /**
  * Sanitizes raw text by replacing detected secrets with a mask placeholder.
@@ -358,16 +391,24 @@ function regexSanitize(rawText) {
     let wasModified = false;
     const cleanText = rawText.replace(SECRET_KEY_REGEX, (...args) => {
         wasModified = true;
-        // Named-key = value  (groups 1, 2)
+        // Named-key = value / secrets  (groups 1, 2)
         if (args[1] && args[2]) {
-            return args[1] + MASK;
+            return (args[0].match(/^(?:SET\s+|export\s+|ENV\s+)/i)?.[0] ?? '') + args[1] + MASK;
         }
-        // Bearer token        (groups 3, 4)
+        // Email-like PII             (groups 3, 4)
         if (args[3] && args[4]) {
             return args[3] + MASK;
         }
-        // AWS key             (group 5)
-        if (args[5]) {
+        // Phone/IP/hostname          (groups 5, 6)
+        if (args[5] && args[6]) {
+            return args[5] + MASK;
+        }
+        // Bearer token               (groups 7, 8)
+        if (args[7] && args[8]) {
+            return args[7] + MASK;
+        }
+        // AWS key                    (group 9)
+        if (args[9]) {
             return MASK;
         }
         return MASK;

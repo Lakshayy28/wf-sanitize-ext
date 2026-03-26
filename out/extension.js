@@ -42,6 +42,12 @@ const fileStateCache = new Map();
 let conversationFileKeys = new Set();
 let latestCacheEntryUri;
 let lastRulesHash;
+/**
+ * SessionStateManager: Maps original file URI string → masked .temp_cache URI string.
+ * Populated after sanitization + cache-write. Used to redirect autonomous file reads
+ * to the already-sanitized versions on disk, preventing data leakage.
+ */
+const sessionStateMap = new Map();
 // ── Activation ──────────────────────────────────────────────────────────────
 function activate(context) {
     extensionPath = context.extensionPath;
@@ -52,9 +58,10 @@ function activate(context) {
 }
 // ── Chat Request Handler ────────────────────────────────────────────────────
 async function chatRequestHandler(request, chatContext, stream, token) {
-    // New conversation → clear the conversation-scoped file set.
+    // New conversation → clear the conversation-scoped file set and session state.
     if (chatContext.history.length === 0) {
         conversationFileKeys.clear();
+        sessionStateMap.clear();
     }
     stream.progress('Scanning attached context for sensitive data…');
     // ── DEBUG: log references received from VS Code ──────────────────────
@@ -170,13 +177,18 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                 relPath: state.relPath,
                 original: state.originalContent,
                 masked: state.sanitizedContent,
+                uri: key,
             });
         }
     }
-    // ── Step 4: Write per-file diff cache ────────────────────────────────
-    // Rewrite when new masks appear OR when disk cache was deleted/cleared
-    if (maskedFiles.length > 0 && (newMasks > 0 || !diskExists)) {
-        await writePerFileDiffCache(maskedFiles);
+    // ── Step 4: Write per-file diff cache + populate SessionStateManager ──
+    // Always keep the sessionStateMap in sync with the current conversation's masked files.
+    if (maskedFiles.length > 0) {
+        populateSessionStateMap(maskedFiles);
+        // Rewrite disk cache when new masks appear OR when disk cache was deleted/cleared
+        if (newMasks > 0 || !diskExists) {
+            await writePerFileDiffCache(maskedFiles);
+        }
     }
     // ── Notifications ────────────────────────────────────────────────────
     if (anyPresidioError) {
@@ -289,6 +301,7 @@ async function chatRequestHandler(request, chatContext, stream, token) {
         const toolResultParts = [];
         for (const call of toolCalls) {
             stream.progress(`Running tool: ${call.name}…`);
+            console.log('[SafeChat] Tool call:', call.name, 'input keys:', call.input ? Object.keys(call.input) : 'none');
             let resultContent;
             try {
                 const result = await vscode.lm.invokeTool(call.name, {
@@ -296,6 +309,45 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                     toolInvocationToken: request.toolInvocationToken,
                 }, token);
                 resultContent = result.content;
+                console.log('[SafeChat] Tool result parts:', resultContent.length, 'items →', resultContent.map((p, i) => `[${i}] constructor=${p?.constructor?.name} hasValue=${typeof p?.value} instanceof=${p instanceof vscode.LanguageModelTextPart}`));
+                // ── SessionStateManager: redirect file reads to masked versions ──
+                // If the tool input targets a file that was previously sanitized,
+                // serve the masked version from .temp_cache on disk instead of the
+                // raw tool output. This is the primary data-leakage prevention for
+                // autonomous file reads.
+                const filePath = extractFilePathFromInput(call.input);
+                if (filePath) {
+                    const maskedUri = resolveSessionState(filePath);
+                    if (maskedUri) {
+                        try {
+                            const maskedBytes = await vscode.workspace.fs.readFile(vscode.Uri.parse(maskedUri));
+                            const maskedContent = Buffer.from(maskedBytes).toString('utf-8');
+                            console.log('[SafeChat] SessionState: served masked version for', filePath, '→', maskedUri);
+                            resultContent = [new vscode.LanguageModelTextPart(maskedContent)];
+                        }
+                        catch (readErr) {
+                            // Disk file missing — fall back to in-memory cache
+                            console.log('[SafeChat] SessionState: disk read failed, trying in-memory cache for', filePath);
+                            const cached = findCachedState(filePath);
+                            if (cached?.wasMasked) {
+                                resultContent = [new vscode.LanguageModelTextPart(cached.sanitizedContent)];
+                            }
+                        }
+                    }
+                    else {
+                        // File not in sessionStateMap — check in-memory cache as fallback
+                        const cached = findCachedState(filePath);
+                        if (cached?.wasMasked) {
+                            console.log('[SafeChat] SessionState: in-memory fallback for', cached.relPath);
+                            resultContent = [new vscode.LanguageModelTextPart(cached.sanitizedContent)];
+                        }
+                    }
+                }
+                // ── Universal sanitization: regex-sanitize ALL tool output ──────
+                // Every tool result (terminal, file-read, search, git, notebooks,
+                // MCP tools, etc.) is run through the regex engine. This catches
+                // secrets regardless of which tool produced them.
+                resultContent = sanitizeToolResultParts(resultContent);
             }
             catch (err) {
                 resultContent = [
@@ -309,6 +361,149 @@ async function chatRequestHandler(request, chatContext, stream, token) {
     }
 }
 function deactivate() { }
+// ── Tool Result Sanitization ────────────────────────────────────────────────
+/**
+ * Sanitize the text parts of a tool result using the regex engine.
+ * Uses duck-typing (not instanceof) because tool result parts from
+ * vscode.lm.invokeTool() may be deserialized plain objects.
+ */
+function sanitizeToolResultParts(parts) {
+    return parts.map((part, i) => {
+        // Duck-type: any part with a string `.value` is treated as a text part
+        const val = part.value;
+        if (typeof val === 'string') {
+            const { cleanText, wasModified } = (0, sanitizer_1.regexSanitize)(val);
+            console.log(`[SafeChat] sanitizeToolResultParts[${i}]: len=${val.length} modified=${wasModified} instanceof=${part instanceof vscode.LanguageModelTextPart}`);
+            if (wasModified) {
+                console.log('[SafeChat] ── before (first 200):', val.slice(0, 200));
+                console.log('[SafeChat] ── after  (first 200):', cleanText.slice(0, 200));
+            }
+            return new vscode.LanguageModelTextPart(cleanText);
+        }
+        console.log(`[SafeChat] sanitizeToolResultParts[${i}]: non-text part, type=${part?.constructor?.name}`);
+        return part;
+    });
+}
+/**
+ * Try to extract the file path from a tool call's input arguments.
+ * Tools use varying parameter names; we check the most common ones.
+ */
+function extractFilePathFromInput(input) {
+    if (typeof input !== 'object' || input === null) {
+        return undefined;
+    }
+    const obj = input;
+    for (const key of ['filePath', 'filepath', 'file_path', 'path', 'uri', 'file', 'fileName']) {
+        const val = obj[key];
+        if (typeof val === 'string' && val.length > 0) {
+            return val;
+        }
+    }
+    return undefined;
+}
+/**
+ * Given a file path string (absolute or workspace-relative), try to find a
+ * matching entry in `fileStateCache`. Returns the cached state or undefined.
+ */
+function findCachedState(filePath) {
+    // Try as-is (absolute path → URI)
+    try {
+        const uri = vscode.Uri.file(filePath);
+        const state = fileStateCache.get(uri.toString());
+        if (state) {
+            return state;
+        }
+    }
+    catch { /* not a valid file path */ }
+    // Try as workspace-relative path
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders?.length) {
+        for (const folder of folders) {
+            const candidate = vscode.Uri.joinPath(folder.uri, filePath);
+            const state = fileStateCache.get(candidate.toString());
+            if (state) {
+                return state;
+            }
+        }
+    }
+    // Try matching by relPath suffix (handles partial paths)
+    for (const state of fileStateCache.values()) {
+        if (state.relPath === filePath || filePath.endsWith(state.relPath)) {
+            return state;
+        }
+    }
+    return undefined;
+}
+// ── Session State Manager ───────────────────────────────────────────────────
+/**
+ * Populates the sessionStateMap with original-file-URI → masked-file-URI mappings.
+ * Called after sanitization so that subsequent tool calls can read from the masked
+ * versions on disk instead of the raw originals.
+ */
+function populateSessionStateMap(maskedFiles) {
+    const cacheBase = getCacheBaseUri();
+    if (!cacheBase) {
+        return;
+    }
+    const latestDir = vscode.Uri.joinPath(cacheBase, 'latest');
+    for (const file of maskedFiles) {
+        const safeName = file.relPath.replace(/[/\\]/g, '_');
+        const maskedFileUri = vscode.Uri.joinPath(latestDir, `${safeName}.masked.txt`);
+        const maskedUriStr = maskedFileUri.toString();
+        // Map by original URI (canonical key)
+        sessionStateMap.set(file.uri, maskedUriStr);
+        // Also map by workspace-relative path (tools often report relative paths)
+        sessionStateMap.set(file.relPath, maskedUriStr);
+        // Also map by absolute fsPath for tools that use absolute OS paths
+        try {
+            const parsed = vscode.Uri.parse(file.uri);
+            if (parsed.fsPath) {
+                sessionStateMap.set(parsed.fsPath, maskedUriStr);
+            }
+        }
+        catch { /* ignore invalid URIs */ }
+        console.log(`[SafeChat] SessionState: mapped ${file.relPath} → .temp_cache`);
+    }
+}
+/**
+ * Resolves a file path (absolute, relative, or URI) against the sessionStateMap.
+ * Returns the masked file URI string if found, undefined otherwise.
+ */
+function resolveSessionState(filePath) {
+    // Direct lookup (covers URI strings, relative paths, and absolute paths)
+    const direct = sessionStateMap.get(filePath);
+    if (direct) {
+        return direct;
+    }
+    // Try as file:// URI
+    try {
+        const uri = vscode.Uri.file(filePath);
+        const byUri = sessionStateMap.get(uri.toString());
+        if (byUri) {
+            return byUri;
+        }
+    }
+    catch { /* not a valid file path */ }
+    // Try as workspace-relative path
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders?.length) {
+        for (const folder of folders) {
+            const candidate = vscode.Uri.joinPath(folder.uri, filePath);
+            const byCandidate = sessionStateMap.get(candidate.toString());
+            if (byCandidate) {
+                return byCandidate;
+            }
+        }
+    }
+    // Suffix matching: tools may pass partial paths like "config.env" instead of "src/config.env"
+    for (const [key, val] of sessionStateMap) {
+        // Only match relPath-style keys (skip full URIs to avoid false positives)
+        if (!key.startsWith('file:') && (key === filePath || key.endsWith('/' + filePath) || filePath.endsWith('/' + key))) {
+            return val;
+        }
+    }
+    return undefined;
+}
 // ── Cache Invalidation Helpers ──────────────────────────────────────────────
 /** Simple 32-bit hash for fast cache-key comparisons (not cryptographic). */
 function computeConfigHash(config) {
