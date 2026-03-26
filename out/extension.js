@@ -48,13 +48,156 @@ let lastRulesHash;
  * to the already-sanitized versions on disk, preventing data leakage.
  */
 const sessionStateMap = new Map();
+// ── SafeReadFileTool — Custom LM Tool for sanitized file reads ──────────────
+/**
+ * A Language Model Tool that reads files and sanitizes secrets/PII before
+ * returning content to the model. Registered as `safechat_read_file`.
+ * Every file is sanitized regardless of extension (no allowlist filter).
+ */
+class SafeReadFileTool {
+    async invoke(options, _token) {
+        const filePath = options.input.filePath;
+        console.log('[SafeChat] safechat_read_file invoked for:', filePath);
+        // 1. Check SessionStateManager — if already sanitized, serve cached version
+        const maskedUri = resolveSessionState(filePath);
+        if (maskedUri) {
+            try {
+                const bytes = await vscode.workspace.fs.readFile(vscode.Uri.parse(maskedUri));
+                const text = Buffer.from(bytes).toString('utf-8');
+                console.log('[SafeChat] safechat_read_file: served masked version from cache');
+                return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(text)]);
+            }
+            catch {
+                console.log('[SafeChat] safechat_read_file: cached masked file not readable, falling through');
+            }
+        }
+        // 2. Check in-memory fileStateCache
+        const cached = findCachedState(filePath);
+        if (cached) {
+            console.log('[SafeChat] safechat_read_file: served from fileStateCache (masked:', cached.wasMasked, ')');
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(cached.sanitizedContent),
+            ]);
+        }
+        // 3. Read the file fresh and always sanitize
+        let fileUri;
+        try {
+            if (filePath.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(filePath)) {
+                fileUri = vscode.Uri.file(filePath);
+            }
+            else {
+                const folders = vscode.workspace.workspaceFolders;
+                if (folders?.length) {
+                    fileUri = vscode.Uri.joinPath(folders[0].uri, filePath);
+                }
+                else {
+                    fileUri = vscode.Uri.file(filePath);
+                }
+            }
+        }
+        catch {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(`Error: Invalid file path: ${filePath}`),
+            ]);
+        }
+        try {
+            const bytes = await vscode.workspace.fs.readFile(fileUri);
+            const raw = Buffer.from(bytes).toString('utf-8');
+            const { cleanText, wasModified } = (0, sanitizer_1.regexSanitize)(raw);
+            console.log('[SafeChat] safechat_read_file: read fresh, sanitized:', wasModified);
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(cleanText),
+            ]);
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(`Error reading file "${filePath}": ${msg}`),
+            ]);
+        }
+    }
+}
+/** Shared instance for direct invocation in the redirect guard */
+const safeReadFileToolInstance = new SafeReadFileTool();
 // ── Activation ──────────────────────────────────────────────────────────────
 function activate(context) {
     extensionPath = context.extensionPath;
     const participant = vscode.chat.createChatParticipant('safecopilot.safeChat', chatRequestHandler);
     participant.iconPath = new vscode.ThemeIcon('shield');
     const diffCmd = vscode.commands.registerCommand('safecopilot.viewDiff', handleViewDiff);
-    context.subscriptions.push(participant, diffCmd);
+    // Register the custom safechat_read_file tool
+    const toolDisposable = vscode.lm.registerTool('safechat_read_file', safeReadFileToolInstance);
+    context.subscriptions.push(participant, diffCmd, toolDisposable);
+}
+// ── Native Tool Detection ───────────────────────────────────────────────────
+/**
+ * Patterns matching known native file-read tool names that would bypass our
+ * sanitization. These are stripped from the tool menu so the model can only
+ * use safechat_read_file.
+ */
+const NATIVE_FILE_READ_PATTERNS = [
+    /^vscode_readFile$/i,
+    /^readFile$/i,
+    /^read_file$/i,
+    /^file_read$/i,
+    /^vscode[-_.]?read/i,
+    /^copilot[-_.]?read/i,
+    /^mcp_.*read.*file/i,
+    /^mcp_.*file.*content/i,
+    /^mcp_.*get.*file/i,
+];
+/** Keywords in tool descriptions that indicate file-reading capability */
+const FILE_READ_DESC_KEYWORDS = [
+    'read the contents of a file',
+    'read a file',
+    'contents of a file',
+    'file contents',
+    'read file',
+];
+/** Returns true if a tool is a native file-read tool that should be blocked */
+function isNativeFileReadTool(name, description) {
+    if (name === 'safechat_read_file') {
+        return false;
+    } // Never block our own tool
+    if (NATIVE_FILE_READ_PATTERNS.some(p => p.test(name))) {
+        return true;
+    }
+    const descLower = description.toLowerCase();
+    return FILE_READ_DESC_KEYWORDS.some(kw => descLower.includes(kw));
+}
+/** Returns true if a tool is a terminal/command-execution tool */
+function isTerminalTool(name, description) {
+    const nameLower = name.toLowerCase();
+    const descLower = description.toLowerCase();
+    return (/terminal|shell|exec|command|bash|zsh|run_in/i.test(nameLower) ||
+        descLower.includes('run a command') ||
+        descLower.includes('execute a command') ||
+        descLower.includes('terminal') ||
+        descLower.includes('shell command'));
+}
+// ── Prompt Path Extraction ──────────────────────────────────────────────────
+/**
+ * Extracts absolute file paths from the user's prompt text.
+ * Matches Unix (/path/to/file) and Windows (C:\path\to\file) paths.
+ */
+function extractFilePathsFromPrompt(prompt) {
+    const paths = [];
+    // Unix absolute paths (e.g. /Users/name/Documents/file.bat)
+    const unixRe = /(?:^|\s|["'`])(\/(?:[^\s"'`<>|*?]+\/)*[^\s"'`<>|*?.]+\.[a-zA-Z0-9]{1,10})(?=\s|["'`]|$)/g;
+    let m;
+    while ((m = unixRe.exec(prompt)) !== null) {
+        const p = m[1];
+        // Skip paths that are clearly URLs
+        if (!p.includes('://')) {
+            paths.push(p);
+        }
+    }
+    // Windows absolute paths (e.g. C:\Users\name\file.bat)
+    const winRe = /(?:^|\s|["'`])([a-zA-Z]:\\(?:[^\s"'`<>|*?]+\\)*[^\s"'`<>|*?.]+\.[a-zA-Z0-9]{1,10})(?=\s|["'`]|$)/g;
+    while ((m = winRe.exec(prompt)) !== null) {
+        paths.push(m[1]);
+    }
+    return [...new Set(paths)];
 }
 // ── Chat Request Handler ────────────────────────────────────────────────────
 async function chatRequestHandler(request, chatContext, stream, token) {
@@ -88,6 +231,53 @@ async function chatRequestHandler(request, chatContext, stream, token) {
         latestCacheEntryUri = undefined;
     }
     lastRulesHash = rulesHash;
+    // Variables shared between Step 0.5 and Step 2
+    let newMasks = 0;
+    let anyPresidioError;
+    // ── Step 0.5: Pre-extract file paths from prompt and sanitize ────────
+    // Catches external files (e.g. /Users/name/Documents/sample.bat) mentioned
+    // in the user's prompt BEFORE the model loop starts.
+    const promptPaths = extractFilePathsFromPrompt(request.prompt);
+    if (promptPaths.length > 0) {
+        console.log('[SafeChat] Step 0.5: Found', promptPaths.length, 'file path(s) in prompt:', promptPaths);
+        for (const pp of promptPaths) {
+            const ppUri = vscode.Uri.file(pp);
+            const ppKey = ppUri.toString();
+            // Skip if already in conversation cache
+            if (fileStateCache.has(ppKey)) {
+                continue;
+            }
+            try {
+                const stat = await vscode.workspace.fs.stat(ppUri);
+                if (stat.type !== vscode.FileType.File) {
+                    continue;
+                }
+                const bytes = await vscode.workspace.fs.readFile(ppUri);
+                const raw = Buffer.from(bytes).toString('utf-8');
+                const result = await (0, sanitizer_1.sanitizeOnly)(raw, filterConfig);
+                if (result.presidioError) {
+                    anyPresidioError = result.presidioError;
+                }
+                const relPath = vscode.workspace.asRelativePath(ppUri, false);
+                fileStateCache.set(ppKey, {
+                    relPath, mtime: stat.mtime,
+                    isSensitive: true,
+                    originalContent: raw,
+                    sanitizedContent: result.cleanText,
+                    wasMasked: result.wasModified,
+                    rulesHash,
+                });
+                conversationFileKeys.add(ppKey);
+                if (result.wasModified) {
+                    newMasks++;
+                }
+                console.log('[SafeChat] Step 0.5: Pre-sanitized', pp, '→ masked:', result.wasModified);
+            }
+            catch (err) {
+                console.log('[SafeChat] Step 0.5: Could not read', pp, ':', err);
+            }
+        }
+    }
     // ── Step 1: Resolve file URIs from all attached references ───────────
     const referencedUris = await resolveAllReferences(request.references, request.prompt);
     console.log('[SafeChat] resolvedUris count:', referencedUris.length);
@@ -95,8 +285,6 @@ async function chatRequestHandler(request, chatContext, stream, token) {
         console.log('[SafeChat] first 5 URIs:', referencedUris.slice(0, 5).map(u => u.toString()));
     }
     // ── Step 2: Process each file — reuse cache or (re-)sanitize ─────────
-    let newMasks = 0;
-    let anyPresidioError;
     const staleKeys = new Set();
     for (const fileUri of referencedUris) {
         const key = fileUri.toString();
@@ -212,21 +400,32 @@ async function chatRequestHandler(request, chatContext, stream, token) {
     // Prioritize tools the user explicitly attached
     const priorityNames = new Set(request.toolReferences.map(r => r.name));
     const allTools = [];
-    // Add priority (user-referenced) tools first — skip malformed schemas
+    let nativeReadBlocked = 0;
+    // Add priority (user-referenced) tools first — skip malformed schemas and native read tools
     for (const t of vscode.lm.tools) {
         if (priorityNames.has(t.name) && isToolSchemaValid(t.inputSchema)) {
+            if (isNativeFileReadTool(t.name, t.description)) {
+                nativeReadBlocked++;
+                continue;
+            }
             allTools.push({ name: t.name, description: t.description, inputSchema: t.inputSchema });
         }
     }
-    // Fill remaining slots — skip tools with invalid schemas
-    // (e.g. MCP tools declaring type:"object" without "properties" cause 400 errors)
+    // Fill remaining slots — skip tools with invalid schemas and native read tools
     for (const t of vscode.lm.tools) {
         if (allTools.length >= MAX_TOOLS) {
             break;
         }
         if (!priorityNames.has(t.name) && isToolSchemaValid(t.inputSchema)) {
+            if (isNativeFileReadTool(t.name, t.description)) {
+                nativeReadBlocked++;
+                continue;
+            }
             allTools.push({ name: t.name, description: t.description, inputSchema: t.inputSchema });
         }
+    }
+    if (nativeReadBlocked > 0) {
+        console.log(`[SafeChat] Blocked ${nativeReadBlocked} native file-read tool(s) from tool menu`);
     }
     // ── Step 7: Build messages with conversation history ─────────────────
     const messages = [];
@@ -236,6 +435,11 @@ async function chatRequestHandler(request, chatContext, stream, token) {
         'Use these tools proactively to gather context, explore the codebase, and provide thorough, detailed answers. ' +
         'Think step by step. When the user asks about code, search the codebase, read the relevant files, ' +
         'and provide comprehensive analysis.\n\n' +
+        'CRITICAL FILE READING RULE: When you need to read or inspect any file in the workspace, ' +
+        'you MUST use the `safechat_read_file` tool EXCLUSIVELY. Do NOT use any other file-reading tool ' +
+        '(such as readFile, read_file, vscode_readFile, etc.). The `safechat_read_file` tool automatically ' +
+        'sanitizes sensitive data like passwords, API keys, and PII before returning file contents. ' +
+        'Using any other file-read tool would bypass this security protection.\n\n' +
         'IMPORTANT: Some of the provided file context has been pre-sanitized to protect sensitive data. ' +
         'Treat any `[MASKED_BY_SAFECHAT]` or `<ENTITY_TYPE>` placeholders as redacted secrets — ' +
         'do not attempt to guess their original values. ' +
@@ -304,17 +508,30 @@ async function chatRequestHandler(request, chatContext, stream, token) {
             console.log('[SafeChat] Tool call:', call.name, 'input keys:', call.input ? Object.keys(call.input) : 'none');
             let resultContent;
             try {
-                const result = await vscode.lm.invokeTool(call.name, {
-                    input: call.input,
-                    toolInvocationToken: request.toolInvocationToken,
-                }, token);
-                resultContent = result.content;
+                // ── Defense-in-depth: redirect native file-read tools ──────────
+                // If the model somehow calls a native file-read tool that wasn't
+                // stripped from the menu, intercept and route through our safe tool.
+                const toolDesc = vscode.lm.tools.find(t => t.name === call.name)?.description ?? '';
+                if (isNativeFileReadTool(call.name, toolDesc)) {
+                    console.log('[SafeChat] REDIRECT: native file-read tool', call.name, '→ safechat_read_file');
+                    const filePath = extractFilePathFromInput(call.input);
+                    if (filePath) {
+                        const safeResult = await safeReadFileToolInstance.invoke({ input: { filePath }, toolInvocationToken: request.toolInvocationToken }, token);
+                        resultContent = safeResult.content;
+                    }
+                    else {
+                        resultContent = [new vscode.LanguageModelTextPart('Error: No file path found in tool input')];
+                    }
+                }
+                else {
+                    const result = await vscode.lm.invokeTool(call.name, {
+                        input: call.input,
+                        toolInvocationToken: request.toolInvocationToken,
+                    }, token);
+                    resultContent = result.content;
+                }
                 console.log('[SafeChat] Tool result parts:', resultContent.length, 'items →', resultContent.map((p, i) => `[${i}] constructor=${p?.constructor?.name} hasValue=${typeof p?.value} instanceof=${p instanceof vscode.LanguageModelTextPart}`));
                 // ── SessionStateManager: redirect file reads to masked versions ──
-                // If the tool input targets a file that was previously sanitized,
-                // serve the masked version from .temp_cache on disk instead of the
-                // raw tool output. This is the primary data-leakage prevention for
-                // autonomous file reads.
                 const filePath = extractFilePathFromInput(call.input);
                 if (filePath) {
                     const maskedUri = resolveSessionState(filePath);
@@ -326,7 +543,6 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                             resultContent = [new vscode.LanguageModelTextPart(maskedContent)];
                         }
                         catch (readErr) {
-                            // Disk file missing — fall back to in-memory cache
                             console.log('[SafeChat] SessionState: disk read failed, trying in-memory cache for', filePath);
                             const cached = findCachedState(filePath);
                             if (cached?.wasMasked) {
@@ -335,7 +551,6 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                         }
                     }
                     else {
-                        // File not in sessionStateMap — check in-memory cache as fallback
                         const cached = findCachedState(filePath);
                         if (cached?.wasMasked) {
                             console.log('[SafeChat] SessionState: in-memory fallback for', cached.relPath);
@@ -343,11 +558,9 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                         }
                     }
                 }
-                // ── Universal sanitization: regex-sanitize ALL tool output ──────
-                // Every tool result (terminal, file-read, search, git, notebooks,
-                // MCP tools, etc.) is run through the regex engine. This catches
-                // secrets regardless of which tool produced them.
-                resultContent = sanitizeToolResultParts(resultContent);
+                // ── Branched sanitization: terminal vs general ──────────────────
+                const sanitizeMode = isTerminalTool(call.name, toolDesc) ? 'terminal' : 'general';
+                resultContent = sanitizeToolResultParts(resultContent, sanitizeMode);
             }
             catch (err) {
                 resultContent = [
@@ -363,17 +576,29 @@ async function chatRequestHandler(request, chatContext, stream, token) {
 function deactivate() { }
 // ── Tool Result Sanitization ────────────────────────────────────────────────
 /**
- * Sanitize the text parts of a tool result using the regex engine.
+ * Sanitize the text parts of a tool result.
  * Uses duck-typing (not instanceof) because tool result parts from
  * vscode.lm.invokeTool() may be deserialized plain objects.
+ * @param mode - 'terminal' uses terminalSanitize (targeted CLI patterns),
+ *               'general' uses regexSanitize (key=value secrets, PII).
+ *               Both modes always run regexSanitize as a baseline.
  */
-function sanitizeToolResultParts(parts) {
+function sanitizeToolResultParts(parts, mode = 'general') {
     return parts.map((part, i) => {
         // Duck-type: any part with a string `.value` is treated as a text part
         const val = part.value;
         if (typeof val === 'string') {
-            const { cleanText, wasModified } = (0, sanitizer_1.regexSanitize)(val);
-            console.log(`[SafeChat] sanitizeToolResultParts[${i}]: len=${val.length} modified=${wasModified} instanceof=${part instanceof vscode.LanguageModelTextPart}`);
+            // Always apply regexSanitize (baseline secret detection)
+            let { cleanText, wasModified } = (0, sanitizer_1.regexSanitize)(val);
+            // For terminal output, also apply terminal-specific patterns
+            if (mode === 'terminal') {
+                const termResult = (0, sanitizer_1.terminalSanitize)(cleanText);
+                if (termResult.wasModified) {
+                    cleanText = termResult.cleanText;
+                    wasModified = true;
+                }
+            }
+            console.log(`[SafeChat] sanitizeToolResultParts[${i}] mode=${mode}: len=${val.length} modified=${wasModified}`);
             if (wasModified) {
                 console.log('[SafeChat] ── before (first 200):', val.slice(0, 200));
                 console.log('[SafeChat] ── after  (first 200):', cleanText.slice(0, 200));

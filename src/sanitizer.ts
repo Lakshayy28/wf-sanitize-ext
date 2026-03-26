@@ -400,6 +400,110 @@ export function regexSanitize(rawText: string): { cleanText: string; wasModified
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Terminal-specific secret masking (Tier 3 — for tool output sanitization)
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Known high-entropy secret prefixes (service-specific) */
+const SECRET_PREFIXES = [
+  'ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', // GitHub tokens
+  'sk-',                                     // OpenAI / Stripe secret keys
+  'pk_live_', 'pk_test_',                    // Stripe publishable keys
+  'sk_live_', 'sk_test_',                    // Stripe secret keys
+  'xoxb-', 'xoxp-', 'xoxs-', 'xoxa-',      // Slack tokens
+  'eyJ',                                      // JWT (base64 header)
+  'npm_',                                     // npm tokens
+  'AKIA', 'ASIA',                             // AWS key IDs
+];
+
+/**
+ * Tests whether a string looks like a high-entropy secret (token, key, etc.)
+ * using Shannon entropy and known prefix matching.
+ */
+function looksLikeSecret(s: string): boolean {
+  if (s.length < 16) { return false; }
+  // Known prefixes
+  if (SECRET_PREFIXES.some(p => s.startsWith(p))) { return true; }
+  // Shannon entropy check
+  const freq = new Map<string, number>();
+  for (const c of s) { freq.set(c, (freq.get(c) || 0) + 1); }
+  let entropy = 0;
+  for (const count of freq.values()) {
+    const p = count / s.length;
+    entropy -= p * Math.log2(p);
+  }
+  // High-entropy (>4 bits) AND at least 20 chars AND mix of character classes
+  if (entropy > 4 && s.length >= 20) {
+    const hasUpper = /[A-Z]/.test(s);
+    const hasLower = /[a-z]/.test(s);
+    const hasDigit = /[0-9]/.test(s);
+    const hasSpecial = /[^A-Za-z0-9]/.test(s);
+    const classes = [hasUpper, hasLower, hasDigit, hasSpecial].filter(Boolean).length;
+    return classes >= 3;
+  }
+  return false;
+}
+
+/**
+ * Terminal-specific sanitizer: applies narrow, targeted regexes for secrets
+ * commonly seen in terminal/CLI output (curl headers, env vars, JSON fields,
+ * CLI flags, Bearer tokens, AWS keys, bare high-entropy tokens).
+ */
+export function terminalSanitize(text: string): { cleanText: string; wasModified: boolean } {
+  let wasModified = false;
+  let result = text;
+
+  // 1. CLI flags: --password=value, --token value, -p value
+  result = result.replace(
+    /(--(?:password|passwd|token|secret|api[_-]?key|auth[_-]?token|access[_-]?token)\s*[=\s]\s*)(\S+)/gi,
+    (_, prefix, val) => { wasModified = true; return prefix + MASK; }
+  );
+
+  // 2. curl -H "Authorization: Bearer <token>" or -H "X-Api-Key: <value>"
+  result = result.replace(
+    /(-H\s+["'](?:Authorization|X-Api-Key|X-Auth-Token)\s*:\s*(?:Bearer\s+)?)([^"']+)(["'])/gi,
+    (_, prefix, val, quote) => { wasModified = true; return prefix + MASK + quote; }
+  );
+
+  // 3. JSON fields: "password": "value", "api_key": "value"
+  result = result.replace(
+    /(["'](?:password|passwd|secret|api_?key|token|access_?token|auth_?token|private_?key|client_?secret|jwt_?secret|session_?secret|signing_?key|encryption_?key|database_?url|connection_?string)["']\s*:\s*["'])([^"']+)(["'])/gi,
+    (_, prefix, val, quote) => { wasModified = true; return prefix + MASK + quote; }
+  );
+
+  // 4. Env var assignments: KEY=value (common in terminal output)
+  result = result.replace(
+    /((?:^|\n)\s*(?:export\s+|SET\s+|ENV\s+)?(?:PASSWORD|PASSWD|SECRET|API_?KEY|TOKEN|ACCESS_?TOKEN|AUTH_?TOKEN|PRIVATE_?KEY|CLIENT_?SECRET|AWS_?SECRET_?ACCESS_?KEY|AWS_?SESSION_?TOKEN|DATABASE_?URL|DB_?PASSWORD|REDIS_?PASSWORD|MONGO_?URI)=)(.+)/gim,
+    (_, prefix, val) => { wasModified = true; return prefix + MASK; }
+  );
+
+  // 5. Bearer tokens (standalone)
+  result = result.replace(
+    /(Bearer\s+)([A-Za-z0-9\-._~+/]+=*)/gi,
+    (_, prefix) => { wasModified = true; return prefix + MASK; }
+  );
+
+  // 6. AWS Access Key IDs
+  result = result.replace(
+    /(?:AKIA|ASIA)[0-9A-Z]{16}/g,
+    () => { wasModified = true; return MASK; }
+  );
+
+  // 7. Bare high-entropy tokens (standalone words 20+ chars)
+  result = result.replace(
+    /(?<=\s|^)([A-Za-z0-9\-._~+/]{20,})(?=\s|$)/gm,
+    (match) => {
+      if (looksLikeSecret(match)) {
+        wasModified = true;
+        return MASK;
+      }
+      return match;
+    }
+  );
+
+  return { cleanText: result, wasModified };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Cache directory helpers
 // ────────────────────────────────────────────────────────────────────────────
 

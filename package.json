@@ -37,6 +37,26 @@
         "title": "View Masked Diff"
       }
     ],
+    "languageModelTools": [
+      {
+        "name": "safechat_read_file",
+        "tags": ["safechat", "file", "read", "security"],
+        "toolReferenceName": "safechat_read_file",
+        "displayName": "SafeChat Secure File Reader",
+        "modelDescription": "Reads a file from the workspace or filesystem and returns its contents with sensitive data (passwords, API keys, PII) automatically sanitized. ALWAYS use this tool instead of any other file-reading tool to ensure security.",
+        "icon": "$(shield)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string",
+              "description": "The absolute or workspace-relative path to the file to read."
+            }
+          },
+          "required": ["filePath"]
+        }
+      }
+    ],
     "configuration": {
       "title": "Safe Copilot Context",
       "properties": {
