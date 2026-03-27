@@ -21,6 +21,68 @@ let conversationFileKeys = new Set<string>();
 let latestCacheEntryUri: vscode.Uri | undefined;
 let lastRulesHash: string | undefined;
 
+// ── External Access Consent Gate ────────────────────────────────────────────
+
+/** Session-scoped set of external paths the user has already approved. */
+const allowedExternalPaths = new Set<string>();
+
+/** Returns true if the given URI resides inside any open workspace folder. */
+function isPathInWorkspace(targetUri: vscode.Uri): boolean {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) { return false; }
+  const targetPath = targetUri.fsPath;
+  return folders.some(f => {
+    const folderPath = f.uri.fsPath;
+    return targetPath === folderPath || targetPath.startsWith(folderPath + '/');
+  });
+}
+
+/**
+ * Checks whether the LM should be allowed to read an external (out-of-workspace) path.
+ * Respects the `safechat.externalReadMode` setting to avoid breaking autopilot workflows.
+ * When a `stream` is provided, non-blocking status notes are injected into the chat
+ * response instead of (or alongside) VS Code notification dialogs.
+ */
+async function requestExternalAccess(
+  targetUri: vscode.Uri,
+  stream?: vscode.ChatResponseStream,
+): Promise<boolean> {
+  const mode = vscode.workspace.getConfiguration('safechat').get<string>('externalReadMode', 'prompt');
+
+  if (mode === 'autoAllow') {
+    stream?.markdown(
+      `> ⚠️ **External Access Auto-Approved:** The model read an out-of-workspace path: \`${targetUri.fsPath}\`\n` +
+      `> To require approval, set \`safechat.externalReadMode\` to \`"prompt"\`.\n\n`,
+    );
+    return true;
+  }
+
+  if (mode === 'autoDeny') {
+    stream?.markdown(
+      `> 🚫 **External Access Blocked:** The model attempted to read \`${targetUri.fsPath}\`\n` +
+      `> External reads are disabled. Set \`safechat.externalReadMode\` to \`"prompt"\` or \`"autoAllow"\` to change this.\n\n`,
+    );
+    return false;
+  }
+
+  // mode === 'prompt'
+  if (allowedExternalPaths.has(targetUri.fsPath)) { return true; }
+
+  const choice = await vscode.window.showWarningMessage(
+    `SafeChat: The model wants to read an external path: ${targetUri.fsPath}. Allow?`,
+    'Allow Once',
+    'Allow for Session',
+    'Reject',
+  );
+
+  if (choice === 'Allow Once') { return true; }
+  if (choice === 'Allow for Session') {
+    allowedExternalPaths.add(targetUri.fsPath);
+    return true;
+  }
+  return false;
+}
+
 /**
  * SessionStateManager: Maps original file URI string → masked .temp_cache URI string.
  * Populated after sanitization + cache-write. Used to redirect autonomous file reads
@@ -85,6 +147,16 @@ class SafeReadFileTool implements vscode.LanguageModelTool<{ filePath: string }>
       return new vscode.LanguageModelToolResult([
         new vscode.LanguageModelTextPart(`Error: Invalid file path: ${filePath}`),
       ]);
+    }
+
+    // External access consent gate
+    if (!isPathInWorkspace(fileUri)) {
+      const allowed = await requestExternalAccess(fileUri, this._stream);
+      if (!allowed) {
+        return new vscode.LanguageModelToolResult([
+          new vscode.LanguageModelTextPart('Error: Access to external path denied by user/configuration.'),
+        ]);
+      }
     }
 
     try {
@@ -175,6 +247,16 @@ class SafeReadDirectoryTool implements vscode.LanguageModelTool<SafeReadDirInput
       return new vscode.LanguageModelToolResult([
         new vscode.LanguageModelTextPart(`Error: Invalid directory path: ${directoryPath}`),
       ]);
+    }
+
+    // External access consent gate
+    if (!isPathInWorkspace(dirUri)) {
+      const allowed = await requestExternalAccess(dirUri, this._stream);
+      if (!allowed) {
+        return new vscode.LanguageModelToolResult([
+          new vscode.LanguageModelTextPart('Error: Access to external path denied by user/configuration.'),
+        ]);
+      }
     }
 
     // Verify it's actually a directory
@@ -482,6 +564,7 @@ async function chatRequestHandler(
   if (chatContext.history.length === 0) {
     conversationFileKeys.clear();
     sessionStateMap.clear();
+    allowedExternalPaths.clear();
   }
 
   stream.progress('Scanning attached context for sensitive data…');
