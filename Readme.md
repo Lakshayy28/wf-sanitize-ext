@@ -1,6 +1,6 @@
  # Safe Copilot Context — VS Code Extension
 
-A security-focused VS Code Chat Participant (`@safechat`) that automatically detects and masks PII, credentials, and secrets in any file you attach before the context is forwarded to GitHub Copilot. Nothing sensitive leaves your machine.
+A security-focused VS Code Chat Participant (`@safechat`) that automatically detects and masks PII, credentials, and secrets in any file you attach or that any tool reads before the context is forwarded to GitHub Copilot. Nothing sensitive leaves your machine.
 
 ---
 
@@ -21,37 +21,48 @@ You type: @safechat explain this config #file:config.yaml
           │   (api_key=, Bearer tokens,    │  (API keys, tokens, AWS keys…)
           │    AWS AKIA keys…)             │
           └─────────────┬──────────────────┘
+                        │
+          ┌─────────────▼──────────────────┐
+          │   Tier 2b — Heuristic scanner  │  Catches secrets in unstructured text
+          │   (PEM keys, inline secrets,   │  (code snippets, search results,
+          │    high-entropy tokens)        │   terminal output)
+          └─────────────┬──────────────────┘
                         │ clean text
                  Sent to Copilot LM
                         │
-          Full agentic tool loop:
-          search code, read files, run
-          commands (up to 15 rounds)
+          Full agentic tool loop (≤15 rounds):
+          search code, read files, run commands
+          — ALL tool results pass the mesh too
                         │
              Copilot response streamed
              back to Chat panel
 ```
 
-The original and masked versions of each prompt are cached locally under `.vscode/.temp_cache/<timestamp>/` so you can inspect exactly what was stripped using the built-in diff viewer.
+The original and masked versions of each sanitization event are cached locally under `.vscode/.temp_cache/latest/` so you can inspect exactly what was stripped using the built-in diff viewer.
 
 ---
 
 ## Features
 
-- **`@safechat` Chat Participant** — invoke directly in the Copilot Chat panel, attach any file as context.
-- **Two-tier sanitization** — Microsoft Presidio (NLP) as the primary engine with regex as an always-on fallback.
+- **`@safechat` Chat Participant** — invoke directly in the Copilot Chat panel; attach any file as context.
+- **Sanitization Mesh** — a mandatory multi-layer checkpoint for ALL data entering the model's context window: attached files, tool reads, search results, and terminal output are all sanitized.
+- **Three-tier sanitization engine**:
+  - **Tier 1 — Microsoft Presidio (NLP)** — stanza-based named-entity recognition for names, emails, credit cards, SSNs, IBANs and 70+ more entity types.
+  - **Tier 2 — Regex engine** — always-on fallback catching `key=value` secrets, Bearer tokens, AWS keys, GitHub tokens, database URLs, and more.
+  - **Tier 2b — Heuristic content scanner** — line-by-line processing for PEM private key blocks, inline hardcoded secrets in code snippets, and bare high-entropy strings.
+- **Safe file tools** — `safechat_read_file` and `safechat_read_directory` are registered as LM tools so the model can read workspace files and directories via a sanitized pipeline.
+- **Native tool blocklist** — native file-read, directory-listing, and workspace-search tools are stripped from the model's tool menu and, if called anyway, are intercepted and rerouted through the safe alternatives.
+- **Terminal-aware sanitization** — ANSI escape codes are stripped; CLI-specific patterns (curl headers, env var exports, JSON credential fields) are caught separately from general file patterns.
 - **70+ PII entity types** — names, emails, phone numbers, credit cards, SSNs, IBANs, SWIFT codes, API keys, JWTs, AWS keys, database URLs, K8s secrets, CI/CD tokens, and more.
 - **5 anonymizer operations** — `replace`, `mask`, `redact`, `hash`, or `encrypt` per entity type, configured in a single YAML file.
-- **File type allowlist** — restrict scanning to only data/config file extensions (`.yaml`, `.json`, `.env`, etc.); non-matching files (`.ts`, `.py`, `.go`, etc.) are **forwarded as-is** to Copilot without modification.
+- **File type allowlist** — restrict scanning to only data/config file extensions (`.yaml`, `.json`, `.env`, etc.); non-matching files are forwarded as-is to Copilot without modification.
 - **Full agentic behaviour** — passes all available VS Code tools to the LLM and runs an agentic tool-calling loop (up to 15 rounds): search code, read files, run commands — identical to native Copilot Agent mode.
 - **Conversation continuity** — per-file state cache with `mtime`-based invalidation keeps all attached file context live across multiple turns in the same chat.
 - **User-defined custom recognizers** — add your own regex patterns (employee IDs, ticket numbers, internal references) via the YAML config; no server restart needed.
-- **5 sanitization profiles** — `financial`, `developer`, `infrastructure`, `cicd`, `full` — load the right set of recognizers for your context.
-- **Diff viewer** — every prompt with detected PII gets a "View Masked Diff" button that opens a side-by-side comparison of original vs. sanitized context.
-- **Interactive documentation** — built-in web UI at `http://localhost:8000/docs/ui` lists every entity type, recognizer, and anonymizer operation with examples.
-- **Graceful fallback** — if the Presidio server is not running the regex engine still catches secrets; a warning is shown in chat.
+- **Append-only diff cache** — every sanitization event during a session (both user-attached files and autonomous tool reads) is written to `.vscode/.temp_cache/latest/` with a deduplicated manifest.
+- **Diff viewer** — every sanitization event produces a "View Masked Diff" button that opens a side-by-side comparison of original vs. sanitized content; multiple files are presented in a QuickPick selector.
+- **Graceful fallback** — if the Presidio server is not running the regex+heuristic engine still catches secrets; a warning is shown in chat.
 - **Fully local** — the Presidio server runs on your machine; no data is sent to any external service beyond Copilot itself.
-- **Configurable API URL** — point the extension at any host/port via a VS Code setting.
 
 ---
 
@@ -61,7 +72,7 @@ The original and masked versions of each prompt are cached locally under `.vscod
 |---|---|
 | VS Code | 1.95.0 or later |
 | GitHub Copilot Chat extension | Latest |
-| Python | 3.9 or later |
+| Python | 3.9 or later (optional — for Presidio Tier 1) |
 | Node.js | 18 or later (development only) |
 
 ---
@@ -78,9 +89,9 @@ code --install-extension safe-copilot-context-0.0.1.vsix
 
 Or open VS Code → Extensions → `···` → **Install from VSIX…** and select the file.
 
-### 2 — Set up the Python environment for the Presidio server
+### 2 — Set up the Python environment for the Presidio server (optional)
 
-The Presidio server runs as a local FastAPI service. One-time setup:
+The Presidio server provides Tier 1 NLP-based PII detection. The extension works without it (Tier 2 regex + Tier 2b heuristics still run), but Tier 1 catches things the other tiers miss (names, addresses, custom entity types).
 
 ```bash
 # Create a virtual environment in the project folder
@@ -99,7 +110,7 @@ python -m spacy download en_core_web_lg
 
 ### 3 — Start the Presidio server
 
-The server must be running whenever you use `@safechat`. Start it in a terminal:
+The server must be running if you want Tier 1 detection. Start it in a terminal:
 
 ```bash
 cd /path/to/wf-sanitize-ext
@@ -153,6 +164,16 @@ Open settings (`Cmd+,`) and search for **Safe Copilot** or add these to your `se
 @safechat what does this function do? #file:src/payment-processor.ts
 ```
 
+### Autonomous tool reads
+
+When the model needs to explore the codebase, it calls `safechat_read_file` or `safechat_read_directory` — both of which sanitize data before returning it. You can also ask explicitly:
+
+```
+@safechat scan the scripts folder for any hardcoded credentials
+```
+
+The model will call `safechat_read_directory` with `directoryPath: "scripts"`. Any files containing secrets will be masked before the content is returned, and a **"View Masked Diff"** button will appear in the chat.
+
 ### What gets sanitized
 
 | Category | Examples detected |
@@ -167,10 +188,14 @@ Open settings (`Cmd+,`) and search for **Safe Copilot** or add these to your `se
 | **IP addresses** | `192.168.1.254`, `10.0.0.1` |
 | **Crypto wallets** | `1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2` |
 | **Passports / Driving licences** | US formats |
-| **API keys / secrets** | `api_key = sk-abc123`, `password = s3cr3t` |
+| **API keys / secrets** | `api_key = sk-abc123`, `password = s3cr3t`, `const apiKey = "..."` |
 | **Bearer tokens** | `Authorization: Bearer eyJhb…` |
 | **AWS access keys** | `AKIA[0-9A-Z]{16}` |
-| **URLs** | Detected and optionally masked |
+| **PEM private keys** | Full `BEGIN/END PRIVATE KEY` blocks |
+| **GitHub / GitLab / npm tokens** | `ghp_…`, `npm_…`, `sk-…` prefix detection |
+| **High-entropy bare tokens** | 20+ char strings with Shannon entropy > 4 bits |
+| **CLI secrets** | `--token value`, `export SECRET=...`, `curl -H "Authorization: ..."` |
+| **ANSI terminal output** | Escape codes stripped before scanning |
 
 ### Example — config file with credentials
 
@@ -212,22 +237,87 @@ const API_KEY = "[MASKED_BY_SAFECHAT]";
 const OWNER = "<PERSON>";
 ```
 
+### Example — search result snippet (Tier 2b heuristic)
+
+When the model calls a search tool and results contain code snippets, the heuristic scanner runs:
+
+**Raw search result:**
+```
+[src/config.ts:12] const dbPassword = "SuperSecret123!"
+[src/auth.ts:5]    ghp_ABCDEFGHIJKLMNOPQRSTabcdef1234567890
+```
+
+**After sanitization:**
+```
+[src/config.ts:12] const dbPassword = "[MASKED_BY_SAFECHAT]"
+[src/auth.ts:5]    [MASKED_BY_SAFECHAT]
+```
+
 ### Viewing what was masked
 
-After each sanitized prompt a **"View Masked Diff"** button appears in the chat response. Clicking it opens VS Code's built-in diff editor showing a side-by-side comparison:
+After each sanitization event a **"View Masked Diff"** button appears in the chat response. Clicking it opens VS Code's built-in diff editor:
 
-- **Left pane** — original file content (as you attached it)
+- **Left pane** — original file content (as attached or read by the tool)
 - **Right pane** — what was actually sent to Copilot
 
-All diffs are stored in `.vscode/.temp_cache/<timestamp>/` and persist across reloads so you can review any past prompt.
+When multiple files were masked in one session, a QuickPick selector lets you choose which file to inspect. All diffs persist across reloads in `.vscode/.temp_cache/latest/` and new entries are appended without overwriting existing ones.
+
+---
+
+## Sanitization Pipeline Details
+
+The pipeline has three modes that determine which sanitizers run:
+
+| Mode | Pipeline | Used for |
+|---|---|---|
+| `general` | regexSanitize → contentSanitize | Attached files, general tool results |
+| `terminal` | stripAnsiCodes → terminalSanitize → regexSanitize → contentSanitize | Terminal / shell tool output |
+| `search` | regexSanitize → contentSanitize | Workspace search, grep results |
+
+Each pass:
+
+| Stage | What it catches |
+|---|---|
+| **stripAnsiCodes** | SGR, cursor movement, OSC ANSI escape sequences |
+| **terminalSanitize** | CLI flags (`--token value`), curl headers, JSON credential fields, env var exports, Bearer tokens, AWS keys, bare high-entropy tokens |
+| **regexSanitize** | 180+ named key=value patterns, email/phone/IP after known keys, standalone Bearer and AWS key patterns |
+| **contentSanitize** | PEM private key blocks, inline secret assignments in code, 32+ char high-entropy strings identified by Shannon entropy |
+
+---
+
+## Native Tool Interception (Sanitization Mesh)
+
+The extension enforces a mandatory sanitization boundary around ALL tool invocations:
+
+### Tool menu filtering (Step 6)
+Before the agentic loop starts, native file-read, directory-listing, and workspace-search tools are stripped from the model's tool menu so the model cannot select them. Only `safechat_read_file` and `safechat_read_directory` are available for I/O.
+
+Blocked categories:
+- **File-read tools**: `readFile`, `read_file`, `vscode_readFile`, `mcp_*read*file`, and similar
+- **Directory tools**: `list_dir`, `read_folder`, `listDirectory`, `mcp_*dir*`, and similar
+- **Search tools**: `workspace_search`, `find_files`, `grep_search`, `vscode_*search*`, and similar
+
+### Defense-in-depth redirect (Step 8)
+If a native tool is nonetheless invoked (e.g. via a tool reference the user explicitly attached), the agentic loop intercepts it:
+
+| Tool type | Action |
+|---|---|
+| Native file-read | Redirect to `safechat_read_file` — extracts the file path from the tool input and re-invokes via the safe tool |
+| Native directory | Redirect to `safechat_read_directory` — extracts the directory path and re-invokes via the safe tool |
+| Native search | Allow execution but force-sanitize the raw result through `sanitizePipeline('search')` |
+
+### Automatic diff + UI feedback
+When `safechat_read_file` or `safechat_read_directory` masks data during an autonomous tool call, they automatically:
+
+1. Append the masked file pair to `.vscode/.temp_cache/latest/` (without deleting previously cached files)
+2. Update the `sessionStateMap` so subsequent reads of the same file return the already-masked version
+3. Render a shield notice and "View Masked Diff" button in the chat stream
 
 ---
 
 ## Sanitization Rules File
 
 All user controls live in a single file: `.vscode/safechat-rules.yaml`. This file is read on **every prompt** — no server restart or VS Code reload is required.
-
-> **Tip:** A fully-commented template with all entity types, examples, and hints is pre-installed at `.vscode/safechat-rules.yaml`. An interactive YAML generator is also available at `http://localhost:8000/docs/ui`.
 
 The file has three independent sections — use any combination:
 
@@ -259,87 +349,54 @@ custom_recognizers:
 
 ### Section 1 — File extension allowlist (`include_extensions`)
 
-When present, only files whose extension matches the list are scanned and sanitized. Files that do not match are **forwarded as-is** to Copilot — no blocking, no scanning. If the section is absent or empty, all attached files are scanned.
+When present, only files whose extension matches the list are scanned and sanitized. Files that do not match are **forwarded as-is** to Copilot. If the section is absent or empty, all attached files are scanned.
 
-This lets you exclude code files (`.ts`, `.py`, `.go`, `.java`) while still catching secrets in config and data files. A commented template with every supported extension is pre-installed in `.vscode/safechat-rules.yaml`. Key groups:
+This lets you exclude source files (`.ts`, `.py`, `.go`) while still catching secrets in config and data files.
 
 ```yaml
 include_extensions:
   # Universal config formats
-  - .yaml         # Kubernetes, Helm, CI/CD, Spring Boot, GitLab CI
+  - .yaml
   - .yml
-  - .json         # package.json, appsettings.json, tsconfig.json
-  - .xml          # Maven pom.xml, web.config, Spring context
-  - .toml         # Cargo.toml, pyproject.toml, Pipfile, Poetry
-  - .ini          # php.ini, tox.ini, pytest.ini
-  - .cfg          # setup.cfg, pip, flake8, mypy
-  - .conf         # Nginx, HAProxy, Apache, Redis, sshd_config
-  - .config       # NuGet.config, app.config, web.config (.NET)
-  - .properties   # Java application.properties, gradle.properties
+  - .json
+  - .xml
+  - .toml
+  - .ini
+  - .cfg
+  - .conf
+  - .config
+  - .properties
 
   # Secret & credential dotfiles
-  - .env          # dotenv (.env, .env.production — matched by full basename)
-  - .npmrc        # npm / yarn / pnpm registry auth tokens
-  - .yarnrc       # Yarn 1.x credentials
-  - .gemrc        # Ruby gem source credentials
-  - .netrc        # machine-level FTP/HTTP/Git credential store
-  - .pgpass       # PostgreSQL password file
-  - .terraformrc  # Terraform CLI config (registry tokens)
-  - .curlrc       # curl config (proxy creds, headers)
+  - .env
+  - .npmrc
+  - .netrc
+  - .pgpass
+  - .terraformrc
 
   # Certificates & keys
-  - .pem          # PEM certificate or private key
-  - .crt          # X.509 certificate
-  - .cer          # Windows certificate
-  - .key          # private key (RSA, EC, PKCS#8)
-  - .pub          # SSH/GPG public key
-  - .p12          # PKCS#12 keystore
-  - .pfx          # Windows PKCS#12
-  - .jks          # Java KeyStore
-  - .p8           # Apple AuthKey (APNs, App Store Connect)
-  - .ppk          # PuTTY private key
+  - .pem
+  - .key
+  - .pub
+  - .p12
 
   # Infrastructure as Code
-  - .tf           # Terraform source (provider creds, resource config)
-  - .tfvars       # Terraform variable values (often secrets)
-  - .tfstate      # Terraform state (contains all resource attributes!)
-  - .hcl          # HashiCorp Configuration Language (Vault, Consul)
+  - .tf
+  - .tfvars
+  - .tfstate
 
-  # JVM / Java, Kotlin, Groovy
-  - .gradle       # Groovy Gradle build (repo credentials)
-  - .kts          # Kotlin Script / Gradle KTS
-
-  # .NET — C#, VB, F#
-  - .csproj       # C# project (NuGet source URLs with tokens)
-  - .nuspec       # NuGet package specification
-  - .props        # MSBuild property sheet
-  - .targets      # MSBuild targets
-
-  # Shell scripts (can contain hardcoded credentials)
+  # Shell scripts
   - .sh
-  - .bash
-  - .zsh
-  - .ps1          # PowerShell
-  - .psm1         # PowerShell module
+  - .ps1
   - .bat
   - .cmd
 
   # Data / reports
-  - .csv          # CSV exports (PII — names, emails, accounts)
-  - .tsv
-  - .sql          # SQL scripts (connection strings, INSERTs with PII)
+  - .csv
+  - .sql
+  - .log
   - .txt
-  - .log          # logs (credentials, stack traces, PII)
-  - .jsonl        # JSON Lines / event streams
-
-  # API & schema definitions
-  - .graphql
-  - .gql
-  - .proto        # Protocol Buffers
-  - .wsdl         # SOAP Web Service Description Language
 ```
-
-Dotfiles with no secondary extension (`.env`, `.npmrc`, `.netrc`) are matched by their full basename. Files like `.env.local` have extension `.local` — add `- .local` to the list to include them.
 
 ---
 
@@ -351,11 +408,9 @@ Controls how each detected entity type is transformed:
 |---|---|---|
 | `replace` | `<PHONE_NUMBER>` | **Default.** Preserves entity type label for Copilot context. |
 | `mask` | `************` | Replaces every character with `*`. |
-| `redact` | *(empty string)* | Completely removes the text — nothing remains. |
+| `redact` | *(empty string)* | Completely removes the text. |
 | `hash` | `b7531e08…` | One-way SHA-256 digest. Repeatable — identical values produce identical hashes. |
-| `encrypt` | `dGhpcyBp…` | AES-CBC reversible encryption. Requires `SAFECHAT_ENCRYPT_KEY` env var (16, 24, or 32 chars). Falls back to `replace` if key is missing. |
-
-Legacy capitalised values (`Mask`, `Replace`) still work for backwards compatibility.
+| `encrypt` | `dGhpcyBp…` | AES-CBC reversible encryption. Requires `SAFECHAT_ENCRYPT_KEY` env var. Falls back to `replace` if key is missing. |
 
 ```yaml
 rules:
@@ -367,8 +422,6 @@ rules:
 ```
 
 #### Supported entity aliases
-
-You can use either friendly names or the canonical Presidio types:
 
 | Friendly alias | Presidio entity type |
 |---|---|
@@ -389,44 +442,48 @@ You can use either friendly names or the canonical Presidio types:
 | `MedicalLicense` | `MEDICAL_LICENSE` |
 | `NRP` | `NRP` |
 
-Any entity type **not listed** in `rules` defaults to `replace`. For the full catalogue of 70+ entity types across Financial, Developer, Infrastructure, and CI/CD profiles, see `http://localhost:8000/docs/ui` or `http://localhost:8000/docs/entities`.
+Any entity type **not listed** in `rules` defaults to `replace`. For the full catalogue of 70+ entity types across Financial, Developer, Infrastructure, and CI/CD profiles, see `http://localhost:8000/docs/entities`.
 
 ---
 
 ### Section 3 — Custom recognizers (`custom_recognizers`)
 
-Define your own regex-based recognizers without touching the server. Each recognizer is active for the duration of the request — no restart required.
+Define your own regex-based recognizers without touching the server:
 
 ```yaml
 custom_recognizers:
-  - name: EMPLOYEE_ID          # entity type label (uppercase)
-    pattern: "EMP-\\d{6}"     # Python-compatible regex
-    score: 0.9                 # confidence 0.0–1.0 (default: 0.85)
-    context:                   # optional — nearby words boost confidence
+  - name: EMPLOYEE_ID
+    pattern: "EMP-\\d{6}"
+    score: 0.9
+    context:
       - employee
       - staff
-      - badge
 
   - name: INTERNAL_TICKET
     pattern: "JIRA-\\d{4,6}"
     score: 0.85
-    context:
-      - ticket
-      - issue
 
-  - name: CUSTOMER_ACCOUNT
-    pattern: "CUST-[A-Z]{2}\\d{8}"
-    score: 0.9
-```
-
-Then add a matching entry in the `rules` section:
-
-```yaml
 rules:
-  EMPLOYEE_ID:      mask
-  INTERNAL_TICKET:  redact
-  CUSTOMER_ACCOUNT: replace
+  EMPLOYEE_ID:     mask
+  INTERNAL_TICKET: redact
 ```
+
+---
+
+## Registered LM Tools
+
+Two Language Model Tools are registered with VS Code, making them available to the model in the tool menu:
+
+### `safechat_read_file`
+- **Input**: `{ filePath: string }` (absolute or workspace-relative)
+- **Behaviour**: (1) checks SessionStateManager for a previously masked version on disk; (2) checks in-memory `fileStateCache`; (3) reads fresh from disk and applies `regexSanitize`; if data was masked, appends to diff cache and renders a UI button
+- **Safety**: Never blocked by its own blocklist
+
+### `safechat_read_directory`
+- **Input**: `{ directoryPath: string, maxDepth?: number, maxFiles?: number }`
+- **Defaults**: `maxDepth: 5` (hard cap: 10), `maxFiles: 50` (hard cap: 200)
+- **Behaviour**: Recursively collects files (sorted: files first, then directories); checks cache tiers per file; fresh reads are passed through `regexSanitize`; tracks all masked files and appends them to the diff cache in one batch; renders a UI button with the masked file count
+- **Skipped directories**: `node_modules`, `.git`, `.venv`, `__pycache__`, `.temp_cache`, `out`, `dist`, `build`, `.next`, `.nuxt`, `coverage`
 
 ---
 
@@ -441,53 +498,9 @@ The server runs at `http://localhost:8000` by default.
 | `/docs/ui` | GET | Interactive documentation web page |
 | `/docs/entities` | GET | JSON catalogue of all entity types and profiles |
 | `/analyze` | POST | Detect PII — returns findings without masking |
-| `/anonymize` | POST | Detect + anonymize — returns masked text |
 | `/sanitize` | POST | Detect + anonymize in one call (used by the extension) |
 
-### `GET /health`
-```json
-{ "status": "ok", "service": "safechat-presidio-server" }
-```
-
-### `GET /docs/ui`
-A self-contained HTML documentation page listing all 70+ entity types grouped by profile, all recognizer patterns with examples, all 5 anonymizer operations with input/output examples, and an interactive YAML config generator. Open in a browser:
-```
-http://localhost:8000/docs/ui
-```
-
-### `GET /profiles`
-```json
-{
-  "profiles": [
-    { "name": "financial",      "entity_count": 22 },
-    { "name": "developer",      "entity_count": 17 },
-    { "name": "infrastructure", "entity_count": 13 },
-    { "name": "cicd",           "entity_count": 20 },
-    { "name": "full",           "entity_count": 70 }
-  ]
-}
-```
-
-### `POST /analyze`
-Detect PII entities without modifying text. Useful for previewing what would be masked.
-
-```bash
-curl -X POST http://localhost:8000/analyze \
-  -H 'Content-Type: application/json' \
-  -d '{"text": "Call Jane at 415-555-0198 or jane@example.com"}'
-```
-```json
-{
-  "entities_found": [
-    { "entity_type": "PERSON",        "start": 5,  "end": 9,  "score": 0.85, "text_snippet": "Jane" },
-    { "entity_type": "PHONE_NUMBER",  "start": 13, "end": 25, "score": 0.4,  "text_snippet": "415-555-0198" },
-    { "entity_type": "EMAIL_ADDRESS", "start": 29, "end": 45, "score": 1.0,  "text_snippet": "jane@example.com" }
-  ]
-}
-```
-
 ### `POST /sanitize`
-Combined analyze + anonymize in one call. This is what the extension uses.
 
 ```bash
 curl -X POST http://localhost:8000/sanitize \
@@ -524,8 +537,8 @@ curl -X POST http://localhost:8000/sanitize \
 ```
 wf-sanitize-ext/
 ├── src/
-│   ├── extension.ts          # Chat participant registration & handler
-│   └── sanitizer.ts          # Two-tier sanitization engine + cache management
+│   ├── extension.ts          # Chat participant, safe tools, agentic loop, cache helpers
+│   └── sanitizer.ts          # Multi-tier sanitization engine (Presidio + regex + heuristics)
 ├── presidio_server/
 │   ├── main.py               # FastAPI server (Presidio NLP engine)
 │   ├── requirements.txt      # Python dependencies
@@ -535,6 +548,7 @@ wf-sanitize-ext/
 │   ├── launch.json           # Debug configs incl. compound launch
 │   ├── tasks.json            # Build + server tasks
 │   └── .temp_cache/          # Auto-generated diff cache (gitignored)
+│       └── latest/           # Most recent session's masked file pairs + manifest.json
 ├── out/                      # Compiled JS (generated)
 ├── package.json              # Extension manifest
 └── tsconfig.json
@@ -550,7 +564,7 @@ git clone <repo-url>
 cd wf-sanitize-ext
 npm install
 
-# Set up Python environment
+# Set up Python environment (optional — for Presidio Tier 1)
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r presidio_server/requirements.txt
@@ -579,41 +593,27 @@ npm run watch     # compile on save
 npm run lint      # ESLint
 ```
 
-### Rebuilding the extension
+### Rebuilding and reinstalling
 
-After making changes to `src/extension.ts` or `src/sanitizer.ts`, rebuild and repackage the extension:
+After making changes to `src/extension.ts` or `src/sanitizer.ts`:
 
 ```bash
-# Compile TypeScript
+# Compile + repackage
 npm run compile
-
-# Repackage the VSIX
 npx @vscode/vsce package --allow-missing-repository
-```
 
-This produces an updated `safe-copilot-context-0.0.1.vsix` (42+ KB) that includes all compiled changes. Then reinstall it:
-
-```bash
+# Reinstall
 code --install-extension safe-copilot-context-0.0.1.vsix
-```
-
-Or in VS Code: **Extensions** → **···** → **Install from VSIX…** and select the file.
-
-### Packaging a VSIX
-
-```bash
-npm install -g @vscode/vsce
-vsce package --allow-missing-repository
-# → safe-copilot-context-0.0.1.vsix
 ```
 
 ---
 
 ## Privacy & Security
 
-- **All sanitization runs locally.** The Presidio server and the regex engine both run on your machine.
+- **All sanitization runs locally.** The Presidio server and the regex/heuristic engines all run on your machine.
 - **Nothing is stored remotely.** Only the already-sanitized text is forwarded to Copilot. The original context never leaves your machine.
-- **Diff cache is local.** `.vscode/.temp_cache/` is gitignored by default (a `*` gitignore is written automatically).
+- **Diff cache is local.** `.vscode/.temp_cache/` is gitignored by default (a `*` gitignore is written automatically on first use).
+- **Tool boundary enforcement.** Native file-read, directory, and search tools are blocked at two layers: the tool menu (before the loop starts) and the agentic loop redirect guard (defense-in-depth).
 - **No telemetry.** The extension collects no usage data.
 
 ---
@@ -625,12 +625,13 @@ vsce package --allow-missing-repository
 - Ensure GitHub Copilot Chat is installed and you are signed in.
 
 **"Advanced PII detection unavailable" warning in chat**
-- The Presidio server is not running. Start it:
-  ```bash
-  .venv/bin/uvicorn presidio_server.main:app --port 8000 --reload
-  ```
+- The Presidio server is not running. Tier 1 (NLP) is skipped but Tier 2 (regex) and Tier 2b (heuristics) still run.
+- Start the server: `.venv/bin/uvicorn presidio_server.main:app --port 8000 --reload`
 - Check `safechat.presidioApiUrl` in VS Code settings matches the port you are using.
-- Regex-only masking still runs as a fallback — secrets like API keys and tokens are still caught.
+
+**"No cached diff available yet" when clicking View Masked Diff**
+- This occurs if no sanitizable content has been processed yet in this session.
+- Attach a file with a detectable secret and send a prompt — the button will appear automatically.
 
 **Server starts but extension cannot reach it**
 - Confirm the URL in settings (`safechat.presidioApiUrl`) does not have a trailing slash.
