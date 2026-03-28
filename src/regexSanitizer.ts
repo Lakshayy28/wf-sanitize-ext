@@ -79,6 +79,16 @@ export const HIGH_CONFIDENCE_SECRETS: SecretPattern[] = [
   // ── Generic URLs (Ultimate Fallbacks) ─────────────────────────────────────
   { name: 'URL Query Parameter Secret', regex: /(?:password|passwd|secret|token|api_?key|auth)=([^&\s"']+)/gi },
   { name: 'Credential URL', regex: /\b([a-zA-Z0-9+.-]+:\/\/)([^@\s]+)(@[a-zA-Z0-9.-]+(?::[\d]+)?(?:\/[^\s"']*)?)/gi, isUrlAuth: true },
+
+  // ── Keyless Credential Files ──────────────────────────────────────────────
+  { name: 'Netrc Password', regex: /(?:password|passwd)\s+([^\s]+)/gi },
+  { name: 'Pgpass Password', regex: /^(?:[^:\r\n]+:){4}([^:\r\n]+)$/gm },
+
+  // ── Tier 3 PII Fallback (for scripts/certs that bypass Presidio NLP) ──────
+  { name: 'IPv4 Address', regex: /\b((?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g },
+  { name: 'MAC Address', regex: /\b([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})\b/g },
+  { name: 'Email Address', regex: /\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/g },
+  { name: 'Phone Number Fallback', regex: /\b(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g },
 ];
 
 // ────────────────────────────────────────────────────────────────────────────

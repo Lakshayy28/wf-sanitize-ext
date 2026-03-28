@@ -1,302 +1,87 @@
-# SafeChat Sanitization Rules
+# =============================================================================
+# SafeChat Master Configuration
+# =============================================================================
+# This file controls the behavior of the @safechat VS Code extension.
+# It defines file routing, custom secret generation, and NLP PII rules.
+# =============================================================================
+
+# ── 1. Smart Routing Overrides ───────────────────────────────────────────────
+# The extension automatically routes common files (e.g., .json, .env to Tier 2 AST, 
+# and .log, .md to Tier 3 NLP). You can force unknown or custom extensions 
+# into specific engines here. (Dotfiles are matched by their full basename).
 # ─────────────────────────────────────────────────────────────────────────────
-# Define how each PII entity type should be anonymized when detected.
-#
+ast_extensions: 
+  # Force these into the Tier 2 AST Guardian (Structure preservation, no NLP)
+  - .custom_env
+  - .kube_vars
+  - .mycompany_conf
+
+full_dlp_extensions: 
+  # Force these into Tier 3 (Regex + Python Presidio NLP)
+  - .audit_log
+  - .splunk_dump
+  - .chat_transcript
+
+
+# ── 2. Dynamic Secret Builder (TypeScript Engine) ────────────────────────────
+# Define custom internal developer secrets here. The TypeScript extension will:
+# 1. Inject `ast_keys` into the Tier 2 JSON/YAML/ENV parser to mask them instantly.
+# 2. Dynamically compile a mathematically safe Regex using the prefix/charset/length 
+#    to hunt for these tokens in unstructured text (Tier 3).
 # ─────────────────────────────────────────────────────────────────────────────
-# FILE FILTERING (new)
-# ─────────────────────────────────────────────────────────────────────────────
+custom_secrets:
+  # Catch Base64 encoded usernames or DB logins in configurations
+  - name: "App Usernames"
+    ast_keys: ["username", "db_user", "login"] 
+
+  # Example: Dynamically compiles \b(acme_live_[A-Za-z0-9_\-]{32})\b
+  - name: "Acme Corp Production Token"
+    ast_keys: ["acme_prod", "acme_token"]
+    value_prefix: "acme_live_"            
+    value_charset: "alphanumeric"         # Options: alphanumeric, hex, base64, all
+    value_length: "32"                    
+
+
+# ── 3. NLP Entity Overrides (Python Presidio Engine) ─────────────────────────
+# Define how the Python NLP engine handles Human PII and Financial Data.
+# Tech Secrets (AWS, GitHub, etc.) are handled by TypeScript, NOT here.
 #
-# include_extensions  — list of file extensions that need PII sanitization.
-#   Files whose extension matches this list are scanned and sanitized before Copilot sees them.
-#   Files with no matching extension are forwarded AS-IS to Copilot (no blocking, no scanning).
-#   If this section is absent or empty, ALL referenced files are scanned (default).
-#   Dotfiles like ".env" are matched by their full basename.
-#
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Supported extension values (examples):
-#   Universal:  .yaml / .yml, .json, .xml, .toml, .ini, .cfg, .conf, .config, .properties
-#   Secrets:    .env, .secret, .npmrc, .yarnrc, .gemrc, .netrc, .pgpass, .terraformrc
-#   Certs/Keys: .pem, .crt, .cer, .key, .pub, .p12, .pfx, .jks, .p8, .ppk, .asc
-#   IaC:        .tf, .tfvars, .tfstate, .hcl
-#   JVM:        .gradle, .kts
-#   .NET:       .csproj, .nuspec, .props, .targets
-#   Shell:      .sh, .bash, .zsh, .ps1, .psm1, .bat, .cmd
-#   Data:       .csv, .tsv, .sql, .txt, .log, .jsonl
-#   API/Schema: .graphql, .gql, .proto, .wsdl, .xsd
-#
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Format:
-#   <EntityKey>: <Operation>
-#
-# Operations:
-#   replace  — substitute with a labelled placeholder  e.g.  <PHONE_NUMBER>
-#   mask     — substitute with asterisks               e.g.  ****
+# Operations: 
+#   replace  — substitute with a labelled placeholder (e.g. <PHONE_NUMBER>)
+#   mask     — substitute with asterisks (e.g. ****)
 #   redact   — completely remove the detected text
-#   hash     — replace with SHA-256 hash of the value
-#   encrypt  — replace with AES-encrypted value (set SAFECHAT_ENCRYPT_KEY env var)
-#
-# Legacy names "Mask" and "Replace" still work (backwards compatible).
-#
-# EntityKey can be a Presidio entity type OR a friendly alias (case-insensitive):
-#
-#   Alias                     Presidio entity type
-#   ─────────────────────     ──────────────────────────
-#   PhoneNumber / Phone     → PHONE_NUMBER
-#   AccountNumber           → US_BANK_NUMBER
-#   Email / EmailAddress    → EMAIL_ADDRESS
-#   CreditCard / CC         → CREDIT_CARD
-#   SSN                     → US_SSN
-#   IPAddress / IP          → IP_ADDRESS
-#   Person / Name           → PERSON
-#   IBAN / IBANCode         → IBAN_CODE
-#   Crypto / Bitcoin        → CRYPTO
-#   Location                → LOCATION
-#   Date / DateTime         → DATE_TIME
-#   URL                     → URL
-#   Passport                → US_PASSPORT
-#   DrivingLicense          → US_DRIVER_LICENSE
-#   MedicalLicense          → MEDICAL_LICENSE
-#   NRP                     → NRP
-#
-# Rules listed here override the server default (replace) for that entity type.
-# Entity types NOT listed use the server default replacement format.
-#
-# View full documentation at http://localhost:8000/docs/ui
 # ─────────────────────────────────────────────────────────────────────────────
-
-# ── File Extension Allowlist ──────────────────────────────────────────────────
-# Uncomment and populate to restrict sanitization to specific file types only.
-# Code files (.ts, .py, .go, .java, etc.) are intentionally omitted — they are
-# not considered data files.  Only config, secret, certificate, and data files
-# are listed here.
-#
-# DOTFILE NOTE: Dotfiles with no secondary extension (.env, .npmrc, .netrc …)
-# are matched by their full basename.  Files like ".env.local" have extension
-# ".local" and must be listed separately.
-#
-include_extensions:
-  - .yaml        # Kubernetes, Helm, CI/CD, Spring Boot, GitLab CI, app config
-  - .yml         # same as .yaml (alternate spelling)
-  - .json        # package.json, appsettings.json, tsconfig.json, API responses
-  - .xml         # Maven pom.xml, web.config, Spring context, NuGet packages.config
-  - .conf        # Nginx, Apache, HAProxy, Redis, PostgreSQL, sshd_config
-  - .env         # dotenv secret files (.env, .env.production — matched by basename)
-  - .properties  # Java application.properties, gradle.properties
-  - .pem         # PEM-encoded certificate or private key
-  - .crt         # X.509 certificate (PEM or DER)
-  - .cer         # Windows DER/PEM certificate
-  - .pfx         # Windows PKCS#12 keystore (cert + private key bundle)
-  - .key         # private key file (RSA, EC, PKCS#8)
-# ── Full reference — uncomment any of the lines below to add more types ──────
-# include_extensions (additional options):
-#   # ── Universal config & data formats ───────────────────────────────────────
-#   - .toml        # Cargo.toml, pyproject.toml, Pipfile, config.toml, Poetry
-#   - .ini         # classic config (php.ini, mypy.ini, tox.ini, pytest.ini)
-#   - .cfg         # setup.cfg, pip.cfg, flake8, mypy
-#   - .config      # NuGet.config, app.config, web.config (.NET / IIS)
-#   - .properties  # Java application.properties, gradle.properties, log4j
-#
-#   # ── Secret & credential dotfiles ──────────────────────────────────────────
-#   - .env         # dotenv (.env, .env.production — dotfiles matched by basename)
-#   - .secret      # generic secret files
-#   - .secrets     # generic secrets bundle
-#   - .token       # raw token files
-#   - .npmrc       # npm / yarn / pnpm registry auth tokens
-#   - .yarnrc      # Yarn 1.x credential config
-#   - .gemrc       # Ruby gem source credentials
-#   - .netrc       # FTP / HTTP / Git machine-level credential store
-#   - .pgpass      # PostgreSQL password file
-#   - .curlrc      # curl config (proxy credentials, headers)
-#   - .s3cfg       # s3cmd config (AWS endpoint + credentials)
-#   - .terraformrc # Terraform CLI config (registry tokens, provider creds)
-#   - .aws         # AWS credentials/config dotfile (if referenced directly)
-#
-#   # ── Certificates & cryptographic keys ─────────────────────────────────────
-#   - .pem         # PEM-encoded certificate or private key
-#   - .crt         # X.509 certificate (PEM or DER)
-#   - .cer         # Windows DER/PEM certificate
-#   - .key         # private key file (RSA, EC, PKCS#8 …)
-#   - .pub         # SSH / GPG public key
-#   - .asc         # ASCII-armoured GPG key or detached signature
-#   - .p12         # PKCS#12 keystore (cert + private key bundle)
-#   - .pfx         # Windows Personal Information Exchange (PKCS#12)
-#   - .jks         # Java KeyStore (JKS / PKCS#12)
-#   - .p8          # Apple AuthKey (APNs, App Store Connect, MapKit JS)
-#   - .ppk         # PuTTY private key
-#   - .gpg         # GPG-encrypted file
-#
-#   # ── Infrastructure as Code ────────────────────────────────────────────────
-#   - .tf          # Terraform source (provider credentials, resource config)
-#   - .tfvars      # Terraform variable values (frequently contain secrets)
-#   - .tfstate     # Terraform state (stores all resource attribute values!)
-#   - .hcl         # HashiCorp Configuration Language (Vault, Consul, Nomad)
-#   - .pkr.hcl     # Packer build templates
-#
-#   # ── Java / JVM (Spring, Micronaut, Quarkus) ───────────────────────────────
-#   # .yaml, .xml, .properties already cover most cases above.
-#   - .gradle      # Groovy Gradle build script (may reference repo credentials)
-#   - .kts         # Kotlin Script / Gradle KTS (build scripts with credentials)
-#
-#   # ── Python ────────────────────────────────────────────────────────────────
-#   # .toml (pyproject.toml), .cfg (setup.cfg), .ini (tox/pytest), .env covered.
-#   - .pth         # Python path file (uncommon but can reference internal paths)
-#
-#   # ── .NET / C# / VB / F# ───────────────────────────────────────────────────
-#   # .json (appsettings), .xml (packages.config), .config (app/web.config) covered.
-#   - .csproj      # C# project file (can embed NuGet source URLs with tokens)
-#   - .vbproj      # VB.NET project file
-#   - .fsproj      # F# project file
-#   - .nuspec      # NuGet package specification (source repository URLs)
-#   - .props       # MSBuild property sheet (can set env vars / credentials)
-#   - .targets     # MSBuild targets file
-#
-#   # ── Node / JavaScript / TypeScript / Angular / React / Vue ───────────────
-#   # .json (package.json, tsconfig, .eslintrc), .yaml, .env covered.
-#   - .local       # .env.local, .env.development.local etc. (secondary extension)
-#
-#   # ── Ruby (Rails, Sinatra) ─────────────────────────────────────────────────
-#   # .yaml (database.yml, secrets.yml), .gemrc covered.
-#   - .erb         # ERB template (Rails views/configs embedding credentials)
-#   - .lock        # Gemfile.lock / Podfile.lock (dependency digests; lower risk)
-#
-#   # ── PHP (Laravel, Symfony, WordPress) ─────────────────────────────────────
-#   # .json (composer.json), .yaml, .env covered.
-#   - .php         # PHP config files (wp-config.php, .env-style configs)
-#                  # NOTE: only enable if you specifically need PHP config scanning.
-#
-#   # ── Go ────────────────────────────────────────────────────────────────────
-#   # .yaml, .toml, .env covered; go.mod/go.sum rarely contain secrets.
-#   - .mod         # go.mod (module path; occasionally internal registry URLs)
-#
-#   # ── Rust ──────────────────────────────────────────────────────────────────
-#   # .toml (Cargo.toml) covered.
-#
-#   # ── Shell scripts (hardcoded credentials / export statements) ─────────────
-#   - .sh          # Bash / POSIX shell scripts
-#   - .bash        # Bash scripts (.bash_profile, .bashrc fragments)
-#   - .zsh         # Zsh scripts (.zshrc, .zprofile fragments)
-#   - .fish        # Fish shell scripts
-#   - .ps1         # PowerShell scripts
-#   - .psm1        # PowerShell modules
-#   - .psd1        # PowerShell data files (module manifests)
-#   - .bat         # Windows batch scripts
-#   - .cmd         # Windows command scripts
-#
-#   # ── Data / reports ────────────────────────────────────────────────────────
-#   - .csv         # CSV data exports (PII — names, emails, accounts)
-#   - .tsv         # Tab-separated values
-#   - .sql         # SQL scripts (connection strings, INSERTs with PII)
-#   - .txt         # Plain-text data / credentials dump
-#   - .log         # Log files (can contain credentials, stack traces, PII)
-#   - .jsonl       # JSON Lines (log / event streams)
-#   - .ndjson      # Newline-delimited JSON
-#
-#   # ── API & schema definitions ──────────────────────────────────────────────
-#   - .graphql     # GraphQL schema / operations (endpoint URLs, auth directives)
-#   - .gql         # GraphQL (alternate extension)
-#   - .proto       # Protocol Buffer definitions (service URLs, auth metadata)
-#   - .wsdl        # SOAP Web Service Description Language
-#   - .xsd         # XML Schema Definition
-
-
-
 rules:
-  # ── Presidio built-in entities ────────────────────────────────────────────
-  AccountNumber: Mask      # bank account numbers  → ****
-  PhoneNumber: Replace     # phone numbers         → <PHONE_NUMBER>
-  # CreditCard: Mask
-  # EmailAddress: Replace
-  # SSN: Mask
-  # IPAddress: Mask
-  # Person: Replace
-  # IBAN: Mask
-  # URL: Replace
+  PERSON: replace
+  EMAIL_ADDRESS: replace
+  PHONE_NUMBER: replace
+  CREDIT_CARD: mask
+  US_SSN: mask
+  IP_ADDRESS: replace
+  IBAN_CODE: mask
+  URL: replace
+  CARD_CVV: mask       # Custom financial entity from financial.py
+  CARD_EXPIRY: mask    # Custom financial entity from financial.py
 
-  # ── Financial (custom recognizers) ───────────────────────────────────────
-  # CARD_CVV: Mask               # Card CVV/CVC codes             → ****
-  # CARD_EXPIRY: Mask            # Card expiry dates              → ****
 
-  # ── Developer secrets (custom recognizers) ───────────────────────────────
-  # AWS_ACCESS_KEY: Mask         # AWS IAM access key IDs         → ****
-  # AWS_SECRET_KEY: Mask         # AWS IAM secret access keys     → ****
-  # GITHUB_TOKEN: Mask           # GitHub PATs / OAuth tokens     → ****
-  # GITLAB_TOKEN: Mask           # GitLab personal/project tokens → ****
-  # SLACK_TOKEN: Mask            # Slack bot/user/webhook tokens  → ****
-  # JWT_TOKEN: Mask              # JSON Web Tokens                → ****
-  # STRIPE_KEY: Mask             # Stripe API keys                → ****
-  # SENDGRID_KEY: Mask           # SendGrid API keys              → ****
-  # NPM_TOKEN: Mask              # NPM registry tokens            → ****
-  # HASHICORP_VAULT_TOKEN: Mask  # HashiCorp Vault tokens         → ****
-  # GENERIC_API_KEY: Mask        # Generic API key assignments    → ****
-  # BEARER_TOKEN: Mask           # Authorization Bearer tokens    → ****
-  # PRIVATE_KEY_BLOCK: Mask      # PEM private key blocks         → ****
-  # CERTIFICATE_BLOCK: Replace   # PEM certificate blocks         → <CERTIFICATE_BLOCK>
-
-  # ── Infrastructure (custom recognizers) ──────────────────────────────────
-  # DB_CONNECTION_STRING: Mask   # Database connection strings    → ****
-  # AZURE_CONN_STRING: Mask      # Azure service conn strings     → ****
-  # JDBC_URL: Mask               # Java JDBC URLs                 → ****
-  # REDIS_URL: Mask              # Redis/Valkey URIs              → ****
-  # MONGO_URL: Mask              # MongoDB URIs                   → ****
-  # INTERNAL_HOSTNAME: Replace   # Internal hostnames             → <INTERNAL_HOSTNAME>
-  # PRIVATE_IP_ADDRESS: Replace  # RFC 1918 / loopback IPs        → <PRIVATE_IP_ADDRESS>
-  # ENV_VARIABLE_VALUE: Mask     # .env secret assignments        → ****
-
-  # ── CI/CD & Platform (custom recognizers) ────────────────────────────────
-  # SONARQUBE_TOKEN: Mask            # SonarQube analysis tokens      → ****
-  # OPENSHIFT_TOKEN: Mask            # OpenShift / OCP API tokens     → ****
-  # DOCKER_REGISTRY_CREDENTIAL: Mask # Docker registry auth entries   → ****
-  # HELM_SECRET: Mask                # SOPS-encrypted Helm values     → ****
-  # TERRAFORM_TOKEN: Mask            # Terraform Cloud tokens         → ****
-  # ANSIBLE_VAULT: Mask              # Ansible Vault encrypted blocks → ****
-  # GCP_SA_KEY: Mask                 # GCP service account keys       → ****
-  # BITBUCKET_APP_PASSWORD: Mask     # Bitbucket app passwords        → ****
-
+# ── 4. Custom PII Recognizers (Python Presidio Engine) ───────────────────────
+# Add custom regexes ONLY for Human Data (e.g., employee IDs, support tickets) 
+# that require NLP context words to avoid false positives. 
+# (DO NOT put API keys or passwords here — put them in custom_secrets above!)
 # ─────────────────────────────────────────────────────────────────────────────
-# Custom Recognizers
-# ─────────────────────────────────────────────────────────────────────────────
-# Add your own regex-based recognizers here. Each entry creates a temporary
-# PatternRecognizer that will detect text matching your regex and apply the
-# anonymizer operation you specify in the rules section above.
-#
-# Format:
-#   custom_recognizers:
-#     - name: ENTITY_NAME           # required — uppercase entity type label
-#       pattern: "regex_pattern"     # required — Python-compatible regex
-#       score: 0.85                  # optional — confidence score (0.0–1.0)
-#       context:                     # optional — context words boost score
-#         - keyword1
-#         - keyword2
-#
-# Then add a rule for it:
-#   rules:
-#     ENTITY_NAME: mask      # or replace, redact, hash, encrypt
-#
-# Example:
-# ─────────────────────────────────────────────────────────────────────────────
-# custom_recognizers:
-#   - name: EMPLOYEE_ID
-#     pattern: "EMP-\\d{6}"
-#     score: 0.9
-#     context:
-#       - employee
-#       - staff
-#       - badge
-#
-#   - name: INTERNAL_TICKET
-#     pattern: "JIRA-\\d{4,6}"
-#     score: 0.85
-#     context:
-#       - ticket
-#       - issue
-#       - jira
-#
-#   - name: CUSTOMER_ACCOUNT
-#     pattern: "CUST-[A-Z]{2}\\d{8}"
-#     score: 0.9
-#     context:
-#       - customer
-#       - account
-# ─────────────────────────────────────────────────────────────────────────────
+custom_recognizers:
+  - name: EMPLOYEE_ID
+    pattern: "EMP-\\d{6}"
+    score: 0.9
+    context:
+      - employee
+      - staff
+      - badge
+
+  - name: CUSTOMER_ACCOUNT
+    pattern: "CUST-[A-Z]{2}\\d{8}"
+    score: 0.9
+    context:
+      - customer
+      - account
+      - billing

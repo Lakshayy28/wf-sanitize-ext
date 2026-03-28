@@ -24,9 +24,18 @@ export type PiiChecker = (value: string) => Promise<string>;
  *  3. PASSTHROUGH — return the value unchanged
  */
 async function processAstValue(key: string, value: string, piiCheck?: PiiChecker): Promise<string> {
+  // 1. FAST PATH: Mask known tech secrets instantly
   if (isSensitiveKey(key)) {
     return MASK;
   }
+
+  // 2. SAFE PATH: Skip Presidio for structural keys to prevent hallucinations
+  const IGNORE_KEYS = /^(version|id|lineage|serial|name|type|kind|namespace|replicas|image|ami)$/i;
+  if (IGNORE_KEYS.test(key.trim())) {
+    return value;
+  }
+
+  // 3. SLOW PATH: Deep scan for human PII via Presidio NLP
   if (piiCheck && typeof value === 'string' && value.length > 3) {
     return piiCheck(value);
   }
@@ -193,55 +202,34 @@ export async function sanitizeEnv(
 ): Promise<{ cleanText: string; wasModified: boolean }> {
   let modified = false;
   const lines = text.split('\n');
-  const result: string[] = [];
 
-  // Matches: optional "export " + KEY = VALUE or KEY: VALUE
-  const ENV_RE = /^(\s*(?:export\s+)?[A-Za-z0-9_.-]+)\s*([:=])\s*(.*)$/;
-
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const trimmed = line.trim();
     // Preserve comments and blank lines
     if (!trimmed || trimmed.startsWith('#')) {
-      result.push(line);
       continue;
     }
 
-    const match = line.match(ENV_RE);
+    // G1: Key (with optional export + leading space), G2: Operator, G3: Open Quote, G4: Value, G5: Close Quote, G6: Tail
+    const match = line.match(/^(\s*(?:export\s+)?[A-Za-z0-9_.-]+)(\s*[:=]\s*)(["']?)(.*?)(["']?)(\s*(?:#.*)?)$/);
+
     if (match) {
-      const [, keyPart, separator, valuePart] = match;
-      const keyName = keyPart.replace(/^\s*export\s+/, '').trim();
-      const trimVal = valuePart.trim();
+      const [, key, operator, quoteOpen, value, quoteClose, tail] = match;
+      const keyName = key.replace(/^\s*export\s+/, '').trim();
 
-      if (trimVal.length > 0) {
-        // Unquote for processAstValue
-        let unquotedVal = trimVal;
-        let quoteChar = '';
-        if ((trimVal.startsWith('"') && trimVal.endsWith('"') && trimVal.length > 1) ||
-            (trimVal.startsWith("'") && trimVal.endsWith("'") && trimVal.length > 1)) {
-          quoteChar = trimVal[0];
-          unquotedVal = trimVal.slice(1, -1);
-        }
-
-        const cleaned = await processAstValue(keyName, unquotedVal, piiCheck);
-        if (cleaned !== unquotedVal) {
+      // Only process if quotes are balanced (or both empty)
+      if (quoteOpen === quoteClose && value.length > 0) {
+        const cleaned = await processAstValue(keyName, value, piiCheck);
+        if (cleaned !== value) {
           modified = true;
-          if (quoteChar) {
-            result.push(`${keyPart}${separator}${quoteChar}${cleaned}${quoteChar}`);
-          } else {
-            result.push(`${keyPart}${separator}${cleaned}`);
-          }
-        } else {
-          result.push(line);
+          lines[i] = `${key}${operator}${quoteOpen}${cleaned}${quoteClose}${tail}`;
         }
-      } else {
-        result.push(line);
       }
-    } else {
-      result.push(line);
     }
   }
 
-  return { cleanText: result.join('\n'), wasModified: modified };
+  return { cleanText: lines.join('\n'), wasModified: modified };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
