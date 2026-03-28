@@ -9,23 +9,27 @@ A security-focused VS Code Chat Participant (`@safechat`) that automatically det
 ```
 You type: @safechat explain this config #file:config.yaml
                         │
-               Extension reads the file
+            Smart Router reads the file
+            and classifies it by content
                         │
           ┌─────────────▼──────────────────┐
-          │   Tier 1 — Presidio HTTP API   │  NLP-based PII detection
-          │   POST http://localhost:8000/  │  (names, emails, cards, SSNs…)
-          └─────────────┬──────────────────┘
-                        │ sanitized text
-          ┌─────────────▼──────────────────┐
-          │   Tier 2 — Regex engine        │  Catches secrets the NLP misses
-          │   (api_key=, Bearer tokens,    │  (API keys, tokens, AWS keys…)
-          │    AWS AKIA keys…)             │
+          │  Tier 1 — Bypass               │  Safe files (source code, docs)
+          │  No scanning needed            │  pass through untouched.
           └─────────────┬──────────────────┘
                         │
           ┌─────────────▼──────────────────┐
-          │   Tier 2b — Heuristic scanner  │  Catches secrets in unstructured text
-          │   (PEM keys, inline secrets,   │  (code snippets, search results,
-          │    high-entropy tokens)        │   terminal output)
+          │  Tier 2 — AST Guardian         │  Structured files (JSON, YAML,
+          │  Parse → walk keys → mask      │  ENV, Properties, XML) are
+          │  sensitive values surgically   │  parsed into AST; only values
+          │  + Presidio NLP on leaf values │  under secret keys are masked.
+          └─────────────┬──────────────────┘
+                        │
+          ┌─────────────▼──────────────────┐
+          │  Tier 3 — Full DLP             │  Unstructured text gets the
+          │  Regex Dictionary (22 patterns)│  full pipeline: known-pattern
+          │  Shannon Entropy Scanner (≥3.8)│  regex → entropy-gated unknown
+          │  Bare Token Detector (>4 bits) │  secret scanner → Presidio NLP
+          │  Presidio PII Engine (12 types)│  for human PII.
           └─────────────┬──────────────────┘
                         │ clean text
                  Sent to Copilot LM
@@ -46,15 +50,16 @@ The original and masked versions of each sanitization event are cached locally u
 
 - **`@safechat` Chat Participant** — invoke directly in the Copilot Chat panel; attach any file as context.
 - **Sanitization Mesh** — a mandatory multi-layer checkpoint for ALL data entering the model's context window: attached files, tool reads, search results, and terminal output are all sanitized.
-- **Three-tier sanitization engine**:
-  - **Tier 1 — Microsoft Presidio (NLP)** — stanza-based named-entity recognition for names, emails, credit cards, SSNs, IBANs and 70+ more entity types.
-  - **Tier 2 — Regex engine** — always-on fallback catching `key=value` secrets, Bearer tokens, AWS keys, GitHub tokens, database URLs, and more.
-  - **Tier 2b — Heuristic content scanner** — line-by-line processing for PEM private key blocks, inline hardcoded secrets in code snippets, and bare high-entropy strings.
+- **3-Tier Smart Routing engine**:
+  - **Tier 1 — Bypass** — safe files (source code, docs, images) skip scanning entirely for zero overhead.
+  - **Tier 2 — AST Guardian** — structured files (JSON, YAML, ENV, Properties, XML) are parsed into an AST; only values under sensitive keys are masked. Non-secret values are checked for human PII via Presidio NLP.
+  - **Tier 3 — Full DLP** — unstructured text gets the complete pipeline: 22-pattern regex dictionary → Shannon Entropy scanner (≥ 3.8 threshold for unknown secrets) → bare high-entropy token detector → Presidio NLP for human PII (12 entity types).
+- **Shannon Entropy Engine** — mathematically detects unknown/future secret formats by measuring randomness. Replaces brittle pattern matching with `calculateShannonEntropy()` and context-anchored `applyEntropyMasking()`.
 - **Safe file tools** — `safechat_read_file` and `safechat_read_directory` are registered as LM tools so the model can read workspace files and directories via a sanitized pipeline.
 - **Native tool blocklist** — native file-read, directory-listing, and workspace-search tools are stripped from the model's tool menu and, if called anyway, are intercepted and rerouted through the safe alternatives.
 - **Terminal-aware sanitization** — ANSI escape codes are stripped; CLI-specific patterns (curl headers, env var exports, JSON credential fields) are caught separately from general file patterns.
-- **70+ PII entity types** — names, emails, phone numbers, credit cards, SSNs, IBANs, SWIFT codes, API keys, JWTs, AWS keys, database URLs, K8s secrets, CI/CD tokens, and more.
-- **5 anonymizer operations** — `replace`, `mask`, `redact`, `hash`, or `encrypt` per entity type, configured in a single YAML file.
+- **12 PII entity types** — names, emails, phone numbers, credit cards, SSNs, IBANs, bank accounts, crypto wallets, IP addresses, URLs, card CVV, and card expiry. Hallucination-prone entities (`US_DRIVER_LICENSE`, `US_ITIN`) are intentionally excluded.
+- **4 anonymizer operations** — `replace`, `mask`, `redact`, or `hash` per entity type, configured in a single YAML file.
 - **File type allowlist** — restrict scanning to only data/config file extensions (`.yaml`, `.json`, `.env`, etc.); non-matching files are forwarded as-is to Copilot without modification.
 - **Full agentic behaviour** — passes all available VS Code tools to the LLM and runs an agentic tool-calling loop (up to 15 rounds): search code, read files, run commands — identical to native Copilot Agent mode.
 - **Conversation continuity** — per-file state cache with `mtime`-based invalidation keeps all attached file context live across multiple turns in the same chat.
@@ -72,7 +77,7 @@ The original and masked versions of each sanitization event are cached locally u
 |---|---|
 | VS Code | 1.95.0 or later |
 | GitHub Copilot Chat extension | Latest |
-| Python | 3.9 or later (optional — for Presidio Tier 1) |
+| Python | 3.9 or later (optional — for Presidio PII engine) |
 | Node.js | 18 or later (development only) |
 
 ---
@@ -91,7 +96,7 @@ Or open VS Code → Extensions → `···` → **Install from VSIX…** and sel
 
 ### 2 — Set up the Python environment for the Presidio server (optional)
 
-The Presidio server provides Tier 1 NLP-based PII detection. The extension works without it (Tier 2 regex + Tier 2b heuristics still run), but Tier 1 catches things the other tiers miss (names, addresses, custom entity types).
+The Presidio server provides NLP-based human PII detection (names, emails, phone numbers, credit cards, SSNs, etc.). The extension works without it (Tier 2 AST parsing + Tier 3 regex/entropy engines still catch all secrets), but Presidio catches human PII that regex cannot (e.g. people's names).
 
 ```bash
 # Create a virtual environment in the project folder
@@ -187,13 +192,14 @@ The model will call `safechat_read_directory` with `directoryPath: "scripts"`. A
 | **IBAN codes** | `GB29NWBK60161331926819` |
 | **IP addresses** | `192.168.1.254`, `10.0.0.1` |
 | **Crypto wallets** | `1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2` |
-| **Passports / Driving licences** | US formats |
+| **Card CVV / CVC** | `cvv: 123`, `cvc2: 4567` |
 | **API keys / secrets** | `api_key = sk-abc123`, `password = s3cr3t`, `const apiKey = "..."` |
 | **Bearer tokens** | `Authorization: Bearer eyJhb…` |
 | **AWS access keys** | `AKIA[0-9A-Z]{16}` |
 | **PEM private keys** | Full `BEGIN/END PRIVATE KEY` blocks |
 | **GitHub / GitLab / npm tokens** | `ghp_…`, `npm_…`, `sk-…` prefix detection |
 | **High-entropy bare tokens** | 20+ char strings with Shannon entropy > 4 bits |
+| **Unknown secrets (entropy-gated)** | Any `key = value` where value has Shannon entropy ≥ 3.8 |
 | **CLI secrets** | `--token value`, `export SECRET=...`, `curl -H "Authorization: ..."` |
 | **ANSI terminal output** | Escape codes stripped before scanning |
 
@@ -266,22 +272,43 @@ When multiple files were masked in one session, a QuickPick selector lets you ch
 
 ## Sanitization Pipeline Details
 
-The pipeline has three modes that determine which sanitizers run:
+### Smart Router — 3-Tier Content Classification
 
-| Mode | Pipeline | Used for |
-|---|---|---|
-| `general` | regexSanitize → contentSanitize | Attached files, general tool results |
-| `terminal` | stripAnsiCodes → terminalSanitize → regexSanitize → contentSanitize | Terminal / shell tool output |
-| `search` | regexSanitize → contentSanitize | Workspace search, grep results |
+The Smart Router (`router.ts`) inspects each file's extension and content to assign it to one of three tiers:
 
-Each pass:
+| Tier | Category | What happens | Example files |
+|---|---|---|---|
+| **1** | `bypass` | No scanning — passed through as-is | `.ts`, `.py`, `.go`, `.md`, `.html` |
+| **2** | `ast` | AST-parsed; only sensitive key values are masked | `.json`, `.yaml`, `.env`, `.properties`, `.xml` |
+| **3** | `full_dlp` | Full regex + entropy + Presidio pipeline | `.log`, `.txt`, `.csv`, `.sql`, unknown formats |
+
+Files with unknown extensions are sniffed by a content heuristic (`guessUnknownFileType()`) that checks for JSON braces, YAML colons, XML tags, etc.
+
+### Tier 2 — AST Guardian Pipeline
+
+Structured files are parsed into a key-value tree. The AST walker:
+1. Checks each key against `DYNAMIC_AST_KEYS` (20 secret-related keywords like `password`, `token`, `secret`, `api_key`, etc.)
+2. If the key is sensitive → masks the value immediately with `[MASKED_BY_SAFECHAT]`
+3. If the key is NOT sensitive → sends the value to Presidio NLP to check for human PII (names, emails, etc.)
+
+Supported formats: JSON, YAML, ENV/dotenv, Java Properties, XML.
+
+### Tier 3 — Full DLP Pipeline
 
 | Stage | What it catches |
 |---|---|
-| **stripAnsiCodes** | SGR, cursor movement, OSC ANSI escape sequences |
-| **terminalSanitize** | CLI flags (`--token value`), curl headers, JSON credential fields, env var exports, Bearer tokens, AWS keys, bare high-entropy tokens |
-| **regexSanitize** | 180+ named key=value patterns, email/phone/IP after known keys, standalone Bearer and AWS key patterns |
-| **contentSanitize** | PEM private key blocks, inline secret assignments in code, 32+ char high-entropy strings identified by Shannon entropy |
+| **regexSanitize (Step 1)** | 22 high-confidence patterns: AWS keys, GitHub/GitLab/npm tokens, JWTs, Bearer headers, PEM blocks, database URLs, Stripe/Slack/Twilio keys, credential URLs, query param secrets |
+| **applyEntropyMasking (Step 2)** | Context-anchored Shannon Entropy scanner — finds any `key=value` where the key contains a secret-related word and the value has entropy ≥ 3.8 (catches unknown/future token formats) |
+| **Bare Token Detector (Step 3)** | Standalone high-entropy strings (20+ chars, entropy > 4, 3+ character classes) with known service prefixes (`ghp_`, `sk-`, `AKIA`, `eyJ`, etc.) |
+| **Presidio NLP** | Human PII: PERSON, EMAIL_ADDRESS, PHONE_NUMBER, CREDIT_CARD, US_SSN, IBAN_CODE, US_BANK_NUMBER, CRYPTO, IP_ADDRESS, URL, CARD_CVV, CARD_EXPIRY |
+
+### Terminal & Search Modes
+
+| Mode | Pipeline | Used for |
+|---|---|---|
+| `general` | Smart Router → Tier 1/2/3 | Attached files, tool reads |
+| `terminal` | stripAnsiCodes → terminalSanitize → regexSanitize | Terminal / shell output |
+| `search` | regexSanitize | Workspace search, grep results |
 
 ---
 
@@ -410,7 +437,6 @@ Controls how each detected entity type is transformed:
 | `mask` | `************` | Replaces every character with `*`. |
 | `redact` | *(empty string)* | Completely removes the text. |
 | `hash` | `b7531e08…` | One-way SHA-256 digest. Repeatable — identical values produce identical hashes. |
-| `encrypt` | `dGhpcyBp…` | AES-CBC reversible encryption. Requires `SAFECHAT_ENCRYPT_KEY` env var. Falls back to `replace` if key is missing. |
 
 ```yaml
 rules:
@@ -418,7 +444,6 @@ rules:
   AccountNumber: mask      # → ************
   US_SSN:        redact    # (removed entirely)
   CREDIT_CARD:   hash      # → sha256 digest
-  AWS_SECRET_KEY: encrypt  # → AES-CBC ciphertext
 ```
 
 #### Supported entity aliases
@@ -434,15 +459,11 @@ rules:
 | `Person`, `Name` | `PERSON` |
 | `IBAN`, `IBANCode` | `IBAN_CODE` |
 | `Crypto`, `Bitcoin` | `CRYPTO` |
-| `Location` | `LOCATION` |
-| `Date`, `DateTime` | `DATE_TIME` |
 | `URL` | `URL` |
-| `Passport` | `US_PASSPORT` |
-| `DrivingLicense`, `DriversLicense` | `US_DRIVER_LICENSE` |
-| `MedicalLicense` | `MEDICAL_LICENSE` |
-| `NRP` | `NRP` |
+| `CardCVV`, `CVV` | `CARD_CVV` |
+| `CardExpiry` | `CARD_EXPIRY` |
 
-Any entity type **not listed** in `rules` defaults to `replace`. For the full catalogue of 70+ entity types across Financial, Developer, Infrastructure, and CI/CD profiles, see `http://localhost:8000/docs/entities`.
+Any entity type **not listed** in `rules` defaults to `replace`.
 
 ---
 
@@ -489,16 +510,20 @@ Two Language Model Tools are registered with VS Code, making them available to t
 
 ## Presidio Server API Reference
 
-The server runs at `http://localhost:8000` by default.
+The server runs at `http://localhost:8000` by default. It is a lean **Human PII & Financial Data engine** — all developer secrets, CI/CD tokens, and infrastructure configs are handled by the TypeScript extension.
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/health` | GET | Liveness check |
-| `/profiles` | GET | List available sanitization profiles |
-| `/docs/ui` | GET | Interactive documentation web page |
-| `/docs/entities` | GET | JSON catalogue of all entity types and profiles |
-| `/analyze` | POST | Detect PII — returns findings without masking |
-| `/sanitize` | POST | Detect + anonymize in one call (used by the extension) |
+| `/health` | GET | Liveness check (returns entity count) |
+| `/sanitize` | POST | Analyze + anonymize in one call (used by the extension) |
+| `/docs` | GET | Swagger UI (auto-generated) |
+| `/redoc` | GET | ReDoc API reference (auto-generated) |
+
+### Active Entities (12)
+
+`PERSON`, `EMAIL_ADDRESS`, `PHONE_NUMBER`, `CREDIT_CARD`, `US_SSN`, `IBAN_CODE`, `US_BANK_NUMBER`, `CRYPTO`, `IP_ADDRESS`, `URL`, `CARD_CVV`, `CARD_EXPIRY`
+
+> **Anti-hallucination:** `US_DRIVER_LICENSE` and `US_ITIN` are intentionally excluded — they cause false positives on source code patterns like `apiVersion: v1`.
 
 ### `POST /sanitize`
 
@@ -518,17 +543,12 @@ curl -X POST http://localhost:8000/sanitize \
 }
 ```
 
-**Full request body:**
+**Request body:**
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `text` | string | — | Text to process |
-| `language` | string | `"en"` | Language code |
-| `profile` | string | — | Named recognizer set: `financial`, `developer`, `infrastructure`, `cicd`, `full` |
-| `entities` | string[] | all types | Limit detection to specific entity types |
-| `replacement_format` | string | `"<{entity_type}>"` | Template for `replace` operation |
-| `rules` | object | `{}` | Per-entity operation (`replace`/`mask`/`redact`/`hash`/`encrypt`) |
-| `custom_recognizers` | array | `[]` | Per-request user-defined regex recognizers |
+| `rules` | object | `{}` | Per-entity operation (`replace`/`mask`/`redact`/`hash`) |
 
 ---
 
@@ -538,9 +558,16 @@ curl -X POST http://localhost:8000/sanitize \
 wf-sanitize-ext/
 ├── src/
 │   ├── extension.ts          # Chat participant, safe tools, agentic loop, cache helpers
-│   └── sanitizer.ts          # Multi-tier sanitization engine (Presidio + regex + heuristics)
+│   ├── sanitizer.ts          # Thin orchestrator — wires 3-tier pipeline
+│   ├── router.ts             # Smart Router — content sniffer & file categorization
+│   ├── regexSanitizer.ts     # Mega-Dictionary, Shannon Entropy Engine, terminal sanitizer
+│   └── astSanitizer.ts       # Universal AST Guardian (JSON, YAML, ENV, Properties, XML)
 ├── presidio_server/
-│   ├── main.py               # FastAPI server (Presidio NLP engine)
+│   ├── main.py               # FastAPI server (Human PII & Financial engine)
+│   ├── profiles.py           # Active entity list (12 types, anti-hallucination)
+│   ├── recognizers/
+│   │   ├── __init__.py        # Exports CardCvvRecognizer, CardExpiryRecognizer
+│   │   └── financial.py       # Card CVV + Card Expiry pattern recognizers
 │   ├── requirements.txt      # Python dependencies
 │   └── README.md             # Server-specific docs
 ├── .vscode/
@@ -595,7 +622,7 @@ npm run lint      # ESLint
 
 ### Rebuilding and reinstalling
 
-After making changes to `src/extension.ts` or `src/sanitizer.ts`:
+After making changes to any file in `src/`:
 
 ```bash
 # Compile + repackage
@@ -614,6 +641,7 @@ code --install-extension safe-copilot-context-0.0.1.vsix
 - **Nothing is stored remotely.** Only the already-sanitized text is forwarded to Copilot. The original context never leaves your machine.
 - **Diff cache is local.** `.vscode/.temp_cache/` is gitignored by default (a `*` gitignore is written automatically on first use).
 - **Tool boundary enforcement.** Native file-read, directory, and search tools are blocked at two layers: the tool menu (before the loop starts) and the agentic loop redirect guard (defense-in-depth).
+- **Anti-hallucination Presidio config.** `US_DRIVER_LICENSE` and `US_ITIN` are deliberately excluded from the entity list to prevent false positives on source code.
 - **No telemetry.** The extension collects no usage data.
 
 ---
