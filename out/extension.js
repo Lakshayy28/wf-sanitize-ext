@@ -37,6 +37,7 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const sanitizer_1 = require("./sanitizer");
+const treeSitterManager_1 = require("./treeSitterManager");
 let extensionPath;
 const fileStateCache = new Map();
 let conversationFileKeys = new Set();
@@ -358,6 +359,10 @@ const safeReadDirToolInstance = new SafeReadDirectoryTool();
 // ── Activation ──────────────────────────────────────────────────────────────
 function activate(context) {
     extensionPath = context.extensionPath;
+    // Prime the Tree-sitter WASM parser (async, non-blocking)
+    (0, treeSitterManager_1.initializeTreeSitter)(context.extensionUri).catch(err => {
+        console.warn('[SafeChat] Tree-sitter init failed, using regex fallback:', err);
+    });
     const participant = vscode.chat.createChatParticipant('safecopilot.safeChat', chatRequestHandler);
     participant.iconPath = new vscode.ThemeIcon('shield');
     const diffCmd = vscode.commands.registerCommand('safecopilot.viewDiff', handleViewDiff);

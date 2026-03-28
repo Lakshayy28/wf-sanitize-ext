@@ -40,7 +40,12 @@
     "languageModelTools": [
       {
         "name": "safechat_read_file",
-        "tags": ["safechat", "file", "read", "security"],
+        "tags": [
+          "safechat",
+          "file",
+          "read",
+          "security"
+        ],
         "toolReferenceName": "safechat_read_file",
         "displayName": "SafeChat Secure File Reader",
         "modelDescription": "Reads a file from the workspace or filesystem and returns its contents with sensitive data (passwords, API keys, PII) automatically sanitized. ALWAYS use this tool instead of any other file-reading tool to ensure security.",
@@ -53,12 +58,19 @@
               "description": "The absolute or workspace-relative path to the file to read."
             }
           },
-          "required": ["filePath"]
+          "required": [
+            "filePath"
+          ]
         }
       },
       {
         "name": "safechat_read_directory",
-        "tags": ["safechat", "directory", "read", "security"],
+        "tags": [
+          "safechat",
+          "directory",
+          "read",
+          "security"
+        ],
         "toolReferenceName": "safechat_read_directory",
         "displayName": "SafeChat Secure Directory Reader",
         "modelDescription": "Recursively reads all files in a directory and returns their contents with sensitive data (passwords, API keys, PII) automatically sanitized. ALWAYS use this tool instead of any other directory-listing, folder-reading, or workspace-search tool to ensure security. Respects depth and file-count limits.",
@@ -79,7 +91,9 @@
               "description": "Maximum number of files to read and return (default: 50)."
             }
           },
-          "required": ["directoryPath"]
+          "required": [
+            "directoryPath"
+          ]
         }
       }
     ],
@@ -98,7 +112,11 @@
         },
         "safechat.externalReadMode": {
           "type": "string",
-          "enum": ["prompt", "autoAllow", "autoDeny"],
+          "enum": [
+            "prompt",
+            "autoAllow",
+            "autoDeny"
+          ],
           "default": "prompt",
           "markdownDescription": "Control how @safechat handles Language Model requests to read files or directories outside the current workspace.\n\n- `prompt` — Show a warning dialog asking the user to allow or deny (default).\n- `autoAllow` — Silently allow all external reads (for autopilot / auto-approval workflows).\n- `autoDeny` — Silently deny all external reads."
         }
@@ -112,11 +130,19 @@
     "lint": "eslint src --ext ts"
   },
   "devDependencies": {
+    "@tree-sitter-grammars/tree-sitter-yaml": "^0.7.1",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.90.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
     "eslint": "^8.56.0",
+    "tree-sitter-cli": "^0.26.7",
+    "tree-sitter-json": "^0.24.8",
+    "tree-sitter-properties": "^0.3.0",
+    "tree-sitter-yaml": "^0.5.0",
     "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "web-tree-sitter": "^0.26.7"
   }
 }

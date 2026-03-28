@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { sanitizeOnly, readRulesConfig, sanitizePipeline, getFileCategory, RulesConfig } from './sanitizer';
 import type { SanitizeMode, FileCategory } from './sanitizer';
+import { initializeTreeSitter } from './treeSitterManager';
 
 let extensionPath: string;
 
@@ -403,6 +404,11 @@ const safeReadDirToolInstance = new SafeReadDirectoryTool();
 
 export function activate(context: vscode.ExtensionContext) {
   extensionPath = context.extensionPath;
+
+  // Prime the Tree-sitter WASM parser (async, non-blocking)
+  initializeTreeSitter(context.extensionUri).catch(err => {
+    console.warn('[SafeChat] Tree-sitter init failed, using regex fallback:', err);
+  });
 
   const participant = vscode.chat.createChatParticipant(
     'safecopilot.safeChat',
