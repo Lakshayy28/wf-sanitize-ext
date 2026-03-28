@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
-import { sanitizeOnly, readRulesConfig, regexSanitize, terminalSanitize, sanitizePipeline, RulesConfig } from './sanitizer';
-import type { SanitizeMode } from './sanitizer';
+import { sanitizeOnly, readRulesConfig, sanitizePipeline, getFileCategory, RulesConfig } from './sanitizer';
+import type { SanitizeMode, FileCategory } from './sanitizer';
 
 let extensionPath: string;
 
@@ -162,7 +162,8 @@ class SafeReadFileTool implements vscode.LanguageModelTool<{ filePath: string }>
     try {
       const bytes = await vscode.workspace.fs.readFile(fileUri);
       const raw = Buffer.from(bytes).toString('utf-8');
-      const { cleanText, wasModified } = regexSanitize(raw);
+      const config = await readRulesConfig();
+      const { cleanText, wasModified } = await sanitizeOnly(raw, config, filePath);
       console.log('[SafeChat] safechat_read_file: read fresh, sanitized:', wasModified);
 
       // Write diff cache + render UI button if masking occurred
@@ -316,7 +317,8 @@ class SafeReadDirectoryTool implements vscode.LanguageModelTool<SafeReadDirInput
       try {
         const bytes = await vscode.workspace.fs.readFile(fileUri);
         const raw = Buffer.from(bytes).toString('utf-8');
-        const { cleanText, wasModified } = regexSanitize(raw);
+        const dirConfig = await readRulesConfig();
+        const { cleanText, wasModified } = await sanitizeOnly(raw, dirConfig, relPath);
         parts.push(`// File: ${relPath}\n${cleanText}`);
         if (wasModified) {
           toolMaskedFiles.push({ relPath, original: raw, masked: cleanText, uri: fileUri.toString() });
@@ -584,7 +586,6 @@ async function chatRequestHandler(
   console.log('[SafeChat] request.references (' + request.references.length + '):', JSON.stringify(refDebug, null, 2));
 
   const filterConfig = await readRulesConfig();
-  const includeExts = filterConfig?.includeExtensions;
 
   // ── Cache invalidation checks ────────────────────────────────────────
   const rulesHash = computeConfigHash(filterConfig);
@@ -620,10 +621,11 @@ async function chatRequestHandler(
 
         const bytes = await vscode.workspace.fs.readFile(ppUri);
         const raw = Buffer.from(bytes).toString('utf-8');
-        const result = await sanitizeOnly(raw, filterConfig);
+        const ppRelPath = vscode.workspace.asRelativePath(ppUri, false);
+        const result = await sanitizeOnly(raw, filterConfig, ppRelPath);
         if (result.presidioError) { anyPresidioError = result.presidioError; }
 
-        const relPath = vscode.workspace.asRelativePath(ppUri, false);
+        const relPath = ppRelPath;
         fileStateCache.set(ppKey, {
           relPath, mtime: stat.mtime,
           isSensitive: true,
@@ -671,19 +673,16 @@ async function chatRequestHandler(
       text = Buffer.from(bytes).toString('utf-8');
     } catch { continue; }
 
-    let isSensitive: boolean;
-    if (includeExts && includeExts.length > 0) {
-      const ext = getFileExtension(fileUri);
-      isSensitive = includeExts.some(e => {
-        const norm = (e.startsWith('.') ? e : '.' + e).toLowerCase();
-        return ext === norm;
+    const category = getFileCategory(relPath, text, filterConfig);
+
+    if (category === 'bypass') {
+      fileStateCache.set(key, {
+        relPath, mtime: stat.mtime, isSensitive: false,
+        originalContent: text, sanitizedContent: text,
+        wasMasked: false, rulesHash,
       });
     } else {
-      isSensitive = true;
-    }
-
-    if (isSensitive) {
-      const result = await sanitizeOnly(text, filterConfig);
+      const result = await sanitizeOnly(text, filterConfig, relPath);
       if (result.presidioError) { anyPresidioError = result.presidioError; }
       fileStateCache.set(key, {
         relPath, mtime: stat.mtime, isSensitive: true,
@@ -691,12 +690,6 @@ async function chatRequestHandler(
         wasMasked: result.wasModified, rulesHash,
       });
       if (result.wasModified) { newMasks++; }
-    } else {
-      fileStateCache.set(key, {
-        relPath, mtime: stat.mtime, isSensitive: false,
-        originalContent: text, sanitizedContent: text,
-        wasMasked: false, rulesHash,
-      });
     }
   }
 
@@ -952,7 +945,7 @@ async function chatRequestHandler(
             toolInvocationToken: request.toolInvocationToken,
           }, token);
           // Force-sanitize search results via the 'search' pipeline path
-          resultContent = sanitizeToolResultParts(
+          resultContent = await sanitizeToolResultParts(
             result.content as (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[],
             'search',
           );
@@ -997,7 +990,7 @@ async function chatRequestHandler(
 
         // ── Branched sanitization: terminal vs general ──────────────────
         const sanitizeMode = isTerminalTool(call.name, toolDesc) ? 'terminal' : 'general';
-        resultContent = sanitizeToolResultParts(resultContent, sanitizeMode);
+        resultContent = await sanitizeToolResultParts(resultContent, sanitizeMode);
       } catch (err) {
         resultContent = [
           new vscode.LanguageModelTextPart(`Tool error: ${err instanceof Error ? err.message : String(err)}`),
@@ -1028,15 +1021,15 @@ export function deactivate() {}
  *  - 'general':  regexSanitize → contentSanitize
  *  - 'search':   regexSanitize → contentSanitize  (same pipeline, distinct log label)
  */
-function sanitizeToolResultParts(
+async function sanitizeToolResultParts(
   parts: (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[],
   mode: SanitizeMode = 'general',
-): (vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[] {
-  return parts.map((part, i) => {
+): Promise<(vscode.LanguageModelTextPart | vscode.LanguageModelPromptTsxPart)[]> {
+  return Promise.all(parts.map(async (part, i) => {
     // Duck-type: any part with a string `.value` is treated as a text part
     const val = (part as unknown as Record<string, unknown>).value;
     if (typeof val === 'string') {
-      const { cleanText, wasModified } = sanitizePipeline(val, mode);
+      const { cleanText, wasModified } = await sanitizePipeline(val, mode);
 
       console.log(`[SafeChat] sanitizeToolResultParts[${i}] mode=${mode}: len=${val.length} modified=${wasModified}`);
       if (wasModified) {
@@ -1047,7 +1040,7 @@ function sanitizeToolResultParts(
     }
     console.log(`[SafeChat] sanitizeToolResultParts[${i}]: non-text part, type=${part?.constructor?.name}`);
     return part;
-  });
+  }));
 }
 
 

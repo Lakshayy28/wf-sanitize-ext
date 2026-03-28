@@ -161,7 +161,8 @@ class SafeReadFileTool {
         try {
             const bytes = await vscode.workspace.fs.readFile(fileUri);
             const raw = Buffer.from(bytes).toString('utf-8');
-            const { cleanText, wasModified } = (0, sanitizer_1.regexSanitize)(raw);
+            const config = await (0, sanitizer_1.readRulesConfig)();
+            const { cleanText, wasModified } = await (0, sanitizer_1.sanitizeOnly)(raw, config, filePath);
             console.log('[SafeChat] safechat_read_file: read fresh, sanitized:', wasModified);
             // Write diff cache + render UI button if masking occurred
             if (wasModified) {
@@ -285,7 +286,8 @@ class SafeReadDirectoryTool {
             try {
                 const bytes = await vscode.workspace.fs.readFile(fileUri);
                 const raw = Buffer.from(bytes).toString('utf-8');
-                const { cleanText, wasModified } = (0, sanitizer_1.regexSanitize)(raw);
+                const dirConfig = await (0, sanitizer_1.readRulesConfig)();
+                const { cleanText, wasModified } = await (0, sanitizer_1.sanitizeOnly)(raw, dirConfig, relPath);
                 parts.push(`// File: ${relPath}\n${cleanText}`);
                 if (wasModified) {
                     toolMaskedFiles.push({ relPath, original: raw, masked: cleanText, uri: fileUri.toString() });
@@ -506,7 +508,6 @@ async function chatRequestHandler(request, chatContext, stream, token) {
     console.log('[SafeChat] request.prompt:', JSON.stringify(request.prompt));
     console.log('[SafeChat] request.references (' + request.references.length + '):', JSON.stringify(refDebug, null, 2));
     const filterConfig = await (0, sanitizer_1.readRulesConfig)();
-    const includeExts = filterConfig?.includeExtensions;
     // ── Cache invalidation checks ────────────────────────────────────────
     const rulesHash = computeConfigHash(filterConfig);
     const diskExists = await diskCacheExists();
@@ -539,11 +540,12 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                 }
                 const bytes = await vscode.workspace.fs.readFile(ppUri);
                 const raw = Buffer.from(bytes).toString('utf-8');
-                const result = await (0, sanitizer_1.sanitizeOnly)(raw, filterConfig);
+                const ppRelPath = vscode.workspace.asRelativePath(ppUri, false);
+                const result = await (0, sanitizer_1.sanitizeOnly)(raw, filterConfig, ppRelPath);
                 if (result.presidioError) {
                     anyPresidioError = result.presidioError;
                 }
-                const relPath = vscode.workspace.asRelativePath(ppUri, false);
+                const relPath = ppRelPath;
                 fileStateCache.set(ppKey, {
                     relPath, mtime: stat.mtime,
                     isSensitive: true,
@@ -598,19 +600,16 @@ async function chatRequestHandler(request, chatContext, stream, token) {
         catch {
             continue;
         }
-        let isSensitive;
-        if (includeExts && includeExts.length > 0) {
-            const ext = getFileExtension(fileUri);
-            isSensitive = includeExts.some(e => {
-                const norm = (e.startsWith('.') ? e : '.' + e).toLowerCase();
-                return ext === norm;
+        const category = (0, sanitizer_1.getFileCategory)(relPath, text, filterConfig);
+        if (category === 'bypass') {
+            fileStateCache.set(key, {
+                relPath, mtime: stat.mtime, isSensitive: false,
+                originalContent: text, sanitizedContent: text,
+                wasMasked: false, rulesHash,
             });
         }
         else {
-            isSensitive = true;
-        }
-        if (isSensitive) {
-            const result = await (0, sanitizer_1.sanitizeOnly)(text, filterConfig);
+            const result = await (0, sanitizer_1.sanitizeOnly)(text, filterConfig, relPath);
             if (result.presidioError) {
                 anyPresidioError = result.presidioError;
             }
@@ -622,13 +621,6 @@ async function chatRequestHandler(request, chatContext, stream, token) {
             if (result.wasModified) {
                 newMasks++;
             }
-        }
-        else {
-            fileStateCache.set(key, {
-                relPath, mtime: stat.mtime, isSensitive: false,
-                originalContent: text, sanitizedContent: text,
-                wasMasked: false, rulesHash,
-            });
         }
     }
     // Prune stale keys (files that no longer exist on disk)
@@ -848,7 +840,7 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                         toolInvocationToken: request.toolInvocationToken,
                     }, token);
                     // Force-sanitize search results via the 'search' pipeline path
-                    resultContent = sanitizeToolResultParts(result.content, 'search');
+                    resultContent = await sanitizeToolResultParts(result.content, 'search');
                 }
                 else {
                     const result = await vscode.lm.invokeTool(call.name, {
@@ -887,7 +879,7 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                 }
                 // ── Branched sanitization: terminal vs general ──────────────────
                 const sanitizeMode = isTerminalTool(call.name, toolDesc) ? 'terminal' : 'general';
-                resultContent = sanitizeToolResultParts(resultContent, sanitizeMode);
+                resultContent = await sanitizeToolResultParts(resultContent, sanitizeMode);
             }
             catch (err) {
                 resultContent = [
@@ -912,12 +904,12 @@ function deactivate() { }
  *  - 'general':  regexSanitize → contentSanitize
  *  - 'search':   regexSanitize → contentSanitize  (same pipeline, distinct log label)
  */
-function sanitizeToolResultParts(parts, mode = 'general') {
-    return parts.map((part, i) => {
+async function sanitizeToolResultParts(parts, mode = 'general') {
+    return Promise.all(parts.map(async (part, i) => {
         // Duck-type: any part with a string `.value` is treated as a text part
         const val = part.value;
         if (typeof val === 'string') {
-            const { cleanText, wasModified } = (0, sanitizer_1.sanitizePipeline)(val, mode);
+            const { cleanText, wasModified } = await (0, sanitizer_1.sanitizePipeline)(val, mode);
             console.log(`[SafeChat] sanitizeToolResultParts[${i}] mode=${mode}: len=${val.length} modified=${wasModified}`);
             if (wasModified) {
                 console.log('[SafeChat] ── before (first 200):', val.slice(0, 200));
@@ -927,7 +919,7 @@ function sanitizeToolResultParts(parts, mode = 'general') {
         }
         console.log(`[SafeChat] sanitizeToolResultParts[${i}]: non-text part, type=${part?.constructor?.name}`);
         return part;
-    });
+    }));
 }
 /**
  * Try to extract the file path from a tool call's input arguments.
