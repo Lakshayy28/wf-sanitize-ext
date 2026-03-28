@@ -99,7 +99,7 @@ const CHARSET_MAP: Record<string, string> = {
   hex:          '[0-9a-fA-F]',
   alphanumeric: '[A-Za-z0-9]',
   base64:       '[A-Za-z0-9+/=]',
-  all:          '[A-Za-z0-9_\\-./+!@#$%^&*()=]',
+  all:          '[A-Za-z0-9_\\-.+/]',
 };
 
 /**
@@ -119,8 +119,13 @@ export function hydrateCustomSecrets(customSecrets: CustomSecretDef[]): void {
       }
     }
 
+    // Only compile a value-hunting regex when a prefix is defined.
+    // Without a prefix the pattern degenerates to "match any long string"
+    // which crosses key=value boundaries and masks keys.
+    if (!def.value_prefix) { continue; }
+
     // Build regex from prefix + charset + length
-    const prefix = def.value_prefix ? escapeRegex(def.value_prefix) : '';
+    const prefix = escapeRegex(def.value_prefix);
     const charClass = CHARSET_MAP[def.value_charset || 'all'] || CHARSET_MAP.all;
 
     let quantifier: string;
@@ -136,7 +141,7 @@ export function hydrateCustomSecrets(customSecrets: CustomSecretDef[]): void {
       quantifier = '{16,}';
     }
 
-    const pattern = `${prefix}(${charClass}${quantifier})`;
+    const pattern = `\\b${prefix}(${charClass}${quantifier})\\b`;
 
     try {
       const compiledRegex = new RegExp(pattern, 'g');

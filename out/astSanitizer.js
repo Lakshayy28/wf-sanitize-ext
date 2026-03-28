@@ -182,27 +182,21 @@ async function sanitizeYaml(text, piiCheck) {
  * Masks secret-key values instantly; sends other values to Presidio.
  * Handles export prefix.
  */
-async function sanitizeEnv(text, piiCheck) {
+async function sanitizeEnv(rawText) {
     let modified = false;
-    const lines = text.split('\n');
+    const lines = rawText.split('\n');
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
-        const trimmed = line.trim();
-        // Preserve comments and blank lines
-        if (!trimmed || trimmed.startsWith('#')) {
-            continue;
-        }
-        // G1: Key (with optional export + leading space), G2: Operator, G3: Open Quote, G4: Value, G5: Close Quote, G6: Tail
-        const match = line.match(/^(\s*(?:export\s+)?[A-Za-z0-9_.-]+)(\s*[:=]\s*)(["']?)(.*?)(["']?)(\s*(?:#.*)?)$/);
+        // Matches: 1:Key, 2:Operator(= or :), 3:Quote, 4:Value, 5:Quote, 6:Comments
+        const match = line.match(/^(\s*[A-Za-z0-9_.-]+)(\s*[:=]\s*)(["']?)(.*?)(["']?)(\s*(?:#.*)?)$/);
         if (match) {
             const [, key, operator, quoteOpen, value, quoteClose, tail] = match;
-            const keyName = key.replace(/^\s*export\s+/, '').trim();
-            // Only process if quotes are balanced (or both empty)
-            if (quoteOpen === quoteClose && value.length > 0) {
-                const cleaned = await processAstValue(keyName, value, piiCheck);
-                if (cleaned !== value) {
+            if (quoteOpen === quoteClose) {
+                const maskedValue = await processAstValue(key, value);
+                if (maskedValue !== value) {
                     modified = true;
-                    lines[i] = `${key}${operator}${quoteOpen}${cleaned}${quoteClose}${tail}`;
+                    // THE FIX: Perfectly reconstruct the line keeping the key intact
+                    lines[i] = `${key}${operator}${quoteOpen}${maskedValue}${quoteClose}${tail}`;
                 }
             }
         }
@@ -311,7 +305,7 @@ async function astSanitize(text, format, piiCheck) {
         case 'yaml':
             return sanitizeYaml(text, piiCheck);
         case 'env':
-            return sanitizeEnv(text, piiCheck);
+            return sanitizeEnv(text);
         case 'properties':
             return sanitizeProperties(text, piiCheck);
         case 'xml':
