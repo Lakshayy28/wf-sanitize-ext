@@ -14,6 +14,7 @@ exports.sanitizeYaml = sanitizeYaml;
 exports.sanitizeEnv = sanitizeEnv;
 exports.sanitizeProperties = sanitizeProperties;
 exports.sanitizeXml = sanitizeXml;
+exports.sanitizeUniversalKeyValue = sanitizeUniversalKeyValue;
 exports.astSanitize = astSanitize;
 const regexSanitizer_1 = require("./regexSanitizer");
 const treeSitterManager_1 = require("./treeSitterManager");
@@ -569,6 +570,43 @@ async function sanitizeXml(text, piiCheck) {
         return full;
     });
     return { cleanText, wasModified: modified };
+}
+// ────────────────────────────────────────────────────────────────────────────
+// Tier 2B: Universal Key-Value Lexer (proprietary config fallback)
+// ────────────────────────────────────────────────────────────────────────────
+/**
+ * Fallback sanitizer for proprietary structured files that use standard
+ * assignment operators (=, :, ->, >>) but aren't a known grammar.
+ *
+ * Strategy: split each line into key + delimiter + rest-of-line,
+ * check the key against isSensitiveKey(), and aggressively mask the
+ * entire value portion if positive. This is intentionally conservative
+ * because we can't reliably parse custom quoting or comment styles.
+ */
+async function sanitizeUniversalKeyValue(rawText) {
+    let modified = false;
+    const lines = rawText.split('\n');
+    // Matches: Key (Group 1), Delimiter (Group 2), Value+Comments (Group 3)
+    // Supports delimiters: =, :, ->, >>
+    const universalRegex = /^(\s*[A-Za-z0-9_.-]+)(\s*(?:[:=]|->|>>)\s*)(.*)$/;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        // Skip blank lines and common comment prefixes
+        if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith(';') ||
+            trimmed.startsWith('//') || trimmed.startsWith('/*')) {
+            continue;
+        }
+        const match = line.match(universalRegex);
+        if (match) {
+            const [, key, delimiter, restOfLine] = match;
+            if (restOfLine.trim().length > 0 && (0, regexSanitizer_1.isSensitiveKey)(key.trim())) {
+                modified = true;
+                lines[i] = `${key}${delimiter}${regexSanitizer_1.MASK}`;
+            }
+        }
+    }
+    return { cleanText: lines.join('\n'), wasModified: modified };
 }
 /**
  * Route to the correct AST parser based on the detected format.

@@ -16,12 +16,16 @@ import * as https from 'https';
 
 // ── Module imports ──────────────────────────────────────────────────────────
 import { regexSanitize, terminalSanitize, stripAnsiCodes, hydrateCustomSecrets, MASK, applyEntropyMasking } from './regexSanitizer';
-import { astSanitize, type AstFormat, type PiiChecker } from './astSanitizer';
-import { getFileCategory, getAstFormat, readRulesConfig, type RulesConfig, type FileCategory, type CustomSecretDef } from './router';
+import { astSanitize, sanitizeUniversalKeyValue, type AstFormat, type PiiChecker } from './astSanitizer';
+import {
+  getFileCategory, getAstFormat, readRulesConfig, determineSanitizationRoute,
+  type RulesConfig, type FileCategory, type CustomSecretDef,
+  type SanitizationRoute, type SanitizationEngine,
+} from './router';
 
 // ── Re-exports for extension.ts ─────────────────────────────────────────────
-export { readRulesConfig, getFileCategory } from './router';
-export type { RulesConfig, FileCategory, CustomSecretDef } from './router';
+export { readRulesConfig, getFileCategory, determineSanitizationRoute } from './router';
+export type { RulesConfig, FileCategory, CustomSecretDef, SanitizationRoute, SanitizationEngine } from './router';
 export { regexSanitize, stripAnsiCodes, MASK, calculateShannonEntropy, applyEntropyMasking } from './regexSanitizer';
 export type { SecretPattern } from './regexSanitizer';
 
@@ -150,18 +154,21 @@ export async function sanitizePipeline(
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * 3-Tier Smart Router:
+ * 3-Tier Smart Router + Graceful Degradation Pipeline:
  *
- *  Tier 1 (bypass):   source code → pass raw
- *  Tier 2 (ast):      structured configs → AST key-match + regex fallback
- *  Tier 3 (full_dlp): unstructured text → regex + Presidio NLP
+ *  Blocked:                binary files → reject
+ *  Tier 1 (bypass):        source code → pass raw
+ *  Tier 2 (tree-sitter):   structured configs → AST key-match + regex fallback
+ *  Tier 2B (universal-kv): proprietary KV files → Universal Lexer + regex
+ *  Tier 3 (unstructured):  everything else → regex + Presidio NLP
  *
- * If `fileName` is omitted (e.g., user prompt text), defaults to full_dlp.
+ * If `fileName` is omitted (e.g., user prompt text), defaults to Tier 3.
  */
 export async function sanitizeOnly(
   rawText: string,
   rulesConfig?: RulesConfig,
   fileName?: string,
+  fileSize?: number,
 ): Promise<{
   cleanText: string;
   wasModified: boolean;
@@ -169,34 +176,53 @@ export async function sanitizeOnly(
 }> {
   ensureHydrated(rulesConfig);
 
+  // ── Route through the Graceful Degradation Pipeline ─────────────────
+  const ext = fileName
+    ? ('.' + (fileName.split('.').pop() ?? '').toLowerCase())
+    : '';
+  const route = fileName
+    ? determineSanitizationRoute(rawText, ext, fileSize)
+    : { engine: 'unstructured' as const };
+
+  // ── Blocked (binary / corrupt) ──────────────────────────────────────
+  if (route.engine === 'blocked') {
+    return { cleanText: rawText, wasModified: false, presidioError: route.reason };
+  }
+
+  // ── Tier 1: Bypass (source code) ────────────────────────────────────
   const category: FileCategory = fileName
     ? getFileCategory(fileName, rawText, rulesConfig)
     : 'full_dlp';
 
-  // ── Tier 1: Bypass ──────────────────────────────────────────────────
-  if (category === 'bypass') {
+  if (category === 'bypass' && route.engine !== 'tree-sitter' && route.engine !== 'universal-lexer') {
     return { cleanText: rawText, wasModified: false };
   }
 
-  // ── Tier 2: AST + Aggressive Key Match + Presidio PII Bridge ────────
-  if (category === 'ast') {
-    const astFormat = fileName ? getAstFormat(fileName) : undefined;
-    let current = rawText;
-    let modified = false;
-    let presidioError: string | undefined;
+  let current = rawText;
+  let modified = false;
+  let presidioError: string | undefined;
 
-    // PII checker callback — sends isolated AST values to Presidio NLP
-    const piiCheck: PiiChecker = async (value: string) => {
-      try {
-        const result = await callPresidioApi(value, rulesConfig);
-        return result.sanitized_text;
-      } catch (err) {
-        if (!presidioError) {
-          presidioError = err instanceof Error ? err.message : String(err);
-        }
-        return value;
+  // PII checker callback for AST-to-Presidio bridge
+  const piiCheck: PiiChecker = async (value: string) => {
+    try {
+      const result = await callPresidioApi(value, rulesConfig);
+      return result.sanitized_text;
+    } catch (err) {
+      if (!presidioError) {
+        presidioError = err instanceof Error ? err.message : String(err);
       }
+      return value;
+    }
+  };
+
+  // ── Tier 2: Tree-sitter (known + sniffed formats) ──────────────────
+  if (route.engine === 'tree-sitter') {
+    const langToFormat: Record<string, AstFormat> = {
+      json: 'json', yaml: 'yaml', bash: 'env',
+      properties: 'properties', xml: 'xml',
     };
+    const astFormat = (route.language && langToFormat[route.language])
+      ?? (fileName ? getAstFormat(fileName) : undefined);
 
     if (astFormat) {
       const astResult = await astSanitize(current, astFormat, piiCheck);
@@ -204,7 +230,7 @@ export async function sanitizeOnly(
       modified = astResult.wasModified;
     }
 
-    // Also run the regex dictionary as a safety net
+    // Regex safety net
     const regResult = regexSanitize(current);
     current = regResult.cleanText;
     if (regResult.wasModified) { modified = true; }
@@ -212,23 +238,51 @@ export async function sanitizeOnly(
     return { cleanText: current, wasModified: modified, presidioError };
   }
 
-  // ── Tier 3: Mega-Regex + NLP (full_dlp) ─────────────────────────────
-  let current = rawText;
-  let modified = false;
-  let presidioError: string | undefined;
+  // ── Tier 2B: Universal Lexer (proprietary KV formats) ───────────────
+  if (route.engine === 'universal-lexer') {
+    const kvResult = await sanitizeUniversalKeyValue(current);
+    current = kvResult.cleanText;
+    if (kvResult.wasModified) { modified = true; }
 
-  // Step 1: Regex dictionary (known patterns) + Entropy scanner (unknown secrets)
+    // Regex safety net
+    const regResult = regexSanitize(current);
+    current = regResult.cleanText;
+    if (regResult.wasModified) { modified = true; }
+
+    return { cleanText: current, wasModified: modified, presidioError };
+  }
+
+  // ── Legacy AST path (Tier 2 files not caught by Content Sniffer) ────
+  if (category === 'ast') {
+    const astFormat = fileName ? getAstFormat(fileName) : undefined;
+    if (astFormat) {
+      const astResult = await astSanitize(current, astFormat, piiCheck);
+      current = astResult.cleanText;
+      modified = astResult.wasModified;
+    }
+
+    const regResult = regexSanitize(current);
+    current = regResult.cleanText;
+    if (regResult.wasModified) { modified = true; }
+
+    return { cleanText: current, wasModified: modified, presidioError };
+  }
+
+  // ── Tier 3: Mega-Regex + NLP (full_dlp / unstructured) ──────────────
+  // Step 1: Regex dictionary + Entropy scanner
   const regResult = regexSanitize(current);
   current = regResult.cleanText;
   if (regResult.wasModified) { modified = true; }
 
-  // Step 2: Presidio NLP for human PII (PERSON, CREDIT_CARD, SSN, etc.)
-  try {
-    const result = await callPresidioApi(current, rulesConfig);
-    current = result.sanitized_text;
-    if (result.was_modified) { modified = true; }
-  } catch (err) {
-    presidioError = err instanceof Error ? err.message : String(err);
+  // Step 2: Presidio NLP (skip for mega/minified files flagged by router)
+  if (!route.reason?.includes('regex only')) {
+    try {
+      const result = await callPresidioApi(current, rulesConfig);
+      current = result.sanitized_text;
+      if (result.was_modified) { modified = true; }
+    } catch (err) {
+      presidioError = err instanceof Error ? err.message : String(err);
+    }
   }
 
   return { cleanText: current, wasModified: modified, presidioError };

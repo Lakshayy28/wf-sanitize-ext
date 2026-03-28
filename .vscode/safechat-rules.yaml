@@ -1,14 +1,32 @@
 # =============================================================================
 # SafeChat Master Configuration
 # =============================================================================
-# This file controls the behavior of the @safechat VS Code extension.
-# It defines file routing, custom secret generation, and NLP PII rules.
+# This file controls the behavior of the @safechat VS Code Extension.
+# It is re-read on every @safechat prompt — no reload or server restart needed.
+#
+# Routing happens automatically via the Graceful Degradation Pipeline:
+#   1. Binary files / NUL bytes        → blocked (never forwarded to Copilot)
+#   2. Source code / docs              → bypass  (forwarded as-is, no scan)
+#   3. Mega-files (> 1 MB) or          → Tier 3 regex-only (Presidio skipped)
+#      minified lines (> 10 000 chars)
+#   4. Known structured formats        → Tier 2 Tree-sitter CST
+#      (.json .yaml .env .properties)    (WASM grammars, 4 languages)
+#   5. Unknown ext — content sniffed   → Tier 2 Tree-sitter if JSON/YAML/XML/bash
+#   6. Unknown ext — KV detected       → Tier 2B Universal KV Lexer
+#      (=  :  ->  >>  delimiters)
+#   7. Everything else                 → Tier 3 Full DLP
+#      (.log .txt .csv unstructured)    Regex + Entropy + Presidio NLP
+#
+# Use ast_extensions / full_dlp_extensions below only when the automatic
+# routing needs an explicit override for an internal/proprietary format.
 # =============================================================================
 
-# ── 1. Smart Routing Overrides ───────────────────────────────────────────────
-# The extension automatically routes common files (e.g., .json, .env to Tier 2 AST, 
-# and .log, .md to Tier 3 NLP). You can force unknown or custom extensions 
-# into specific engines here. (Dotfiles are matched by their full basename).
+# ── 1. AST Routing Overrides ─────────────────────────────────────────────────
+# Force proprietary or vendor-specific extensions into the Tier 2 AST engine
+# (Tree-sitter CST parser or Universal KV Lexer, depending on content).
+# The Content Sniffer handles most cases automatically — add entries here only
+# when the sniffer does not recognise your internal format.
+# (Dotfiles are matched by their full basename e.g. ".kube_vars")
 # ─────────────────────────────────────────────────────────────────────────────
 ast_extensions: 
   # Force these into the Tier 2 AST Guardian (Structure preservation, no NLP)
@@ -17,7 +35,9 @@ ast_extensions:
   - .mycompany_conf
 
 full_dlp_extensions: 
-  # Force these into Tier 3 (Regex + Python Presidio NLP)
+  # Force these into Tier 3 Full DLP (Regex + Shannon Entropy + Presidio NLP).
+  # Use for log files, audit dumps, and chat transcripts that contain human PII
+  # not detectable by the key-name-based AST engine.
   - .audit_log
   - .splunk_dump
   - .chat_transcript
@@ -25,9 +45,10 @@ full_dlp_extensions:
 
 # ── 2. Dynamic Secret Builder (TypeScript Engine) ────────────────────────────
 # Define custom internal developer secrets here. The TypeScript extension will:
-# 1. Inject `ast_keys` into the Tier 2 JSON/YAML/ENV parser to mask them instantly.
-# 2. Dynamically compile a mathematically safe Regex using the prefix/charset/length 
-#    to hunt for these tokens in unstructured text (Tier 3).
+# 1. Inject `ast_keys` into the Tier 2 Tree-sitter / KV parsers so those keys
+#    are masked immediately at the AST level.
+# 2. Dynamically compile a mathematically safe regex from the prefix/charset/
+#    length and add it to the Tier 3 regex dictionary for unstructured text.
 # ─────────────────────────────────────────────────────────────────────────────
 custom_secrets:
   # Catch Base64 encoded usernames or DB logins in configurations

@@ -43,9 +43,29 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getAstFormat = getAstFormat;
+exports.determineSanitizationRoute = determineSanitizationRoute;
 exports.getFileCategory = getFileCategory;
 exports.readRulesConfig = readRulesConfig;
 const vscode = __importStar(require("vscode"));
+// ────────────────────────────────────────────────────────────────────────────
+// Safety blocklists
+// ────────────────────────────────────────────────────────────────────────────
+/** Binary extensions that must never enter the text pipeline. */
+const BINARY_BLOCKLIST = new Set([
+    '.pdf', '.zip', '.gz', '.tar', '.bz2', '.xz', '.7z', '.rar',
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff',
+    '.mp3', '.mp4', '.wav', '.avi', '.mkv', '.mov', '.flac', '.ogg',
+    '.exe', '.dll', '.so', '.dylib', '.bin', '.o', '.obj', '.a', '.lib',
+    '.wasm', '.class', '.pyc', '.pyo',
+    '.sqlite', '.db', '.mdb', '.accdb',
+    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.ttf', '.otf', '.woff', '.woff2', '.eot',
+    '.p12', '.pfx', '.jks', '.keystore',
+]);
+/** Max file size (bytes) for full NLP pipeline. Above this → fast regex only. */
+const MAX_NLP_FILE_SIZE = 1_000_000; // 1 MB
+/** Max single-line length before we treat the file as minified. */
+const MAX_LINE_LENGTH = 10_000;
 // ────────────────────────────────────────────────────────────────────────────
 // Default extension sets
 // ────────────────────────────────────────────────────────────────────────────
@@ -119,11 +139,80 @@ function getAstFormat(fileName) {
     return AST_FORMAT_MAP[ext];
 }
 // ────────────────────────────────────────────────────────────────────────────
-// Content Sniffer — for unknown extensions
+// Content Sniffer + Graceful Degradation Pipeline
 // ────────────────────────────────────────────────────────────────────────────
+/** Tree-sitter language map for known structured extensions. */
+const TREE_SITTER_LANG_MAP = {
+    '.json': 'json',
+    '.yaml': 'yaml', '.yml': 'yaml', '.kubeconfig': 'yaml',
+    '.env': 'bash',
+    '.properties': 'properties', '.ini': 'properties', '.cfg': 'properties',
+    '.npmrc': 'properties', '.netrc': 'properties', '.conf': 'properties',
+    '.xml': 'xml', '.csproj': 'xml', '.props': 'xml', '.targets': 'xml',
+    '.nuspec': 'xml',
+};
 /**
- * Guess the file type from its content when the extension is unknown.
- * Peeks at the first 1000 characters.
+ * Determines the sanitization route for a file.
+ *
+ * Graceful Degradation Pipeline:
+ *  1. Block binary files (crash risk)
+ *  2. Block mega-files (latency risk) → fast regex only
+ *  3. Detect minified files → fast regex only
+ *  4. Known extensions → Tree-sitter
+ *  5. Content sniff unknown extensions → Tree-sitter spoof
+ *  6. Proprietary KV formats → Universal Lexer (Tier 2B)
+ *  7. Everything else → Unstructured (Tier 3 regex+NLP)
+ */
+function determineSanitizationRoute(rawText, extension, fileSize) {
+    const ext = extension.toLowerCase();
+    // ── Safety Gate 1: Binary blocklist ────────────────────────────────
+    if (BINARY_BLOCKLIST.has(ext)) {
+        return { engine: 'blocked', reason: 'binary file' };
+    }
+    // ── Safety Gate 2: Binary content heuristic (NUL bytes) ───────────
+    if (rawText.length > 0 && rawText.indexOf('\0') !== -1) {
+        return { engine: 'blocked', reason: 'binary content detected' };
+    }
+    // ── Safety Gate 3: Mega-file check ────────────────────────────────
+    if (fileSize !== undefined && fileSize > MAX_NLP_FILE_SIZE) {
+        return { engine: 'unstructured', reason: 'file exceeds 1 MB — regex only' };
+    }
+    // ── Safety Gate 4: Minified file detection ────────────────────────
+    const firstNewline = rawText.indexOf('\n');
+    const firstLineLen = firstNewline === -1 ? rawText.length : firstNewline;
+    if (firstLineLen > MAX_LINE_LENGTH) {
+        return { engine: 'unstructured', reason: 'minified file — regex only' };
+    }
+    // ── Step 1: Known Tree-sitter formats ─────────────────────────────
+    if (TREE_SITTER_LANG_MAP[ext]) {
+        return { engine: 'tree-sitter', language: TREE_SITTER_LANG_MAP[ext] };
+    }
+    // ── Step 2: Content Sniffer (for unknown extensions) ──────────────
+    const firstChunk = rawText.substring(0, 500).trim();
+    if (firstChunk.startsWith('{') || firstChunk.startsWith('[')) {
+        return { engine: 'tree-sitter', language: 'json' };
+    }
+    if (firstChunk.startsWith('<?xml') || /^<[a-zA-Z][a-zA-Z0-9]*[\s>]/.test(firstChunk)) {
+        return { engine: 'tree-sitter', language: 'xml' };
+    }
+    if (firstChunk.startsWith('#!/')) {
+        return { engine: 'tree-sitter', language: 'bash' };
+    }
+    // YAML heuristic: first non-blank line is `key: value`
+    if (/^[a-zA-Z0-9_-]+:\s/.test(firstChunk)) {
+        return { engine: 'tree-sitter', language: 'yaml' };
+    }
+    // ── Step 3: Universal Lexer (proprietary KV formats) ──────────────
+    // Matches: KEY = VAL, KEY: VAL, KEY -> VAL, KEY >> VAL
+    if (/^[a-zA-Z0-9_.-]+\s*(?:[:=]|->|>>)\s*.+$/m.test(firstChunk)) {
+        return { engine: 'universal-lexer' };
+    }
+    // ── Step 4: Unstructured fallback (Tier 3) ────────────────────────
+    return { engine: 'unstructured' };
+}
+/**
+ * Legacy content sniffer — maps unknown content to FileCategory.
+ * Used by getFileCategory when an extension is unknown.
  */
 function guessUnknownFileType(rawContent) {
     const peek = rawContent.slice(0, 1000);

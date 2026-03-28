@@ -657,6 +657,52 @@ export async function sanitizeXml(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Tier 2B: Universal Key-Value Lexer (proprietary config fallback)
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fallback sanitizer for proprietary structured files that use standard
+ * assignment operators (=, :, ->, >>) but aren't a known grammar.
+ *
+ * Strategy: split each line into key + delimiter + rest-of-line,
+ * check the key against isSensitiveKey(), and aggressively mask the
+ * entire value portion if positive. This is intentionally conservative
+ * because we can't reliably parse custom quoting or comment styles.
+ */
+export async function sanitizeUniversalKeyValue(
+  rawText: string,
+): Promise<{ cleanText: string; wasModified: boolean }> {
+  let modified = false;
+  const lines = rawText.split('\n');
+
+  // Matches: Key (Group 1), Delimiter (Group 2), Value+Comments (Group 3)
+  // Supports delimiters: =, :, ->, >>
+  const universalRegex = /^(\s*[A-Za-z0-9_.-]+)(\s*(?:[:=]|->|>>)\s*)(.*)$/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    // Skip blank lines and common comment prefixes
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith(';') ||
+        trimmed.startsWith('//') || trimmed.startsWith('/*')) {
+      continue;
+    }
+
+    const match = line.match(universalRegex);
+    if (match) {
+      const [, key, delimiter, restOfLine] = match;
+      if (restOfLine.trim().length > 0 && isSensitiveKey(key.trim())) {
+        modified = true;
+        lines[i] = `${key}${delimiter}${MASK}`;
+      }
+    }
+  }
+
+  return { cleanText: lines.join('\n'), wasModified: modified };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Dispatcher
 // ────────────────────────────────────────────────────────────────────────────
 

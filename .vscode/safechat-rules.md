@@ -9,12 +9,14 @@ This file is the single control panel for the `@safechat` VS Code extension. Eve
 ## Table of Contents
 
 1. [How it fits into the pipeline](#1-how-it-fits-into-the-pipeline)
-2. [Section: `include_extensions`](#2-section-include_extensions)
-3. [Section: `rules`](#3-section-rules)
-4. [Section: `custom_recognizers`](#4-section-custom_recognizers)
-5. [Entity alias reference](#5-entity-alias-reference)
-6. [Complete annotated example](#6-complete-annotated-example)
-7. [Common recipes](#7-common-recipes)
+2. [Section: `ast_extensions`](#2-section-ast_extensions)
+3. [Section: `full_dlp_extensions`](#3-section-full_dlp_extensions)
+4. [Section: `custom_secrets`](#4-section-custom_secrets)
+5. [Section: `rules`](#5-section-rules)
+6. [Section: `custom_recognizers`](#6-section-custom_recognizers)
+7. [Entity alias reference](#7-entity-alias-reference)
+8. [Complete annotated example](#8-complete-annotated-example)
+9. [Common recipes](#9-common-recipes)
 
 ---
 
@@ -25,54 +27,49 @@ User attaches file(s) to @safechat
             │
             ▼
   ┌─────────────────────┐
-  │  include_extensions │
-  │  present & non-     │ ── no match ──► 📄 Forwarded as-is to Copilot (no PII scan)
-  │  empty?             │
-  └─────────────────────┘
-            │ match (or section absent = scan all)
-            ▼
-       Read file content
-            │
-            ▼
-  ┌─────────────────────┐      ┌───────────────────────────┐
-  │  Presidio NLP API   │      │  custom_recognizers       │
-  │  (Tier 1)           │◄─────│  sent with every request  │
-  └─────────────────────┘      └───────────────────────────┘
-            │
-         rules applied (replace / mask / redact / hash / encrypt)
-            │
-            ▼
+  │  Safety Gates         │  Binary file or NUL bytes found?
+  │  (blocked / bypass)   │ ── yes ──► 🚫 Rejected — not forwarded to Copilot.
+  └─────────────────────┘  Source code / doc file?
+       │                    ── yes ──► 📄 Forwarded as-is (bypass, no scan).
+       │
+       ▼
   ┌─────────────────────┐
-  │  Regex engine       │  catches any remaining secrets (api_key=, Bearer …)
-  │  (Tier 2, always)   │
-  └─────────────────────┘
+  │  Content Sniffer &    │  Known extension (.json/.yaml/.env…) or unknown
+  │  ast_extensions list  │  extension whose content looks like a known format?
+  └─────────────────────┘  ── yes ──► Tree-sitter CST parser (Tier 2).
+       │                    Unknown extension with KV pairs?
+       │                    ── yes ──► Universal KV Lexer (Tier 2B).
+       │
+       ▼
+  ┌─────────────────────┐      ┌─────────────────────┐
+  │  Full DLP pipeline    │      │  custom_recognizers +    │
+  │  Regex → Entropy      │◄────│  rules applied via        │
+  │  → Presidio NLP       │      │  Presidio API call        │
+  └─────────────────────┘      └─────────────────────┘
             │
             ▼
      Sanitized text → Copilot
 ```
 
-Files that do not match `include_extensions` are **forwarded as-is** to Copilot — they are not blocked, just not scanned for PII.
+Files that are source code or documentation are **forwarded as-is** to Copilot. Config and data files are always scanned — there is no longer an extension allowlist that gates scanning; instead the routing engine automatically assigns the most appropriate engine.
 
 ---
 
-## 2. Section: `include_extensions`
+## 2. Section: `ast_extensions`
 
-Controls which file types are scanned for PII before forwarding to Copilot.
+Forces custom or proprietary file extensions through the **Tier 2 AST / Universal KV engine** instead of leaving the decision entirely to the automatic router.
 
-### Rules
+### When to use it
 
-| Condition | Behaviour |
-|---|---|
-| Section absent or empty | **All** attached files are scanned (default — backwards compatible) |
-| Section present with entries | Files matching the list are sanitized; **all other files are forwarded as-is** (no scanning, no blocking) |
+The Content Sniffer already handles most cases automatically — unknown extensions are sniffed, and if the content looks like JSON/YAML/ENV/Properties the Tree-sitter parser is used; if it looks like a generic key-value format the Universal KV Lexer is used. Add an entry here only when the automatic routing doesn’t pick the right engine (e.g. a format the sniffer doesn’t recognise).
 
 ### Syntax
 
 ```yaml
-include_extensions:
-  - .yaml
-  - .json
-  - .env       # matched by full basename for dotfiles (see below)
+ast_extensions:
+  - .custom_env      # force through AST/KV engine
+  - .kube_vars       # helm/kubernetes local var files
+  - .mycompany_conf  # vendor-specific config
 ```
 
 Each entry must start with a `.`. Matching is **case-insensitive**.
@@ -81,35 +78,65 @@ Each entry must start with a `.`. Matching is **case-insensitive**.
 
 | File | Extension seen | Matches |
 |---|---|---|
-| `config.yaml` | `.yaml` | `- .yaml` ✅ |
-| `.env` | `.env` (full basename) | `- .env` ✅ |
-| `.env.local` | `.local` | `- .local` ✅ |
-| `.env.production` | `.production` | `- .production` ✅ |
+| `settings.custom_env` | `.custom_env` | `- .custom_env` ✅ |
+| `.kube_vars` | `.kube_vars` (full basename) | `- .kube_vars` ✅ |
 | `Makefile` | *(empty)* | never matched |
-
-### Example — only scan config and secret files
-
-```yaml
-include_extensions:
-  - .yaml
-  - .yml
-  - .json
-  - .xml
-  - .conf
-  - .env
-  - .properties
-  - .pem
-  - .crt
-  - .cer
-  - .pfx
-  - .key
-```
-
-With this active, attaching a TypeScript file (`.ts`) forwards it **as-is** to Copilot (no PII scanning). Config/secret files like `.yaml` or `.env` are sanitized first.
 
 ---
 
-## 3. Section: `rules`
+## 3. Section: `full_dlp_extensions`
+
+Forces custom file extensions straight to the **Tier 3 Full DLP** pipeline (regex + Shannon Entropy + Presidio NLP), bypassing the AST/KV engines entirely.
+
+### When to use it
+
+Use this for log files, audit dumps, chat transcripts, or any unstructured text export from internal tools. These files may contain human PII (names, emails, phone numbers) that the key-name-based AST engine would miss because the data isn’t under a recognisable key.
+
+### Syntax
+
+```yaml
+full_dlp_extensions:
+  - .audit_log
+  - .splunk_dump
+  - .chat_transcript
+```
+
+---
+
+## 4. Section: `custom_secrets`
+
+Defines custom internal developer secrets recognised by the **TypeScript engine** (not Presidio). Each entry does two things:
+
+1. **Injects `ast_keys`** into the Tier 2 JSON/YAML/ENV parser so those keys are masked immediately at the AST level.
+2. **Compiles a regex** from `value_prefix` + `value_charset` + `value_length` and adds it to the Tier 3 regex dictionary for unstructured text.
+
+### Syntax
+
+```yaml
+custom_secrets:
+  - name: "My Secret Name"        # human-readable label
+    ast_keys: ["key1", "key2"]    # extra keys to mask in Tier 2
+    value_prefix: "mytoken_"      # optional token prefix
+    value_charset: "alphanumeric" # alphanumeric | hex | base64 | all
+    value_length: "32"            # expected token length
+```
+
+### Example — internal API token
+
+```yaml
+custom_secrets:
+  - name: "Acme Corp Production Token"
+    ast_keys: ["acme_prod", "acme_token"]
+    value_prefix: "acme_live_"
+    value_charset: "alphanumeric"
+    value_length: "32"
+```
+
+This compiles the regex `\b(acme_live_[A-Za-z0-9_\-]{32})\b` and adds it to the Tier 3 dictionary. Any occurrence of an `acme_live_` token anywhere in unstructured text is masked automatically.
+
+---
+
+## 5. Section: `rules`
 
 Defines how each detected entity type is anonymized. Any entity type not listed defaults to `replace`.
 
@@ -158,7 +185,7 @@ export SAFECHAT_ENCRYPT_KEY="my32characterlongsecretkey123456"
 
 ---
 
-## 4. Section: `custom_recognizers`
+## 6. Section: `custom_recognizers`
 
 Adds your own regex-based entity detectors without modifying the server. Each recognizer is active for the duration of the request — no restart required.
 
@@ -276,7 +303,7 @@ rules:
 
 ---
 
-## 5. Entity alias reference
+## 7. Entity alias reference
 
 You can use either the friendly alias or the canonical Presidio type — both are accepted, case-insensitively.
 
@@ -303,24 +330,33 @@ For the full catalogue of 70+ entity types (financial, developer, infrastructure
 
 ---
 
-## 6. Complete annotated example
+## 8. Complete annotated example
 
 ```yaml
-# ── Only scan data/config files — skip all code files ─────────────────────────
-include_extensions:
-  - .yaml
-  - .yml
-  - .json
-  - .xml
-  - .conf
-  - .env
-  - .properties
-  - .pem
-  - .crt
-  - .pfx
-  - .key
+# ── 1. Force proprietary extensions into Tier 2 AST/KV engine ─────────────────
+ast_extensions:
+  - .custom_env
+  - .kube_vars
+  - .mycompany_conf
 
-# ── Per-entity anonymization operations ───────────────────────────────────────
+# ── 2. Force log/dump extensions into Tier 3 Full DLP ─────────────────────────
+full_dlp_extensions:
+  - .audit_log
+  - .splunk_dump
+  - .chat_transcript
+
+# ── 3. Internal developer token definitions ────────────────────────────────────
+custom_secrets:
+  - name: "App Usernames"
+    ast_keys: ["username", "db_user", "login"]
+
+  - name: "Acme Corp Production Token"
+    ast_keys: ["acme_prod", "acme_token"]
+    value_prefix: "acme_live_"
+    value_charset: "alphanumeric"
+    value_length: "32"
+
+# ── 4. Per-entity anonymization operations ────────────────────────────────────
 rules:
   # Presidio built-in
   PhoneNumber:    replace   # → <PHONE_NUMBER>
@@ -335,7 +371,7 @@ rules:
   EMPLOYEE_ID:    mask
   BRANCH_CODE:    replace
 
-# ── User-defined regex recognizers ────────────────────────────────────────────
+# ── 5. User-defined Presidio NLP recognizers ──────────────────────────────────
 custom_recognizers:
   - name: EMPLOYEE_ID
     pattern: "EMP-\\d{6}"
@@ -355,62 +391,40 @@ custom_recognizers:
 
 ---
 
-## 7. Common recipes
+## 9. Common recipes
 
-### Scan everything (default behaviour)
+### No overrides needed (default behaviour)
 
-Remove or comment out `include_extensions` entirely. All attached files are scanned.
+For standard projects, leave `ast_extensions` and `full_dlp_extensions` empty or absent. The Content Sniffer automatically routes `.json`, `.yaml`, `.yml`, `.env`, `.properties` to Tree-sitter, unknown KV files to the Universal Lexer, and everything else to Full DLP.
 
-### Java / Spring Boot project
+### Java / Spring Boot project — add proprietary formats
 
 ```yaml
-include_extensions:
-  - .yaml
-  - .yml
-  - .xml
-  - .properties
-  - .env
-  - .gradle
-  - .kts
+ast_extensions:
+  - .myapp_config       # custom app config with key=value pairs
+  - .spring_local       # local Spring overrides
+
+full_dlp_extensions:
+  - .gc_log             # GC / application logs
 ```
 
-### Node / TypeScript / React project
+### Node / TypeScript / React project — add internal token format
 
 ```yaml
-include_extensions:
-  - .json
-  - .yaml
-  - .yml
-  - .env
-  - .local      # .env.local, .env.development.local
-  - .conf
+custom_secrets:
+  - name: "Internal Service Token"
+    ast_keys: ["service_token", "svc_key"]
+    value_prefix: "svc_"
+    value_charset: "alphanumeric"
+    value_length: "40"
 ```
 
-### .NET / C# project
+### Infrastructure / DevOps — force Terraform state to Full DLP
 
 ```yaml
-include_extensions:
-  - .json        # appsettings.json
-  - .xml         # web.config, packages.config
-  - .config      # app.config
-  - .env
-  - .csproj      # may contain NuGet source URLs with tokens
-```
-
-### Infrastructure / DevOps
-
-```yaml
-include_extensions:
-  - .yaml
-  - .yml
-  - .tf
-  - .tfvars
-  - .hcl
-  - .env
-  - .conf
-  - .pem
-  - .key
-  - .crt
+full_dlp_extensions:
+  - .tfstate            # Terraform state files contain raw secrets in plain text
+  - .tfstate.backup
 ```
 
 ### Mask everything aggressively
