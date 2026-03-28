@@ -11,6 +11,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.HIGH_CONFIDENCE_SECRETS = exports.MASK = exports.DYNAMIC_AST_KEYS = void 0;
 exports.isSensitiveKey = isSensitiveKey;
 exports.hydrateCustomSecrets = hydrateCustomSecrets;
+exports.calculateShannonEntropy = calculateShannonEntropy;
+exports.applyEntropyMasking = applyEntropyMasking;
 exports.regexSanitize = regexSanitize;
 exports.stripAnsiCodes = stripAnsiCodes;
 exports.terminalSanitize = terminalSanitize;
@@ -61,8 +63,7 @@ exports.HIGH_CONFIDENCE_SECRETS = [
     // ── Cryptographic Material ────────────────────────────────────────────
     { name: 'RSA/PEM Private Key', regex: /(-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|DSA\s+|ENCRYPTED\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|DSA\s+|ENCRYPTED\s+)?PRIVATE\s+KEY-----)/g },
     { name: 'JWT Token', regex: /\b(eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]*)\b/g },
-    // ── Generic Assignments & URLs (Ultimate Fallbacks) ───────────────────
-    { name: 'Generic Secret Assignment', regex: /(?:key|secret|token|password|passwd|auth|credential|cert|ssh|bearer|client_id)[A-Za-z0-9_]*\s*(?:[:=>])\s*["']?([A-Za-z0-9_.\-\/+!@#$%^&*()]{16,})["']?(?:<\/[A-Za-z0-9\-_]+>)?/gi },
+    // ── Generic URLs (Ultimate Fallbacks) ─────────────────────────────────────
     { name: 'URL Query Parameter Secret', regex: /(?:password|passwd|secret|token|api_?key|auth)=([^&\s"']+)/gi },
     { name: 'Credential URL', regex: /\b([a-zA-Z0-9+.-]+:\/\/)([^@\s]+)(@[a-zA-Z0-9.-]+(?::[\d]+)?(?:\/[^\s"']*)?)/gi, isUrlAuth: true },
 ];
@@ -126,8 +127,31 @@ function escapeRegex(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 // ────────────────────────────────────────────────────────────────────────────
-// Shannon Entropy Helper
+// Shannon Entropy Engine
 // ────────────────────────────────────────────────────────────────────────────
+/**
+ * Calculates the Shannon Entropy of a string.
+ * Higher values = more cryptographic randomness.
+ * Standard English text: ~2.5–3.5 | Base64 API keys: typically > 4.5
+ */
+function calculateShannonEntropy(str) {
+    if (!str || str.length === 0) {
+        return 0;
+    }
+    const charCounts = new Map();
+    for (let i = 0; i < str.length; i++) {
+        const char = str[i];
+        charCounts.set(char, (charCounts.get(char) || 0) + 1);
+    }
+    let entropy = 0;
+    const len = str.length;
+    for (const count of charCounts.values()) {
+        const freq = count / len;
+        entropy -= freq * Math.log2(freq);
+    }
+    return entropy;
+}
+/** Known high-entropy secret prefixes (service-specific). */
 const SECRET_PREFIXES = [
     'ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_',
     'sk-', 'pk_live_', 'pk_test_', 'sk_live_', 'sk_test_',
@@ -135,6 +159,7 @@ const SECRET_PREFIXES = [
     'eyJ', 'npm_', 'AKIA', 'ASIA',
     'glpat-', 'SG.', 'hvs.', 'hvb.', 'hvr.',
 ];
+/** Heuristic: is this bare token likely a cryptographic secret? */
 function looksLikeSecret(s) {
     if (s.length < 16) {
         return false;
@@ -142,15 +167,7 @@ function looksLikeSecret(s) {
     if (SECRET_PREFIXES.some(p => s.startsWith(p))) {
         return true;
     }
-    const freq = new Map();
-    for (const c of s) {
-        freq.set(c, (freq.get(c) || 0) + 1);
-    }
-    let entropy = 0;
-    for (const count of freq.values()) {
-        const p = count / s.length;
-        entropy -= p * Math.log2(p);
-    }
+    const entropy = calculateShannonEntropy(s);
     if (entropy > 4 && s.length >= 20) {
         const hasUpper = /[A-Z]/.test(s);
         const hasLower = /[a-z]/.test(s);
@@ -160,6 +177,41 @@ function looksLikeSecret(s) {
         return classes >= 3;
     }
     return false;
+}
+// ────────────────────────────────────────────────────────────────────────────
+// Context-Anchored Entropy Scanner (replaces brittle Generic Secret Assignment)
+// ────────────────────────────────────────────────────────────────────────────
+/**
+ * The Anchor Regex: loose match for any key=value, key: "value", key => "value"
+ * where the key name contains a suspicious word. Captures the value in Group 1.
+ *
+ * This does NOT decide whether to mask — that's the Entropy Gate's job.
+ */
+const ENTROPY_ANCHOR_RE = /(?:key|secret|token|password|passwd|auth|credential|cert|ssh|api|bearer|client_id|client_secret|private_key|access_key|api_key)[A-Za-z0-9_]*\s*(?:[:=>])\s*["']?([A-Za-z0-9_.\-\/+!@#$%^&*()]{8,})["']?(?:<\/[A-Za-z0-9\-_]+>)?/gi;
+/**
+ * Hunts for unknown secrets by finding suspicious assignments and gating
+ * on Shannon Entropy. If the value is mathematically random (entropy ≥ 3.8),
+ * it is almost certainly a cryptographic secret — mask it.
+ *
+ * This replaces the old hardcoded "Generic Secret Assignment" regex,
+ * making the system future-proof against new token formats.
+ */
+function applyEntropyMasking(text) {
+    let modified = false;
+    const cleanText = text.replace(ENTROPY_ANCHOR_RE, (match, secretValue) => {
+        if (!secretValue) {
+            return match;
+        }
+        const entropy = calculateShannonEntropy(secretValue);
+        // Entropy Gate: high randomness → cryptographic secret → mask
+        if (entropy >= 3.8) {
+            modified = true;
+            return match.replace(secretValue, exports.MASK);
+        }
+        // Low entropy (e.g., password="password123") — leave for Presidio NLP
+        return match;
+    });
+    return { cleanText, wasModified: modified };
 }
 // ────────────────────────────────────────────────────────────────────────────
 // Core regex sanitizer
@@ -199,7 +251,13 @@ function regexSanitize(text) {
             });
         }
     }
-    // Step 2: Shannon entropy scan for bare high-entropy tokens
+    // Step 2: Context-Anchored Entropy Scanner (catches unknown secrets)
+    const entropyResult = applyEntropyMasking(cleanText);
+    cleanText = entropyResult.cleanText;
+    if (entropyResult.wasModified) {
+        modified = true;
+    }
+    // Step 3: Shannon entropy scan for bare high-entropy tokens
     const lines = cleanText.split('\n');
     for (let i = 0; i < lines.length; i++) {
         BARE_TOKEN_RE.lastIndex = 0;

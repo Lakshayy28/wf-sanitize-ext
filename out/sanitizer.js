@@ -44,7 +44,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.MASK = exports.stripAnsiCodes = exports.regexSanitize = exports.getFileCategory = exports.readRulesConfig = void 0;
+exports.applyEntropyMasking = exports.calculateShannonEntropy = exports.MASK = exports.stripAnsiCodes = exports.regexSanitize = exports.getFileCategory = exports.readRulesConfig = void 0;
 exports.sanitizePipeline = sanitizePipeline;
 exports.sanitizeOnly = sanitizeOnly;
 exports.sanitizeAndCache = sanitizeAndCache;
@@ -64,6 +64,8 @@ var regexSanitizer_2 = require("./regexSanitizer");
 Object.defineProperty(exports, "regexSanitize", { enumerable: true, get: function () { return regexSanitizer_2.regexSanitize; } });
 Object.defineProperty(exports, "stripAnsiCodes", { enumerable: true, get: function () { return regexSanitizer_2.stripAnsiCodes; } });
 Object.defineProperty(exports, "MASK", { enumerable: true, get: function () { return regexSanitizer_2.MASK; } });
+Object.defineProperty(exports, "calculateShannonEntropy", { enumerable: true, get: function () { return regexSanitizer_2.calculateShannonEntropy; } });
+Object.defineProperty(exports, "applyEntropyMasking", { enumerable: true, get: function () { return regexSanitizer_2.applyEntropyMasking; } });
 function getPresidioApiUrl() {
     const config = vscode.workspace.getConfiguration('safechat');
     return (config.get('presidioApiUrl') || 'http://localhost:8000').replace(/\/$/, '');
@@ -218,7 +220,7 @@ async function sanitizeOnly(rawText, rulesConfig, fileName) {
     let current = rawText;
     let modified = false;
     let presidioError;
-    // Step 1: Regex dictionary + Shannon entropy
+    // Step 1: Regex dictionary (known patterns) + Entropy scanner (unknown secrets)
     const regResult = (0, regexSanitizer_1.regexSanitize)(current);
     current = regResult.cleanText;
     if (regResult.wasModified) {

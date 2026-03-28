@@ -15,14 +15,14 @@ import * as http from 'http';
 import * as https from 'https';
 
 // ── Module imports ──────────────────────────────────────────────────────────
-import { regexSanitize, terminalSanitize, stripAnsiCodes, hydrateCustomSecrets, MASK } from './regexSanitizer';
+import { regexSanitize, terminalSanitize, stripAnsiCodes, hydrateCustomSecrets, MASK, applyEntropyMasking } from './regexSanitizer';
 import { astSanitize, type AstFormat, type PiiChecker } from './astSanitizer';
 import { getFileCategory, getAstFormat, readRulesConfig, type RulesConfig, type FileCategory, type CustomSecretDef } from './router';
 
 // ── Re-exports for extension.ts ─────────────────────────────────────────────
 export { readRulesConfig, getFileCategory } from './router';
 export type { RulesConfig, FileCategory, CustomSecretDef } from './router';
-export { regexSanitize, stripAnsiCodes, MASK } from './regexSanitizer';
+export { regexSanitize, stripAnsiCodes, MASK, calculateShannonEntropy, applyEntropyMasking } from './regexSanitizer';
 export type { SecretPattern } from './regexSanitizer';
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -217,7 +217,7 @@ export async function sanitizeOnly(
   let modified = false;
   let presidioError: string | undefined;
 
-  // Step 1: Regex dictionary + Shannon entropy
+  // Step 1: Regex dictionary (known patterns) + Entropy scanner (unknown secrets)
   const regResult = regexSanitize(current);
   current = regResult.cleanText;
   if (regResult.wasModified) { modified = true; }
