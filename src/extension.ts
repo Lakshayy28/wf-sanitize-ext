@@ -421,17 +421,22 @@ export function activate(context: vscode.ExtensionContext) {
     handleViewDiff,
   );
 
-  // Register custom safe tools
-  const fileToolDisposable = vscode.lm.registerTool(
-    'safechat_read_file',
-    safeReadFileToolInstance,
-  );
-  const dirToolDisposable = vscode.lm.registerTool(
-    'safechat_read_directory',
-    safeReadDirToolInstance,
-  );
+  // Register custom safe tools (registerTool stable since VS Code 1.96)
+  try {
+    const fileToolDisposable = vscode.lm.registerTool(
+      'safechat_read_file',
+      safeReadFileToolInstance,
+    );
+    const dirToolDisposable = vscode.lm.registerTool(
+      'safechat_read_directory',
+      safeReadDirToolInstance,
+    );
+    context.subscriptions.push(fileToolDisposable, dirToolDisposable);
+  } catch (err) {
+    console.error('[SafeChat] registerTool failed — safe tools unavailable:', err);
+  }
 
-  context.subscriptions.push(participant, diffCmd, fileToolDisposable, dirToolDisposable);
+  context.subscriptions.push(participant, diffCmd);
 }
 
 // ── Native Tool Detection ───────────────────────────────────────────────────

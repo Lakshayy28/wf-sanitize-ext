@@ -9,7 +9,6 @@ presidio_server/**
 **/*.map
 **/*.ts
 !out/**
-node_modules/**
 tsconfig.json
 package-extension.sh
 PACKAGING.md

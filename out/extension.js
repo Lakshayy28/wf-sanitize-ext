@@ -366,10 +366,16 @@ function activate(context) {
     const participant = vscode.chat.createChatParticipant('safecopilot.safeChat', chatRequestHandler);
     participant.iconPath = new vscode.ThemeIcon('shield');
     const diffCmd = vscode.commands.registerCommand('safecopilot.viewDiff', handleViewDiff);
-    // Register custom safe tools
-    const fileToolDisposable = vscode.lm.registerTool('safechat_read_file', safeReadFileToolInstance);
-    const dirToolDisposable = vscode.lm.registerTool('safechat_read_directory', safeReadDirToolInstance);
-    context.subscriptions.push(participant, diffCmd, fileToolDisposable, dirToolDisposable);
+    // Register custom safe tools (registerTool stable since VS Code 1.96)
+    try {
+        const fileToolDisposable = vscode.lm.registerTool('safechat_read_file', safeReadFileToolInstance);
+        const dirToolDisposable = vscode.lm.registerTool('safechat_read_directory', safeReadDirToolInstance);
+        context.subscriptions.push(fileToolDisposable, dirToolDisposable);
+    }
+    catch (err) {
+        console.error('[SafeChat] registerTool failed — safe tools unavailable:', err);
+    }
+    context.subscriptions.push(participant, diffCmd);
 }
 // ── Native Tool Detection ───────────────────────────────────────────────────
 /**
