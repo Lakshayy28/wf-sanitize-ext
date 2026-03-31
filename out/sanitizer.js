@@ -44,7 +44,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.applyEntropyMasking = exports.calculateShannonEntropy = exports.MASK = exports.stripAnsiCodes = exports.regexSanitize = exports.determineSanitizationRoute = exports.getFileCategory = exports.readRulesConfig = void 0;
+exports.applyEntropyMasking = exports.calculateShannonEntropy = exports.MASK = exports.stripAnsiCodes = exports.regexSanitize = exports.getFileCategory = exports.readRulesConfig = void 0;
 exports.sanitizePipeline = sanitizePipeline;
 exports.sanitizeOnly = sanitizeOnly;
 exports.sanitizeAndCache = sanitizeAndCache;
@@ -60,7 +60,6 @@ const router_1 = require("./router");
 var router_2 = require("./router");
 Object.defineProperty(exports, "readRulesConfig", { enumerable: true, get: function () { return router_2.readRulesConfig; } });
 Object.defineProperty(exports, "getFileCategory", { enumerable: true, get: function () { return router_2.getFileCategory; } });
-Object.defineProperty(exports, "determineSanitizationRoute", { enumerable: true, get: function () { return router_2.determineSanitizationRoute; } });
 var regexSanitizer_2 = require("./regexSanitizer");
 Object.defineProperty(exports, "regexSanitize", { enumerable: true, get: function () { return regexSanitizer_2.regexSanitize; } });
 Object.defineProperty(exports, "stripAnsiCodes", { enumerable: true, get: function () { return regexSanitizer_2.stripAnsiCodes; } });
@@ -168,34 +167,23 @@ async function sanitizePipeline(text, mode = 'general') {
 // Smart Router — File-level sanitization (the main entry point)
 // ────────────────────────────────────────────────────────────────────────────
 /**
- * 3-Tier Smart Router + Graceful Degradation Pipeline:
+ * 3-Tier Smart Router:
  *
- *  Blocked:                binary files → reject
  *  Tier 1 (bypass):        source code → pass raw
- *  Tier 2 (tree-sitter):   structured configs → AST key-match + regex fallback
- *  Tier 2B (universal-kv): proprietary KV files → Universal Lexer + regex
- *  Tier 3 (unstructured):  everything else → regex + Presidio NLP
+ *  Tier 2 (ast):           structured configs → AST key-match + regex fallback
+ *  Tier 2B (universal-kv): unknown KV files → Universal Lexer + regex
+ *  Tier 3 (full_dlp):      everything else → regex + Presidio NLP
  *
  * If `fileName` is omitted (e.g., user prompt text), defaults to Tier 3.
  */
 async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
     ensureHydrated(rulesConfig);
-    // ── Route through the Graceful Degradation Pipeline ─────────────────
-    const ext = fileName
-        ? ('.' + (fileName.split('.').pop() ?? '').toLowerCase())
-        : '';
-    const route = fileName
-        ? (0, router_1.determineSanitizationRoute)(rawText, ext, fileSize)
-        : { engine: 'unstructured' };
-    // ── Blocked (binary / corrupt) ──────────────────────────────────────
-    if (route.engine === 'blocked') {
-        return { cleanText: rawText, wasModified: false, presidioError: route.reason };
-    }
-    // ── Tier 1: Bypass (source code) ────────────────────────────────────
+    // ── Determine file category ─────────────────────────────────────────
     const category = fileName
         ? (0, router_1.getFileCategory)(fileName, rawText, rulesConfig)
         : 'full_dlp';
-    if (category === 'bypass' && route.engine !== 'tree-sitter' && route.engine !== 'universal-lexer') {
+    // ── Tier 1: Bypass (source code) ────────────────────────────────────
+    if (category === 'bypass') {
         return { cleanText: rawText, wasModified: false };
     }
     let current = rawText;
@@ -214,43 +202,7 @@ async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
             return value;
         }
     };
-    // ── Tier 2: Tree-sitter (known + sniffed formats) ──────────────────
-    if (route.engine === 'tree-sitter') {
-        const langToFormat = {
-            json: 'json', yaml: 'yaml', bash: 'env',
-            properties: 'properties', xml: 'xml',
-        };
-        const astFormat = (route.language && langToFormat[route.language])
-            ?? (fileName ? (0, router_1.getAstFormat)(fileName) : undefined);
-        if (astFormat) {
-            const astResult = await (0, astSanitizer_1.astSanitize)(current, astFormat, piiCheck);
-            current = astResult.cleanText;
-            modified = astResult.wasModified;
-        }
-        // Regex safety net
-        const regResult = (0, regexSanitizer_1.regexSanitize)(current);
-        current = regResult.cleanText;
-        if (regResult.wasModified) {
-            modified = true;
-        }
-        return { cleanText: current, wasModified: modified, presidioError };
-    }
-    // ── Tier 2B: Universal Lexer (proprietary KV formats) ───────────────
-    if (route.engine === 'universal-lexer') {
-        const kvResult = await (0, astSanitizer_1.sanitizeUniversalKeyValue)(current);
-        current = kvResult.cleanText;
-        if (kvResult.wasModified) {
-            modified = true;
-        }
-        // Regex safety net
-        const regResult = (0, regexSanitizer_1.regexSanitize)(current);
-        current = regResult.cleanText;
-        if (regResult.wasModified) {
-            modified = true;
-        }
-        return { cleanText: current, wasModified: modified, presidioError };
-    }
-    // ── Legacy AST path (Tier 2 files not caught by Content Sniffer) ────
+    // ── Tier 2: AST (structured configs) ────────────────────────────────
     if (category === 'ast') {
         const astFormat = fileName ? (0, router_1.getAstFormat)(fileName) : undefined;
         if (astFormat) {
@@ -258,6 +210,15 @@ async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
             current = astResult.cleanText;
             modified = astResult.wasModified;
         }
+        else {
+            // No known AST format — try Universal KV Lexer
+            const kvResult = await (0, astSanitizer_1.sanitizeUniversalKeyValue)(current);
+            current = kvResult.cleanText;
+            if (kvResult.wasModified) {
+                modified = true;
+            }
+        }
+        // Regex safety net
         const regResult = (0, regexSanitizer_1.regexSanitize)(current);
         current = regResult.cleanText;
         if (regResult.wasModified) {
@@ -265,25 +226,23 @@ async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
         }
         return { cleanText: current, wasModified: modified, presidioError };
     }
-    // ── Tier 3: Mega-Regex + NLP (full_dlp / unstructured) ──────────────
+    // ── Tier 3: Mega-Regex + NLP (full_dlp) ─────────────────────────────
     // Step 1: Regex dictionary + Entropy scanner
     const regResult = (0, regexSanitizer_1.regexSanitize)(current);
     current = regResult.cleanText;
     if (regResult.wasModified) {
         modified = true;
     }
-    // Step 2: Presidio NLP (skip for mega/minified files flagged by router)
-    if (!route.reason?.includes('regex only')) {
-        try {
-            const result = await callPresidioApi(current, rulesConfig);
-            current = result.sanitized_text;
-            if (result.was_modified) {
-                modified = true;
-            }
+    // Step 2: Presidio NLP
+    try {
+        const result = await callPresidioApi(current, rulesConfig);
+        current = result.sanitized_text;
+        if (result.was_modified) {
+            modified = true;
         }
-        catch (err) {
-            presidioError = err instanceof Error ? err.message : String(err);
-        }
+    }
+    catch (err) {
+        presidioError = err instanceof Error ? err.message : String(err);
     }
     return { cleanText: current, wasModified: modified, presidioError };
 }

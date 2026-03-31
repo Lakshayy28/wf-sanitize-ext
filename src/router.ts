@@ -12,18 +12,6 @@ import * as vscode from 'vscode';
 import type { AstFormat } from './astSanitizer';
 
 // ────────────────────────────────────────────────────────────────────────────
-// Sanitization Route — the output of the Content Sniffer
-// ────────────────────────────────────────────────────────────────────────────
-
-export type SanitizationEngine = 'tree-sitter' | 'universal-lexer' | 'unstructured' | 'bypass' | 'blocked';
-
-export interface SanitizationRoute {
-  engine: SanitizationEngine;
-  language?: string;
-  reason?: string;
-}
-
-// ────────────────────────────────────────────────────────────────────────────
 // Safety blocklists
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -81,6 +69,8 @@ const DEFAULT_AST_EXTENSIONS = new Set([
   '.xml', '.npmrc', '.kubeconfig', '.tfvars',
   // Config files
   '.conf', '.cfg', '.config', '.toml',
+  // Tabular data
+  '.csv', '.tsv',
   // Auth/Package Managers
   '.netrc', '.pgpass', '.gemrc', '.yarnrc',
   // Keys/Certs (have key=value structure)
@@ -99,10 +89,89 @@ const DEFAULT_AST_EXTENSIONS = new Set([
 
 /** Tier 3: Full DLP — regex + Shannon entropy + Presidio NLP. */
 const DEFAULT_FULL_DLP_EXTENSIONS = new Set([
-  '.txt', '.md', '.log', '.csv', '.tsv',
+  '.txt', '.md', '.log',
   '.jsonl', '.sql', '.graphql', '.gql',
   '.xsd', '.wsdl', '.rtf',
+  // Terraform state contains secrets under generic keys like "value"
+  '.tfstate',
 ]);
+
+/**
+ * Source-code extensions that should NEVER be scanned.
+ * These are always bypassed — no regex, no Presidio, no AST.
+ */
+const SOURCE_CODE_BYPASS = new Set([
+  // Systems languages
+  '.c', '.h', '.cpp', '.cxx', '.cc', '.hpp', '.hxx', '.hh',
+  '.m', '.mm',               // Objective-C
+  '.rs',                     // Rust
+  '.go',                     // Go
+  '.swift',                  // Swift
+  '.zig',                    // Zig
+  // JVM
+  '.java', '.scala', '.kt', '.groovy', '.clj', '.cljs',
+  // .NET
+  '.cs', '.fs', '.vb',
+  // Web / Frontend
+  '.js', '.mjs', '.cjs', '.jsx',
+  '.ts', '.tsx', '.mts', '.cts',
+  '.vue', '.svelte', '.astro',
+  '.html', '.htm', '.css', '.scss', '.sass', '.less', '.styl',
+  // Scripting (NOT .sh/.bash/.ps1 — those are scanned for env vars)
+  '.py', '.pyi', '.pyw',
+  '.rb', '.erb',
+  '.php', '.phtml',
+  '.pl', '.pm',              // Perl
+  '.lua',
+  '.r', '.rmd',              // R
+  '.jl',                     // Julia
+  // Functional
+  '.hs', '.lhs',             // Haskell
+  '.ml', '.mli',             // OCaml
+  '.ex', '.exs',             // Elixir
+  '.erl', '.hrl',            // Erlang
+  '.elm',                    // Elm
+  '.dart',                   // Dart
+  // Mobile
+  '.kt', '.kts',             // Kotlin (also build scripts)
+  // Assembly / low-level
+  '.asm', '.s',
+  // Misc
+  '.d', '.nim', '.cr', '.v', '.zig',
+  '.proto',                  // Protocol Buffers
+  '.thrift',                 // Thrift IDL
+  '.sol',                    // Solidity
+  '.wgsl', '.glsl', '.hlsl', // Shaders
+  '.cu', '.cuh',             // CUDA
+  '.cmake',                  // CMake
+  '.tcl',                    // Tcl
+  '.ada', '.adb', '.ads',    // Ada
+  '.pas', '.pp',             // Pascal/Delphi
+  '.f', '.f90', '.f95',      // Fortran
+  '.cob', '.cbl',            // COBOL
+  '.lisp', '.el',            // Lisp / Emacs Lisp
+  '.rkt',                    // Racket
+]);
+
+/**
+ * Check whether an extension should be ignored (bypassed without scanning).
+ * Merges the built-in SOURCE_CODE_BYPASS with user-configured extras from
+ * `safechat.ignoreExtensions` setting.
+ */
+function isIgnoredExtension(ext: string): boolean {
+  if (SOURCE_CODE_BYPASS.has(ext)) { return true; }
+  try {
+    const userIgnoreList: string[] =
+      vscode.workspace.getConfiguration('safechat').get<string[]>('ignoreExtensions', []);
+    for (const raw of userIgnoreList) {
+      const normalized = raw.startsWith('.') ? raw.toLowerCase() : '.' + raw.toLowerCase();
+      if (normalized === ext) { return true; }
+    }
+  } catch {
+    // Outside VS Code context (unit tests) — just use built-in set
+  }
+  return false;
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // AST format detection
@@ -120,17 +189,21 @@ const AST_FORMAT_MAP: Record<string, AstFormat> = {
   '.properties': 'properties', '.ini': 'properties', '.cfg': 'properties',
   '.npmrc': 'properties', '.netrc': 'properties', '.pgpass': 'properties',
   '.gemrc': 'properties', '.yarnrc': 'properties',
-  '.conf': 'properties', '.config': 'properties', '.toml': 'properties',
+  '.conf': 'properties', '.config': 'properties',
   '.secret': 'properties', '.editorconfig': 'properties',
+  // TOML
+  '.toml': 'toml',
   // XML
   '.xml': 'xml', '.csproj': 'xml', '.props': 'xml', '.targets': 'xml',
   '.nuspec': 'xml', '.xsd': 'xml', '.wsdl': 'xml',
   // Key file formats (treat as env/properties for key: value lines)
   '.pem': 'env', '.key': 'env', '.cert': 'env', '.crt': 'env',
   '.pub': 'env', '.p12': 'env', '.ppk': 'env', '.cer': 'env', '.asc': 'env',
-  // IaC (HCL is key=value like)
-  '.tf': 'properties', '.tfvars': 'properties', '.hcl': 'properties',
-  '.terraformrc': 'properties',
+  // IaC (HCL)
+  '.tf': 'hcl', '.tfvars': 'hcl', '.hcl': 'hcl',
+  '.terraformrc': 'hcl',
+  // CSV / TSV
+  '.csv': 'csv', '.tsv': 'csv',
   // Build scripts (shell = env format)
   '.sh': 'env', '.bash': 'env', '.zsh': 'env', '.bat': 'env',
   '.cmd': 'env', '.ps1': 'env', '.psm1': 'env',
@@ -147,93 +220,6 @@ export function getAstFormat(fileName: string): AstFormat | undefined {
   return AST_FORMAT_MAP[ext];
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Content Sniffer + Graceful Degradation Pipeline
-// ────────────────────────────────────────────────────────────────────────────
-
-/** Tree-sitter language map for known structured extensions. */
-const TREE_SITTER_LANG_MAP: Record<string, string> = {
-  '.json': 'json',
-  '.yaml': 'yaml', '.yml': 'yaml', '.kubeconfig': 'yaml',
-  '.env': 'bash',
-  '.properties': 'properties', '.ini': 'properties', '.cfg': 'properties',
-  '.npmrc': 'properties', '.netrc': 'properties', '.conf': 'properties',
-  '.xml': 'xml', '.csproj': 'xml', '.props': 'xml', '.targets': 'xml',
-  '.nuspec': 'xml',
-};
-
-/**
- * Determines the sanitization route for a file.
- *
- * Graceful Degradation Pipeline:
- *  1. Block binary files (crash risk)
- *  2. Block mega-files (latency risk) → fast regex only
- *  3. Detect minified files → fast regex only
- *  4. Known extensions → Tree-sitter
- *  5. Content sniff unknown extensions → Tree-sitter spoof
- *  6. Proprietary KV formats → Universal Lexer (Tier 2B)
- *  7. Everything else → Unstructured (Tier 3 regex+NLP)
- */
-export function determineSanitizationRoute(
-  rawText: string,
-  extension: string,
-  fileSize?: number,
-): SanitizationRoute {
-  const ext = extension.toLowerCase();
-
-  // ── Safety Gate 1: Binary blocklist ────────────────────────────────
-  if (BINARY_BLOCKLIST.has(ext)) {
-    return { engine: 'blocked', reason: 'binary file' };
-  }
-
-  // ── Safety Gate 2: Binary content heuristic (NUL bytes) ───────────
-  if (rawText.length > 0 && rawText.indexOf('\0') !== -1) {
-    return { engine: 'blocked', reason: 'binary content detected' };
-  }
-
-  // ── Safety Gate 3: Mega-file check ────────────────────────────────
-  if (fileSize !== undefined && fileSize > MAX_NLP_FILE_SIZE) {
-    return { engine: 'unstructured', reason: 'file exceeds 1 MB — regex only' };
-  }
-
-  // ── Safety Gate 4: Minified file detection ────────────────────────
-  const firstNewline = rawText.indexOf('\n');
-  const firstLineLen = firstNewline === -1 ? rawText.length : firstNewline;
-  if (firstLineLen > MAX_LINE_LENGTH) {
-    return { engine: 'unstructured', reason: 'minified file — regex only' };
-  }
-
-  // ── Step 1: Known Tree-sitter formats ─────────────────────────────
-  if (TREE_SITTER_LANG_MAP[ext]) {
-    return { engine: 'tree-sitter', language: TREE_SITTER_LANG_MAP[ext] };
-  }
-
-  // ── Step 2: Content Sniffer (for unknown extensions) ──────────────
-  const firstChunk = rawText.substring(0, 500).trim();
-
-  if (firstChunk.startsWith('{') || firstChunk.startsWith('[')) {
-    return { engine: 'tree-sitter', language: 'json' };
-  }
-  if (firstChunk.startsWith('<?xml') || /^<[a-zA-Z][a-zA-Z0-9]*[\s>]/.test(firstChunk)) {
-    return { engine: 'tree-sitter', language: 'xml' };
-  }
-  if (firstChunk.startsWith('#!/')) {
-    return { engine: 'tree-sitter', language: 'bash' };
-  }
-  // YAML heuristic: first non-blank line is `key: value`
-  if (/^[a-zA-Z0-9_-]+:\s/.test(firstChunk)) {
-    return { engine: 'tree-sitter', language: 'yaml' };
-  }
-
-  // ── Step 3: Universal Lexer (proprietary KV formats) ──────────────
-  // Matches: KEY = VAL, KEY: VAL, KEY -> VAL, KEY >> VAL
-  if (/^[a-zA-Z0-9_.-]+\s*(?:[:=]|->|>>)\s*.+$/m.test(firstChunk)) {
-    return { engine: 'universal-lexer' };
-  }
-
-  // ── Step 4: Unstructured fallback (Tier 3) ────────────────────────
-  return { engine: 'unstructured' };
-}
 
 /**
  * Legacy content sniffer — maps unknown content to FileCategory.
@@ -283,6 +269,12 @@ export function getFileCategory(
   content?: string,
   config?: RulesConfig,
 ): FileCategory {
+  // Source code bypass — always skip scanning for known code extensions
+  const ext = extractExtension(fileName);
+  if (ext && isIgnoredExtension(ext)) {
+    return 'bypass';
+  }
+
   // Build working sets from defaults + user config
   const astSet = new Set(DEFAULT_AST_EXTENSIONS);
   const dlpSet = new Set(DEFAULT_FULL_DLP_EXTENSIONS);
@@ -301,7 +293,6 @@ export function getFileCategory(
   }
 
   // Extract extension
-  const ext = extractExtension(fileName);
   const basename = fileName.split(/[/\\]/).pop()?.toLowerCase() ?? '';
 
   // Check extensionless filenames

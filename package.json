@@ -119,6 +119,14 @@
           ],
           "default": "prompt",
           "markdownDescription": "Control how @safechat handles Language Model requests to read files or directories outside the current workspace.\n\n- `prompt` — Show a warning dialog asking the user to allow or deny (default).\n- `autoAllow` — Silently allow all external reads (for autopilot / auto-approval workflows).\n- `autoDeny` — Silently deny all external reads."
+        },
+        "safechat.ignoreExtensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Additional file extensions to bypass (never scan). Source code extensions (`.ts`, `.py`, `.java`, etc.) are already ignored by default.\n\nExample:\n```json\n[\"myext\", \".custom\"]\n```"
         }
       }
     }
@@ -130,19 +138,11 @@
     "lint": "eslint src --ext ts"
   },
   "devDependencies": {
-    "@tree-sitter-grammars/tree-sitter-yaml": "^0.7.1",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.90.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
     "eslint": "^8.56.0",
-    "tree-sitter-cli": "^0.26.7",
-    "tree-sitter-json": "^0.24.8",
-    "tree-sitter-properties": "^0.3.0",
-    "tree-sitter-yaml": "^0.5.0",
     "typescript": "^5.3.0"
-  },
-  "dependencies": {
-    "web-tree-sitter": "^0.26.7"
   }
 }

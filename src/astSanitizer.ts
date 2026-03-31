@@ -9,7 +9,6 @@
  */
 
 import { MASK, isSensitiveKey } from './regexSanitizer';
-import { getTreeSitterParser, isTreeSitterReady } from './treeSitterManager';
 
 // ────────────────────────────────────────────────────────────────────────────
 // AST-to-Presidio Bridge
@@ -31,7 +30,7 @@ async function processAstValue(key: string, value: string, piiCheck?: PiiChecker
   }
 
   // 2. SAFE PATH: Skip Presidio for structural keys to prevent hallucinations
-  const IGNORE_KEYS = /^(version|id|lineage|serial|name|type|kind|namespace|replicas|image|ami)$/i;
+  const IGNORE_KEYS = /^(version|id|lineage|serial|type|kind|namespace|replicas|image|ami)$/i;
   if (IGNORE_KEYS.test(key.trim())) {
     return value;
   }
@@ -44,91 +43,15 @@ async function processAstValue(key: string, value: string, piiCheck?: PiiChecker
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// JSON Parser — Tree-sitter CST Engine with JSON.parse Fallback
+// JSON Parser — JSON.parse Engine
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Sanitize JSON using Tree-sitter's CST for lossless structure preservation.
- * Falls back to JSON.parse if Tree-sitter JSON grammar is not available.
- *
- * CST approach: finds every `pair` node, extracts the key's bare text via
- * the `string_content` child, masks the value at exact byte offsets.
- * Comments (JSONC), trailing commas, and formatting are preserved.
+ * Sanitize JSON by parsing with JSON.parse, walking the resulting object tree,
+ * and masking string values whose keys match the sensitive-key list.
+ * Returns null if the input is not valid JSON (caller should fall back).
  */
 export async function sanitizeJson(
-  text: string,
-  piiCheck?: PiiChecker,
-): Promise<{ cleanText: string; wasModified: boolean } | null> {
-  // Try Tree-sitter first
-  if (isTreeSitterReady('json')) {
-    try {
-      return await sanitizeJsonTreeSitter(text, piiCheck);
-    } catch {
-      // Fall through to legacy parser
-    }
-  }
-  return sanitizeJsonFallback(text, piiCheck);
-}
-
-/**
- * Tree-sitter CST engine for JSON.
- * Walks all `pair` nodes, masks string values at inner byte offsets (preserves quotes).
- */
-async function sanitizeJsonTreeSitter(
-  rawText: string,
-  piiCheck?: PiiChecker,
-): Promise<{ cleanText: string; wasModified: boolean } | null> {
-  const parser = getTreeSitterParser('json');
-  const tree = parser.parse(rawText);
-  if (!tree) { return null; }
-
-  const pairs = tree.rootNode.descendantsOfType('pair');
-  type Replacement = { start: number; end: number; text: string };
-  const replacements: Replacement[] = [];
-
-  for (const pair of pairs) {
-    const keyNode = pair.childForFieldName('key');
-    const valueNode = pair.childForFieldName('value');
-    if (!keyNode || !valueNode) { continue; }
-
-    // Extract bare key text from string_content (strips quotes)
-    const keyContent = keyNode.namedChildren.find(c => c.type === 'string_content');
-    const keyText = keyContent ? keyContent.text : keyNode.text;
-
-    // Only mask string values (numbers, bools, null, objects, arrays are not secrets)
-    if (valueNode.type === 'string') {
-      const valContent = valueNode.namedChildren.find(c => c.type === 'string_content');
-      if (!valContent || valContent.text.length === 0) { continue; }
-
-      const bareValue = valContent.text;
-      const masked = await processAstValue(keyText, bareValue, piiCheck);
-      if (masked !== bareValue) {
-        replacements.push({ start: valContent.startIndex, end: valContent.endIndex, text: masked });
-      }
-    }
-    // Objects and arrays are handled implicitly — descendantsOfType('pair') recurses into them
-  }
-
-  if (replacements.length === 0) {
-    return { cleanText: rawText, wasModified: false };
-  }
-
-  // Sort descending by start offset so replacements don't shift earlier offsets
-  replacements.sort((a, b) => b.start - a.start);
-
-  let result = rawText;
-  for (const r of replacements) {
-    result = result.slice(0, r.start) + r.text + result.slice(r.end);
-  }
-
-  return { cleanText: result, wasModified: true };
-}
-
-/**
- * Legacy JSON.parse fallback — used when Tree-sitter JSON grammar is unavailable.
- * Loses comments and original formatting.
- */
-async function sanitizeJsonFallback(
   text: string,
   piiCheck?: PiiChecker,
 ): Promise<{ cleanText: string; wasModified: boolean } | null> {
@@ -184,120 +107,14 @@ function detectJsonIndent(text: string): number {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// YAML Parser — Tree-sitter CST Engine with Regex Fallback
+// YAML Parser — Regex Engine
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Sanitize YAML using Tree-sitter CST for lossless structure preservation.
- * Falls back to regex line-by-line parser if the YAML grammar is unavailable.
- *
- * CST approach: finds every `block_mapping_pair` node, extracts key via
- * `childForFieldName('key')`, masks string values at exact byte offsets.
- * Comments, indentation, anchors, and block scalars are preserved.
+ * Sanitize YAML by splitting into lines, matching `key: value` patterns,
+ * and masking string values whose keys match the sensitive-key list.
  */
 export async function sanitizeYaml(
-  text: string,
-  piiCheck?: PiiChecker,
-): Promise<{ cleanText: string; wasModified: boolean }> {
-  // Try Tree-sitter first
-  if (isTreeSitterReady('yaml')) {
-    try {
-      return await sanitizeYamlTreeSitter(text, piiCheck);
-    } catch {
-      // Fall through to legacy parser
-    }
-  }
-  return sanitizeYamlRegexFallback(text, piiCheck);
-}
-
-/**
- * Tree-sitter CST engine for YAML.
- * Walks all `block_mapping_pair` nodes (automatically recurses into nested mappings).
- * Masks scalar values at inner byte offsets — preserves quotes on quoted scalars.
- */
-async function sanitizeYamlTreeSitter(
-  rawText: string,
-  piiCheck?: PiiChecker,
-): Promise<{ cleanText: string; wasModified: boolean }> {
-  const parser = getTreeSitterParser('yaml');
-  const tree = parser.parse(rawText);
-  if (!tree) { return sanitizeYamlRegexFallback(rawText, piiCheck); }
-
-  // block_mapping_pair covers top-level + nested KV pairs automatically
-  const pairs = tree.rootNode.descendantsOfType('block_mapping_pair');
-  type Replacement = { start: number; end: number; text: string };
-  const replacements: Replacement[] = [];
-
-  for (const pair of pairs) {
-    const keyNode = pair.childForFieldName('key');
-    const valueNode = pair.childForFieldName('value');
-    if (!keyNode || !valueNode) { continue; }
-
-    const keyText = keyNode.text.trim();
-
-    // Drill into the value node's first named child to determine the scalar type
-    const scalar = valueNode.namedChildren[0];
-    if (!scalar) { continue; }
-
-    let bareValue: string;
-    let innerStart: number;
-    let innerEnd: number;
-
-    switch (scalar.type) {
-      case 'plain_scalar':
-        // Unquoted value — offsets are exact
-        bareValue = scalar.text;
-        innerStart = scalar.startIndex;
-        innerEnd = scalar.endIndex;
-        break;
-
-      case 'double_quote_scalar':
-        // "value" — strip outer quotes for the bare value
-        bareValue = scalar.text.slice(1, -1);
-        innerStart = scalar.startIndex + 1;
-        innerEnd = scalar.endIndex - 1;
-        break;
-
-      case 'single_quote_scalar':
-        // 'value' — strip outer quotes
-        bareValue = scalar.text.slice(1, -1);
-        innerStart = scalar.startIndex + 1;
-        innerEnd = scalar.endIndex - 1;
-        break;
-
-      default:
-        // block_sequence, block_mapping, boolean_scalar, integer_scalar,
-        // float_scalar, null_scalar — skip (not maskable or handled via recursion)
-        continue;
-    }
-
-    if (bareValue.length === 0) { continue; }
-
-    const masked = await processAstValue(keyText, bareValue, piiCheck);
-    if (masked !== bareValue) {
-      replacements.push({ start: innerStart, end: innerEnd, text: masked });
-    }
-  }
-
-  if (replacements.length === 0) {
-    return { cleanText: rawText, wasModified: false };
-  }
-
-  // Sort descending by start offset so replacements don't shift earlier offsets
-  replacements.sort((a, b) => b.start - a.start);
-
-  let result = rawText;
-  for (const r of replacements) {
-    result = result.slice(0, r.start) + r.text + result.slice(r.end);
-  }
-
-  return { cleanText: result, wasModified: true };
-}
-
-/**
- * Regex-based fallback for YAML — used when Tree-sitter YAML grammar is unavailable.
- */
-async function sanitizeYamlRegexFallback(
   text: string,
   piiCheck?: PiiChecker,
 ): Promise<{ cleanText: string; wasModified: boolean }> {
@@ -363,102 +180,14 @@ async function sanitizeYamlRegexFallback(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// ENV Parser (.env files) — Tree-sitter CST Engine
+// ENV Parser (.env files) — Regex Engine
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Sanitize .env files using Tree-sitter's Concrete Syntax Tree.
- *
- * The parser produces a lossless CST from the Bash grammar where every
- * `variable_assignment` node has typed `name` and `value` children with
- * exact byte offsets. We replace *only* the value bytes — comments,
- * whitespace, quotes, and keys are never touched.
- *
- * Falls back to the regex-based parser if Tree-sitter is not initialized
- * (e.g., WASM failed to load).
+ * Sanitize .env files by splitting into lines, matching KEY=VALUE patterns,
+ * and masking values whose keys match the sensitive-key list.
  */
 export async function sanitizeEnv(rawText: string): Promise<{ cleanText: string; wasModified: boolean }> {
-  // Graceful fallback if Tree-sitter isn't available
-  if (!isTreeSitterReady('bash')) {
-    return sanitizeEnvRegexFallback(rawText);
-  }
-
-  const parser = getTreeSitterParser('bash');
-  const tree = parser.parse(rawText);
-  if (!tree) {
-    return sanitizeEnvRegexFallback(rawText);
-  }
-
-  // Collect all variable_assignment nodes (includes those inside `export`)
-  const assignments = tree.rootNode.descendantsOfType('variable_assignment');
-
-  // Build replacement list: { startIndex, endIndex, newText }
-  type Replacement = { start: number; end: number; text: string };
-  const replacements: Replacement[] = [];
-
-  for (const node of assignments) {
-    const nameNode = node.childForFieldName('name');
-    const valueNode = node.childForFieldName('value');
-    if (!nameNode || !valueNode) { continue; }
-
-    const keyText = nameNode.text;
-
-    // Extract the bare value (strip outer quotes if present)
-    const valueType = valueNode.type; // 'word', 'string', 'raw_string', 'number', etc.
-    let bareValue: string;
-    let innerStart: number;
-    let innerEnd: number;
-
-    if (valueType === 'string') {
-      // Double-quoted: "value" → inner string_content child has the bare text
-      const content = valueNode.namedChildren.find(c => c.type === 'string_content');
-      if (content) {
-        bareValue = content.text;
-        innerStart = content.startIndex;
-        innerEnd = content.endIndex;
-      } else {
-        // Empty string "" — nothing to mask
-        continue;
-      }
-    } else if (valueType === 'raw_string') {
-      // Single-quoted: 'value' → strip outer quotes from the byte range
-      bareValue = valueNode.text.slice(1, -1);
-      innerStart = valueNode.startIndex + 1;
-      innerEnd = valueNode.endIndex - 1;
-    } else {
-      // Unquoted word, number, etc. — full text is the value
-      bareValue = valueNode.text;
-      innerStart = valueNode.startIndex;
-      innerEnd = valueNode.endIndex;
-    }
-
-    if (bareValue.length === 0) { continue; }
-
-    const masked = await processAstValue(keyText, bareValue);
-    if (masked !== bareValue) {
-      replacements.push({ start: innerStart, end: innerEnd, text: masked });
-    }
-  }
-
-  if (replacements.length === 0) {
-    return { cleanText: rawText, wasModified: false };
-  }
-
-  // Sort by startIndex DESCENDING so replacements don't invalidate earlier offsets
-  replacements.sort((a, b) => b.start - a.start);
-
-  let result = rawText;
-  for (const r of replacements) {
-    result = result.slice(0, r.start) + r.text + result.slice(r.end);
-  }
-
-  return { cleanText: result, wasModified: true };
-}
-
-/**
- * Regex-based fallback for .env parsing — used when Tree-sitter is unavailable.
- */
-async function sanitizeEnvRegexFallback(rawText: string): Promise<{ cleanText: string; wasModified: boolean }> {
   let modified = false;
   const lines = rawText.split('\n');
 
@@ -484,79 +213,13 @@ async function sanitizeEnvRegexFallback(rawText: string): Promise<{ cleanText: s
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Properties / INI Parser — Tree-sitter CST Engine with Regex Fallback
+// Properties / INI Parser — Regex Engine
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Sanitize .properties / .ini files using Tree-sitter CST.
- * Falls back to regex-based parser if the Properties grammar is unavailable.
+ * Sanitize .properties / .ini files using regex line-by-line matching.
  */
 export async function sanitizeProperties(
-  text: string,
-  piiCheck?: PiiChecker,
-): Promise<{ cleanText: string; wasModified: boolean }> {
-  // Try Tree-sitter first
-  if (isTreeSitterReady('properties')) {
-    try {
-      return await sanitizePropertiesTreeSitter(text, piiCheck);
-    } catch {
-      // Fall through to legacy parser
-    }
-  }
-  return sanitizePropertiesRegexFallback(text, piiCheck);
-}
-
-/**
- * Tree-sitter CST engine for .properties files.
- * Walks `property` nodes, extracts `key` and `value` typed children,
- * masks values at exact byte offsets.
- */
-async function sanitizePropertiesTreeSitter(
-  rawText: string,
-  piiCheck?: PiiChecker,
-): Promise<{ cleanText: string; wasModified: boolean }> {
-  const parser = getTreeSitterParser('properties');
-  const tree = parser.parse(rawText);
-  if (!tree) { return sanitizePropertiesRegexFallback(rawText, piiCheck); }
-
-  const properties = tree.rootNode.descendantsOfType('property');
-  type Replacement = { start: number; end: number; text: string };
-  const replacements: Replacement[] = [];
-
-  for (const prop of properties) {
-    const keyNode = prop.namedChildren.find(c => c.type === 'key');
-    const valueNode = prop.namedChildren.find(c => c.type === 'value');
-    if (!keyNode || !valueNode) { continue; }
-
-    const keyText = keyNode.text.trim();
-    const bareValue = valueNode.text.trim();
-    if (bareValue.length === 0) { continue; }
-
-    const masked = await processAstValue(keyText, bareValue, piiCheck);
-    if (masked !== bareValue) {
-      replacements.push({ start: valueNode.startIndex, end: valueNode.endIndex, text: masked });
-    }
-  }
-
-  if (replacements.length === 0) {
-    return { cleanText: rawText, wasModified: false };
-  }
-
-  // Sort descending by start offset
-  replacements.sort((a, b) => b.start - a.start);
-
-  let result = rawText;
-  for (const r of replacements) {
-    result = result.slice(0, r.start) + r.text + result.slice(r.end);
-  }
-
-  return { cleanText: result, wasModified: true };
-}
-
-/**
- * Regex-based fallback for .properties/.ini parsing.
- */
-async function sanitizePropertiesRegexFallback(
   text: string,
   piiCheck?: PiiChecker,
 ): Promise<{ cleanText: string; wasModified: boolean }> {
@@ -564,7 +227,7 @@ async function sanitizePropertiesRegexFallback(
   const lines = text.split('\n');
   const result: string[] = [];
 
-  const PROP_RE = /^(\s*[A-Za-z0-9_.\-]+)\s*([=:])\s*(.*)$/;
+  const PROP_RE = /^(\s*[A-Za-z0-9_.\-]+)(\s*[=:]\s*)(.*)$/;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -579,7 +242,8 @@ async function sanitizePropertiesRegexFallback(
       const keyName = keyPart.trim();
       const trimVal = valuePart.trim();
 
-      if (trimVal.length > 0) {
+      // Skip structural characters (block openers/closers in Gradle, HCL, etc.)
+      if (trimVal.length > 0 && !/^[{}\[\]()]$/.test(trimVal)) {
         const cleaned = await processAstValue(keyName, trimVal, piiCheck);
         if (cleaned !== trimVal) {
           result.push(`${keyPart}${sep}${cleaned}`);
@@ -599,7 +263,7 @@ async function sanitizePropertiesRegexFallback(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// XML Parser (lightweight, regex-based key-value tag masking)
+// XML Parser — Regex Engine
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -657,6 +321,149 @@ export async function sanitizeXml(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// TOML Parser — Reuses Properties Regex Engine
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Sanitize TOML files using the properties regex parser.
+ * TOML's `key = value` syntax is compatible with the properties regex engine.
+ */
+export async function sanitizeToml(
+  rawText: string,
+  piiCheck?: PiiChecker,
+): Promise<{ cleanText: string; wasModified: boolean }> {
+  return sanitizeProperties(rawText, piiCheck);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// HCL Parser — Reuses Properties Regex Engine
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Sanitize HCL files (.tf, .tfvars, .hcl) using the properties regex parser.
+ * HCL's `key = value` syntax is compatible with the properties regex engine.
+ * The structural character guard prevents `{` / `}` corruption.
+ */
+export async function sanitizeHcl(
+  rawText: string,
+  piiCheck?: PiiChecker,
+): Promise<{ cleanText: string; wasModified: boolean }> {
+  return sanitizeProperties(rawText, piiCheck);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// CSV / TSV Parser — Header-based Column Sanitizer
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Sanitize CSV/TSV files by treating the header row as keys and each data
+ * cell as a value.  Runs every cell through processAstValue so that
+ * columns like "password", "ssn", "api_key" get masked automatically and
+ * other values go through Presidio PII detection.
+ */
+export async function sanitizeCsv(
+  rawText: string,
+  piiCheck?: PiiChecker,
+): Promise<{ cleanText: string; wasModified: boolean }> {
+  const lines = rawText.split('\n');
+  if (lines.length < 2) {
+    // Need at least a header + one data row
+    return { cleanText: rawText, wasModified: false };
+  }
+
+  // Detect delimiter: tab-first, then comma
+  const delimiter = lines[0].includes('\t') ? '\t' : ',';
+
+  // Parse header row (strip surrounding quotes)
+  const headers = parseCsvRow(lines[0], delimiter);
+  if (headers.length === 0) {
+    return { cleanText: rawText, wasModified: false };
+  }
+
+  let modified = false;
+  const resultLines: string[] = [lines[0]]; // keep header unchanged
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    // Preserve blank lines / trailing newline
+    if (line.trim().length === 0) {
+      resultLines.push(line);
+      continue;
+    }
+
+    const cells = parseCsvRow(line, delimiter);
+    const cleanedCells: string[] = [];
+
+    for (let col = 0; col < cells.length; col++) {
+      const header = col < headers.length ? headers[col] : `col_${col}`;
+      const cell = cells[col];
+      if (cell.trim().length > 0) {
+        const cleaned = await processAstValue(header, cell, piiCheck);
+        if (cleaned !== cell) { modified = true; }
+        cleanedCells.push(cleaned);
+      } else {
+        cleanedCells.push(cell);
+      }
+    }
+
+    // Rebuild the line — quote cells that contain the delimiter or quotes
+    resultLines.push(cleanedCells.map(c => csvQuote(c, delimiter)).join(delimiter));
+  }
+
+  return { cleanText: resultLines.join('\n'), wasModified: modified };
+}
+
+/** Parse a single CSV row respecting quoted fields. */
+function parseCsvRow(row: string, delimiter: string): string[] {
+  const cells: string[] = [];
+  let i = 0;
+  while (i <= row.length) {
+    if (i === row.length) { cells.push(''); break; }
+    if (row[i] === '"') {
+      // Quoted field
+      let j = i + 1;
+      let value = '';
+      while (j < row.length) {
+        if (row[j] === '"') {
+          if (j + 1 < row.length && row[j + 1] === '"') {
+            value += '"';
+            j += 2;
+          } else {
+            j++; // closing quote
+            break;
+          }
+        } else {
+          value += row[j];
+          j++;
+        }
+      }
+      cells.push(value);
+      // Skip delimiter after closing quote
+      if (j < row.length && row[j] === delimiter) { j++; }
+      i = j;
+    } else {
+      // Unquoted field
+      const end = row.indexOf(delimiter, i);
+      if (end === -1) {
+        cells.push(row.substring(i));
+        break;
+      }
+      cells.push(row.substring(i, end));
+      i = end + 1;
+    }
+  }
+  return cells;
+}
+
+/** Quote a CSV cell if it contains the delimiter, quotes, or newlines. */
+function csvQuote(cell: string, delimiter: string): string {
+  if (cell.includes(delimiter) || cell.includes('"') || cell.includes('\n')) {
+    return '"' + cell.replace(/"/g, '""') + '"';
+  }
+  return cell;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Tier 2B: Universal Key-Value Lexer (proprietary config fallback)
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -706,7 +513,7 @@ export async function sanitizeUniversalKeyValue(
 // Dispatcher
 // ────────────────────────────────────────────────────────────────────────────
 
-export type AstFormat = 'json' | 'yaml' | 'env' | 'properties' | 'xml';
+export type AstFormat = 'json' | 'yaml' | 'env' | 'properties' | 'xml' | 'toml' | 'hcl' | 'csv';
 
 /**
  * Route to the correct AST parser based on the detected format.
@@ -731,6 +538,12 @@ export async function astSanitize(
       return sanitizeProperties(text, piiCheck);
     case 'xml':
       return sanitizeXml(text, piiCheck);
+    case 'toml':
+      return sanitizeToml(text, piiCheck);
+    case 'hcl':
+      return sanitizeHcl(text, piiCheck);
+    case 'csv':
+      return sanitizeCsv(text, piiCheck);
     default:
       return { cleanText: text, wasModified: false };
   }

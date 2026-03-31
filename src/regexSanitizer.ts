@@ -14,10 +14,16 @@ import type { CustomSecretDef } from './router';
 // ────────────────────────────────────────────────────────────────────────────
 
 export let DYNAMIC_AST_KEYS: string[] = [
+  // Infrastructure secrets
   'secret', 'token', 'password', 'passwd', 'auth', 'credential',
   'cert', 'ssh', 'bearer', 'client_id', 'client_secret', 'private',
   'jwt', 'session', 'encryption_key', 'access_key', 'secret_key',
   'api_key', 'apikey', 'private_key',
+  // PII identifiers (catches SSN/CC/IBAN values under labeled keys)
+  'ssn', 'social_security', 'credit_card', 'card_number', 'card_no',
+  'cvv', 'iban', 'bank_account', 'account_number', 'routing_number',
+  'national_id', 'passport', 'driver_license', 'drivers_license',
+  'dob', 'date_of_birth', 'birth_date',
 ];
 
 /**
@@ -85,10 +91,18 @@ export const HIGH_CONFIDENCE_SECRETS: SecretPattern[] = [
   { name: 'Pgpass Password', regex: /^(?:[^:\r\n]+:){4}([^:\r\n]+)$/gm },
 
   // ── Tier 3 PII Fallback (for scripts/certs that bypass Presidio NLP) ──────
-  { name: 'IPv4 Address', regex: /\b((?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g },
+  // SSN: matches xxx-xx-xxxx (no Luhn needed — Presidio misses test/mock SSNs)
+  { name: 'US SSN', regex: /\b(\d{3}-\d{2}-\d{4})\b/g },
+  // Credit Card: 13-19 digit sequences, with optional dashes/spaces (no Luhn — catches test data)
+  { name: 'Credit Card Number', regex: /\b(\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{1,7})\b/g },
+  // IBAN: 2 uppercase letters + 2 check digits + 11-30 alphanumeric
+  { name: 'IBAN Code', regex: /\b([A-Z]{2}\d{2}[A-Z0-9]{11,30})\b/g },
+  // IPv4: whole-match replacement (no capture group to avoid partial masking)
+  { name: 'IPv4 Address', regex: /\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g },
   { name: 'MAC Address', regex: /\b([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})\b/g },
   { name: 'Email Address', regex: /\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/g },
-  { name: 'Phone Number Fallback', regex: /\b(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g },
+  // Phone: whole-match replacement (no partial capture group)
+  { name: 'Phone Number Fallback', regex: /(?:\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g },
 ];
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -239,6 +253,8 @@ export function applyEntropyMasking(text: string): { cleanText: string; wasModif
 
   const cleanText = text.replace(ENTROPY_ANCHOR_RE, (match, secretValue: string) => {
     if (!secretValue) { return match; }
+    // Skip if already masked
+    if (match.includes(MASK)) { return match; }
 
     const entropy = calculateShannonEntropy(secretValue);
 
@@ -289,6 +305,8 @@ export function regexSanitize(text: string): { cleanText: string; wasModified: b
     } else {
       // Standard handler: Group 1 isolation (mask only the captured secret)
       cleanText = cleanText.replace(rule.regex, (match, group1?: string) => {
+        // Skip if already masked (prevents double-masking when regex safety net runs after AST)
+        if (match.includes(MASK)) { return match; }
         modified = true;
         if (group1) {
           return match.replace(group1, MASK);
@@ -308,6 +326,7 @@ export function regexSanitize(text: string): { cleanText: string; wasModified: b
   for (let i = 0; i < lines.length; i++) {
     BARE_TOKEN_RE.lastIndex = 0;
     lines[i] = lines[i].replace(BARE_TOKEN_RE, (full, captured: string) => {
+      if (full.includes(MASK)) { return full; }
       if (SAFE_TOKEN_PREFIXES.some(re => re.test(captured))) { return full; }
       if (looksLikeSecret(captured)) {
         modified = true;
