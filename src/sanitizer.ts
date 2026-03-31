@@ -15,7 +15,7 @@ import * as http from 'http';
 import * as https from 'https';
 
 // ── Module imports ──────────────────────────────────────────────────────────
-import { regexSanitize, terminalSanitize, stripAnsiCodes, hydrateCustomSecrets, MASK, applyEntropyMasking } from './regexSanitizer';
+import { regexSanitize, terminalSanitize, stripAnsiCodes, hydrateCustomSecrets, MASK, applyEntropyMasking, DYNAMIC_AST_KEYS } from './regexSanitizer';
 import { astSanitize, sanitizeUniversalKeyValue, type AstFormat, type PiiChecker } from './astSanitizer';
 import {
   getFileCategory, getAstFormat, readRulesConfig,
@@ -110,10 +110,25 @@ function callPresidioApi(text: string, rulesConfig?: RulesConfig): Promise<Sanit
 // ────────────────────────────────────────────────────────────────────────────
 
 let _hydrated = false;
+let _hydratedConfigHash = '';
+
 function ensureHydrated(config?: RulesConfig): void {
-  if (_hydrated || !config?.custom_secrets) { return; }
-  hydrateCustomSecrets(config.custom_secrets);
+  const configHash = JSON.stringify(config?.custom_secrets ?? []);
+  if (_hydrated && configHash === _hydratedConfigHash) { return; }
+  if (!config?.custom_secrets) { _hydrated = true; _hydratedConfigHash = configHash; return; }
+  // Only push custom AST keys (server handles the regex patterns)
+  for (const def of config.custom_secrets) {
+    if (def.ast_keys) {
+      for (const k of def.ast_keys) {
+        const lower = k.toLowerCase();
+        if (!DYNAMIC_AST_KEYS.includes(lower)) {
+          DYNAMIC_AST_KEYS.push(lower);
+        }
+      }
+    }
+  }
   _hydrated = true;
+  _hydratedConfigHash = configHash;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

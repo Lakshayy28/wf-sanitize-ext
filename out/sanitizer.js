@@ -1,13 +1,15 @@
 "use strict";
 /**
- * sanitizer.ts — Thin Orchestrator
- * =================================
- * Wires the 3-Tier Smart Routing Architecture together:
+ * sanitizer.ts — Thin Orchestrator (Server-Delegated)
+ * =====================================================
+ * Routes files via the 3-Tier Smart Router, then delegates ALL masking
+ * to the Python Heavy Brain server via /api/sanitize/batch.
  *
  *   Tier 1 (Bypass)  → source code, passed raw
- *   Tier 2 (AST)     → structured configs → astSanitizer + regexSanitize fallback
- *   Tier 3 (Full DLP)→ unstructured text → regexSanitize + Presidio NLP
+ *   Tier 2 (AST)     → structured configs → AST parsers extract values → server masks them
+ *   Tier 3 (Full DLP)→ raw text sent to server in one shot
  *
+ * ZERO sanitization logic lives here — the server runs Presidio NLP + regex + entropy.
  * Re-exports all types and functions that extension.ts needs.
  */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
@@ -44,15 +46,14 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.applyEntropyMasking = exports.calculateShannonEntropy = exports.MASK = exports.stripAnsiCodes = exports.regexSanitize = exports.getFileCategory = exports.readRulesConfig = void 0;
+exports.applyEntropyMasking = exports.calculateShannonEntropy = exports.MASK = exports.stripAnsiCodes = exports.getFileCategory = exports.readRulesConfig = void 0;
 exports.sanitizePipeline = sanitizePipeline;
 exports.sanitizeOnly = sanitizeOnly;
 exports.sanitizeAndCache = sanitizeAndCache;
 exports.viewDiffCommand = viewDiffCommand;
 const vscode = __importStar(require("vscode"));
-const http = __importStar(require("http"));
-const https = __importStar(require("https"));
 // ── Module imports ──────────────────────────────────────────────────────────
+const apiClient_1 = require("./apiClient");
 const regexSanitizer_1 = require("./regexSanitizer");
 const astSanitizer_1 = require("./astSanitizer");
 const router_1 = require("./router");
@@ -61,123 +62,132 @@ var router_2 = require("./router");
 Object.defineProperty(exports, "readRulesConfig", { enumerable: true, get: function () { return router_2.readRulesConfig; } });
 Object.defineProperty(exports, "getFileCategory", { enumerable: true, get: function () { return router_2.getFileCategory; } });
 var regexSanitizer_2 = require("./regexSanitizer");
-Object.defineProperty(exports, "regexSanitize", { enumerable: true, get: function () { return regexSanitizer_2.regexSanitize; } });
 Object.defineProperty(exports, "stripAnsiCodes", { enumerable: true, get: function () { return regexSanitizer_2.stripAnsiCodes; } });
 Object.defineProperty(exports, "MASK", { enumerable: true, get: function () { return regexSanitizer_2.MASK; } });
 Object.defineProperty(exports, "calculateShannonEntropy", { enumerable: true, get: function () { return regexSanitizer_2.calculateShannonEntropy; } });
 Object.defineProperty(exports, "applyEntropyMasking", { enumerable: true, get: function () { return regexSanitizer_2.applyEntropyMasking; } });
-function getPresidioApiUrl() {
-    const config = vscode.workspace.getConfiguration('safechat');
-    return (config.get('presidioApiUrl') || 'http://localhost:8000').replace(/\/$/, '');
-}
+// ────────────────────────────────────────────────────────────────────────────
+// Server availability gate (cached health check)
+// ────────────────────────────────────────────────────────────────────────────
+let _healthCacheTime = 0;
+let _healthCacheResult = false;
+const HEALTH_CACHE_TTL = 5_000; // 5 seconds
 /**
- * Calls the `/sanitize` endpoint on the running Presidio HTTP server.
- * Used only by Tier 3 (full_dlp) and terminal/search pipeline.
+ * Cached server health check. Returns true if the Heavy Brain server is
+ * reachable, false otherwise. Re-checks at most every 5 seconds.
  */
-function callPresidioApi(text, rulesConfig) {
-    return new Promise((resolve, reject) => {
-        const baseUrl = getPresidioApiUrl();
-        let urlObj;
-        try {
-            urlObj = new URL('/sanitize', baseUrl);
-        }
-        catch {
-            reject(new Error(`Invalid presidioApiUrl: ${baseUrl}`));
-            return;
-        }
-        const payload = { text };
-        if (rulesConfig?.rules && Object.keys(rulesConfig.rules).length > 0) {
-            payload.rules = rulesConfig.rules;
-        }
-        const body = JSON.stringify(payload);
-        const options = {
-            hostname: urlObj.hostname,
-            port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
-            path: urlObj.pathname,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(body),
-            },
-        };
-        const transport = urlObj.protocol === 'https:' ? https : http;
-        const req = transport.request(options, (res) => {
-            let data = '';
-            res.on('data', (chunk) => { data += chunk.toString(); });
-            res.on('end', () => {
-                if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-                    try {
-                        resolve(JSON.parse(data));
-                    }
-                    catch {
-                        reject(new Error(`Invalid JSON from Presidio server: ${data.slice(0, 200)}`));
-                    }
-                }
-                else {
-                    reject(new Error(`Presidio server returned HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
-                }
-            });
-        });
-        req.on('error', (err) => {
-            reject(new Error(`Presidio server unreachable at ${baseUrl}: ${err.message}`));
-        });
-        req.setTimeout(10000, () => {
-            req.destroy();
-            reject(new Error('Presidio server request timed out after 10 s'));
-        });
-        req.write(body);
-        req.end();
-    });
+async function isServerAvailable() {
+    const now = Date.now();
+    if (now - _healthCacheTime < HEALTH_CACHE_TTL) {
+        return _healthCacheResult;
+    }
+    _healthCacheResult = await (0, apiClient_1.checkServerHealth)();
+    _healthCacheTime = now;
+    return _healthCacheResult;
 }
 // ────────────────────────────────────────────────────────────────────────────
-// Hydration bootstrap — run once when config is first loaded
+// Hydration bootstrap — inject custom AST keys from YAML config
 // ────────────────────────────────────────────────────────────────────────────
 let _hydrated = false;
+let _hydratedConfigHash = '';
 function ensureHydrated(config) {
-    if (_hydrated || !config?.custom_secrets) {
+    const configHash = JSON.stringify(config?.custom_secrets ?? []);
+    if (_hydrated && configHash === _hydratedConfigHash) {
         return;
     }
-    (0, regexSanitizer_1.hydrateCustomSecrets)(config.custom_secrets);
+    if (!config?.custom_secrets) {
+        _hydrated = true;
+        _hydratedConfigHash = configHash;
+        return;
+    }
+    // Only push custom AST keys (server handles the regex patterns)
+    for (const def of config.custom_secrets) {
+        if (def.ast_keys) {
+            for (const k of def.ast_keys) {
+                const lower = k.toLowerCase();
+                if (!regexSanitizer_1.DYNAMIC_AST_KEYS.includes(lower)) {
+                    regexSanitizer_1.DYNAMIC_AST_KEYS.push(lower);
+                }
+            }
+        }
+    }
     _hydrated = true;
+    _hydratedConfigHash = configHash;
+}
+// ────────────────────────────────────────────────────────────────────────────
+// Config → Server payload helpers
+// ────────────────────────────────────────────────────────────────────────────
+function buildRecognizerPayloads(config) {
+    if (!config?.custom_recognizers?.length) {
+        return undefined;
+    }
+    return config.custom_recognizers.map(r => ({
+        name: r.name,
+        pattern: r.pattern,
+        score: r.score,
+        context: r.context,
+    }));
+}
+function buildSecretPayloads(config) {
+    if (!config?.custom_secrets?.length) {
+        return undefined;
+    }
+    return config.custom_secrets
+        .filter(s => s.value_prefix) // Only send secrets that have regex-buildable definitions
+        .map(s => ({
+        name: s.name,
+        value_prefix: s.value_prefix,
+        value_charset: s.value_charset,
+        value_length: s.value_length,
+    }));
 }
 /**
  * Pipeline for tool output (terminal results, search results, general text).
- * Terminal mode: stripAnsi → terminalSanitize → regexSanitize
- * General/Search: regexSanitize
+ * Sends raw text to the server for full sanitization.
+ * Terminal mode: strips ANSI codes first.
  */
 async function sanitizePipeline(text, mode = 'general') {
     let current = text;
-    let modified = false;
     if (mode === 'terminal') {
         current = (0, regexSanitizer_1.stripAnsiCodes)(current);
-        const termResult = (0, regexSanitizer_1.terminalSanitize)(current);
-        current = termResult.cleanText;
-        if (termResult.wasModified) {
-            modified = true;
-        }
     }
-    const regResult = (0, regexSanitizer_1.regexSanitize)(current);
-    current = regResult.cleanText;
-    if (regResult.wasModified) {
-        modified = true;
+    // Server availability gate
+    if (!(await isServerAvailable())) {
+        console.log('[SafeChat] sanitizePipeline: server unavailable, returning text as-is');
+        return { cleanText: current, wasModified: false };
     }
-    return { cleanText: current, wasModified: modified };
+    try {
+        const { sanitized, wasModified } = await (0, apiClient_1.sanitizeOne)(current);
+        return { cleanText: sanitized, wasModified };
+    }
+    catch {
+        // Server unreachable — return text as-is (fail-open for tool output)
+        return { cleanText: current, wasModified: false };
+    }
 }
 // ────────────────────────────────────────────────────────────────────────────
 // Smart Router — File-level sanitization (the main entry point)
 // ────────────────────────────────────────────────────────────────────────────
 /**
- * 3-Tier Smart Router:
+ * 3-Tier Smart Router (Server-Delegated):
  *
  *  Tier 1 (bypass):        source code → pass raw
- *  Tier 2 (ast):           structured configs → AST key-match + regex fallback
- *  Tier 2B (universal-kv): unknown KV files → Universal Lexer + regex
- *  Tier 3 (full_dlp):      everything else → regex + Presidio NLP
+ *  Tier 2 (ast):           structured configs → AST extract values → server masks
+ *  Tier 2B (universal-kv): unknown KV files → Universal Lexer + server masks
+ *  Tier 3 (full_dlp):      everything else → send raw text to server
  *
  * If `fileName` is omitted (e.g., user prompt text), defaults to Tier 3.
  */
 async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
     ensureHydrated(rulesConfig);
+    // ── Server availability gate — ALL masking requires the server ──────
+    if (!(await isServerAvailable())) {
+        return {
+            cleanText: rawText,
+            wasModified: false,
+            presidioError: 'Presidio server is not available. Start it with: uvicorn presidio_server.main:app --port 8000',
+        };
+    }
     // ── Determine file category ─────────────────────────────────────────
     const category = fileName
         ? (0, router_1.getFileCategory)(fileName, rawText, rulesConfig)
@@ -189,11 +199,14 @@ async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
     let current = rawText;
     let modified = false;
     let presidioError;
-    // PII checker callback for AST-to-Presidio bridge
+    // Build server payloads from config (sent with every server call)
+    const recognizerPayloads = buildRecognizerPayloads(rulesConfig);
+    const secretPayloads = buildSecretPayloads(rulesConfig);
+    // PII checker callback for AST parsers — delegates to server
     const piiCheck = async (value) => {
         try {
-            const result = await callPresidioApi(value, rulesConfig);
-            return result.sanitized_text;
+            const { sanitized } = await (0, apiClient_1.sanitizeOne)(value, undefined, rulesConfig?.rules, recognizerPayloads, secretPayloads);
+            return sanitized;
         }
         catch (err) {
             if (!presidioError) {
@@ -218,26 +231,26 @@ async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
                 modified = true;
             }
         }
-        // Regex safety net
-        const regResult = (0, regexSanitizer_1.regexSanitize)(current);
-        current = regResult.cleanText;
-        if (regResult.wasModified) {
-            modified = true;
+        // Server safety net — catch any secrets the AST pass missed
+        try {
+            const { sanitized, wasModified: serverModified } = await (0, apiClient_1.sanitizeOne)(current, undefined, rulesConfig?.rules, recognizerPayloads, secretPayloads);
+            current = sanitized;
+            if (serverModified) {
+                modified = true;
+            }
+        }
+        catch (err) {
+            if (!presidioError) {
+                presidioError = err instanceof Error ? err.message : String(err);
+            }
         }
         return { cleanText: current, wasModified: modified, presidioError };
     }
-    // ── Tier 3: Mega-Regex + NLP (full_dlp) ─────────────────────────────
-    // Step 1: Regex dictionary + Entropy scanner
-    const regResult = (0, regexSanitizer_1.regexSanitize)(current);
-    current = regResult.cleanText;
-    if (regResult.wasModified) {
-        modified = true;
-    }
-    // Step 2: Presidio NLP
+    // ── Tier 3: Full DLP — send raw text to server ──────────────────────
     try {
-        const result = await callPresidioApi(current, rulesConfig);
-        current = result.sanitized_text;
-        if (result.was_modified) {
+        const { sanitized, wasModified: serverModified } = await (0, apiClient_1.sanitizeOne)(current, undefined, rulesConfig?.rules, recognizerPayloads, secretPayloads);
+        current = sanitized;
+        if (serverModified) {
             modified = true;
         }
     }

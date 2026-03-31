@@ -254,8 +254,8 @@ function guessUnknownFileType(rawContent) {
     if (/\b(?:import|export|class|function|def|public|private|package|using|#include)\b/.test(peek)) {
         return 'bypass';
     }
-    // Default: AST tier (safer — will attempt key=value masking)
-    return 'ast';
+    // Default: bypass (deny-by-default — only explicitly listed extensions get scanned)
+    return 'bypass';
 }
 // ────────────────────────────────────────────────────────────────────────────
 // Main Router
@@ -376,8 +376,10 @@ function parseRulesYaml(content) {
     const astExtensions = [];
     const fullDlpExtensions = [];
     const customSecrets = [];
+    const customRecognizers = [];
     let section = 'none';
     let currentSecret = null;
+    let currentRecognizer = null;
     function flushSecret() {
         if (currentSecret?.name) {
             customSecrets.push({
@@ -390,6 +392,17 @@ function parseRulesYaml(content) {
         }
         currentSecret = null;
     }
+    function flushRecognizer() {
+        if (currentRecognizer?.name && currentRecognizer?.pattern) {
+            customRecognizers.push({
+                name: currentRecognizer.name,
+                pattern: currentRecognizer.pattern,
+                score: currentRecognizer.score,
+                context: currentRecognizer.context,
+            });
+        }
+        currentRecognizer = null;
+    }
     for (const raw of content.split('\n')) {
         const line = raw.replace(/#.*$/, '').trimEnd();
         const trimmed = line.trim();
@@ -399,27 +412,38 @@ function parseRulesYaml(content) {
         // Top-level section headers
         if (trimmed === 'rules:') {
             flushSecret();
+            flushRecognizer();
             section = 'rules';
             continue;
         }
         if (trimmed === 'ast_extensions:') {
             flushSecret();
+            flushRecognizer();
             section = 'ast_extensions';
             continue;
         }
         if (trimmed === 'full_dlp_extensions:') {
             flushSecret();
+            flushRecognizer();
             section = 'full_dlp_extensions';
             continue;
         }
         if (trimmed === 'custom_secrets:') {
             flushSecret();
+            flushRecognizer();
             section = 'custom_secrets';
+            continue;
+        }
+        if (trimmed === 'custom_recognizers:') {
+            flushSecret();
+            flushRecognizer();
+            section = 'custom_recognizers';
             continue;
         }
         // Must be indented to be inside a section
         if (!/^\s/.test(line)) {
             flushSecret();
+            flushRecognizer();
             section = 'none';
             continue;
         }
@@ -459,8 +483,41 @@ function parseRulesYaml(content) {
                 }
             }
         }
+        if (section === 'custom_recognizers') {
+            if (trimmed.startsWith('- ')) {
+                flushRecognizer();
+                currentRecognizer = {};
+                const kvMatch = trimmed.slice(2).trim().match(/^(\w+)\s*:\s*(.+)/);
+                if (kvMatch) {
+                    parseRecognizerKV(currentRecognizer, kvMatch[1], kvMatch[2]);
+                }
+            }
+            else if (currentRecognizer) {
+                // Continuation lines (e.g. context list items or key: value)
+                if (trimmed.startsWith('- ')) {
+                    // Sub-list item under context:
+                    if (currentRecognizer.context) {
+                        const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
+                        if (val) {
+                            currentRecognizer.context.push(val);
+                        }
+                    }
+                }
+                else {
+                    const kvMatch = trimmed.match(/^(\w+)\s*:\s*(.+)/);
+                    if (kvMatch) {
+                        parseRecognizerKV(currentRecognizer, kvMatch[1], kvMatch[2]);
+                    }
+                    // Handle bare "context:" header (value on indented lines below)
+                    if (trimmed === 'context:') {
+                        currentRecognizer.context = currentRecognizer.context || [];
+                    }
+                }
+            }
+        }
     }
     flushSecret();
+    flushRecognizer();
     // Normalize rule keys
     let normalizedRules;
     if (Object.keys(rules).length > 0) {
@@ -474,6 +531,7 @@ function parseRulesYaml(content) {
         ast_extensions: astExtensions.length > 0 ? astExtensions : undefined,
         full_dlp_extensions: fullDlpExtensions.length > 0 ? fullDlpExtensions : undefined,
         custom_secrets: customSecrets.length > 0 ? customSecrets : undefined,
+        custom_recognizers: customRecognizers.length > 0 ? customRecognizers : undefined,
     };
 }
 function parseSecretKV(secret, key, rawValue) {
@@ -494,6 +552,24 @@ function parseSecretKV(secret, key, rawValue) {
             break;
         case 'value_length':
             secret.value_length = value;
+            break;
+    }
+}
+function parseRecognizerKV(recognizer, key, rawValue) {
+    const value = rawValue.trim().replace(/^["']|["']$/g, '');
+    switch (key) {
+        case 'name':
+            recognizer.name = value;
+            break;
+        case 'pattern':
+            recognizer.pattern = value;
+            break;
+        case 'score':
+            recognizer.score = parseFloat(value) || 0.6;
+            break;
+        case 'context':
+            // Parse YAML inline array: [employee, staff, badge]
+            recognizer.context = value.replace(/[\[\]]/g, '').split(',').map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
             break;
     }
 }

@@ -248,8 +248,8 @@ function guessUnknownFileType(rawContent: string): FileCategory {
     return 'bypass';
   }
 
-  // Default: AST tier (safer — will attempt key=value masking)
-  return 'ast';
+  // Default: bypass (deny-by-default — only explicitly listed extensions get scanned)
+  return 'bypass';
 }
 
 // ────────────────────────────────────────────────────────────────────────────
