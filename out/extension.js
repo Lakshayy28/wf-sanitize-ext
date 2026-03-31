@@ -196,14 +196,14 @@ const safeReadFileToolInstance = new SafeReadFileTool();
  */
 class SafeReadDirectoryTool {
     /** Hard upper bounds to prevent runaway reads */
-    static ABSOLUTE_MAX_DEPTH = 10;
-    static ABSOLUTE_MAX_FILES = 200;
+    static ABSOLUTE_MAX_DEPTH = 15;
+    static ABSOLUTE_MAX_FILES = 1000;
     /** Set by the chat handler so the tool can push UI feedback (buttons, markdown). */
     _stream;
     async invoke(options, _token) {
         const { directoryPath } = options.input;
-        const maxDepth = Math.min(options.input.maxDepth ?? 5, SafeReadDirectoryTool.ABSOLUTE_MAX_DEPTH);
-        const maxFiles = Math.min(options.input.maxFiles ?? 50, SafeReadDirectoryTool.ABSOLUTE_MAX_FILES);
+        const maxDepth = Math.min(options.input.maxDepth ?? 10, SafeReadDirectoryTool.ABSOLUTE_MAX_DEPTH);
+        const maxFiles = Math.min(options.input.maxFiles ?? 500, SafeReadDirectoryTool.ABSOLUTE_MAX_FILES);
         console.log('[SafeChat] safechat_read_directory invoked for:', directoryPath, 'maxDepth:', maxDepth, 'maxFiles:', maxFiles);
         // Resolve the directory URI
         let dirUri;

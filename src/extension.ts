@@ -208,8 +208,8 @@ interface SafeReadDirInput {
  */
 class SafeReadDirectoryTool implements vscode.LanguageModelTool<SafeReadDirInput> {
   /** Hard upper bounds to prevent runaway reads */
-  private static readonly ABSOLUTE_MAX_DEPTH = 10;
-  private static readonly ABSOLUTE_MAX_FILES = 200;
+  private static readonly ABSOLUTE_MAX_DEPTH = 15;
+  private static readonly ABSOLUTE_MAX_FILES = 1000;
 
   /** Set by the chat handler so the tool can push UI feedback (buttons, markdown). */
   _stream: vscode.ChatResponseStream | undefined;
@@ -220,11 +220,11 @@ class SafeReadDirectoryTool implements vscode.LanguageModelTool<SafeReadDirInput
   ): Promise<vscode.LanguageModelToolResult> {
     const { directoryPath } = options.input;
     const maxDepth = Math.min(
-      options.input.maxDepth ?? 5,
+      options.input.maxDepth ?? 10,
       SafeReadDirectoryTool.ABSOLUTE_MAX_DEPTH,
     );
     const maxFiles = Math.min(
-      options.input.maxFiles ?? 50,
+      options.input.maxFiles ?? 500,
       SafeReadDirectoryTool.ABSOLUTE_MAX_FILES,
     );
 

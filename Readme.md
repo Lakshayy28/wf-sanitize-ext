@@ -495,7 +495,7 @@ Two Language Model Tools are registered with VS Code, making them available to t
 
 ### `safechat_read_directory`
 - **Input**: `{ directoryPath: string, maxDepth?: number, maxFiles?: number }`
-- **Defaults**: `maxDepth: 5` (hard cap: 10), `maxFiles: 50` (hard cap: 200)
+- **Defaults**: `maxDepth: 10` (hard cap: 15), `maxFiles: 500` (hard cap: 1000)
 - **Behaviour**: Recursively collects files (sorted: files first, then directories); checks cache tiers per file; fresh reads are passed through `regexSanitize`; tracks all masked files and appends them to the diff cache in one batch; renders a UI button with the masked file count
 - **Skipped directories**: `node_modules`, `.git`, `.venv`, `__pycache__`, `.temp_cache`, `out`, `dist`, `build`, `.next`, `.nuxt`, `coverage`
 

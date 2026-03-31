@@ -6,6 +6,7 @@
 src/**
 scripts/**
 presidio_server/**
+latest/**
 **/*.map
 **/*.ts
 !out/**
