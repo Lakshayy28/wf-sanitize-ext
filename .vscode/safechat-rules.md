@@ -11,12 +11,13 @@ This file is the single control panel for the `@safechat` VS Code extension. Eve
 1. [How it fits into the pipeline](#1-how-it-fits-into-the-pipeline)
 2. [Section: `ast_extensions`](#2-section-ast_extensions)
 3. [Section: `full_dlp_extensions`](#3-section-full_dlp_extensions)
-4. [Section: `custom_secrets`](#4-section-custom_secrets)
-5. [Section: `rules`](#5-section-rules)
-6. [Section: `custom_recognizers`](#6-section-custom_recognizers)
-7. [Entity alias reference](#7-entity-alias-reference)
-8. [Complete annotated example](#8-complete-annotated-example)
-9. [Common recipes](#9-common-recipes)
+4. [Section: `custom_paths`](#4-section-custom_paths)
+5. [Section: `custom_secrets`](#5-section-custom_secrets)
+6. [Section: `rules`](#6-section-rules)
+7. [Section: `custom_recognizers`](#7-section-custom_recognizers)
+8. [Entity alias reference](#8-entity-alias-reference)
+9. [Complete annotated example](#9-complete-annotated-example)
+10. [Common recipes](#10-common-recipes)
 
 ---
 
@@ -27,47 +28,72 @@ User attaches file(s) to @safechat
             │
             ▼
   ┌─────────────────────┐
-  │  Safety Gates         │  Binary file or NUL bytes found?
-  │  (blocked / bypass)   │ ── yes ──► 🚫 Rejected — not forwarded to Copilot.
-  └─────────────────────┘  Source code / doc file?
-       │                    ── yes ──► 📄 Forwarded as-is (bypass, no scan).
-       │
+  │  Step 0: Binary       │  .pdf, .zip, .exe, .png…?
+  │  Blocklist            │ ── yes ──► 🚫 Blocked — not forwarded to Copilot.
+  └─────────────────────┘
+       │ no
        ▼
   ┌─────────────────────┐
-  │  Content Sniffer &    │  Known extension (.json/.yaml/.env…) or unknown
-  │  ast_extensions list  │  extension whose content looks like a known format?
-  └─────────────────────┘  ── yes ──► Tree-sitter CST parser (Tier 2).
-       │                    Unknown extension with KV pairs?
-       │                    ── yes ──► Universal KV Lexer (Tier 2B).
-       │
+  │  Step 1: custom_paths │  Path matches a custom_paths rule?
+  │  (highest priority)   │ ── AST ──►      Tier 2 AST (key-based masking)
+  └─────────────────────┘ ── FULL_DLP ──►  Tier 3 Full DLP (NLP + regex)
+       │ no match          ── IGNORE ──►   📄 Bypass (no scan)
        ▼
-  ┌─────────────────────┐      ┌─────────────────────┐
-  │  Full DLP pipeline    │      │  custom_recognizers +    │
-  │  Regex → Entropy      │◄────│  rules applied via        │
-  │  → Presidio NLP       │      │  Presidio API call        │
-  └─────────────────────┘      └─────────────────────┘
-            │
-            ▼
-     Sanitized text → Copilot
+  ┌─────────────────────┐
+  │  Step 2 & 3: Extension│  Extension in ast_extensions or full_dlp_extensions?
+  │  Whitelist            │ ── ast ──►     Tier 2 AST (key-based masking)
+  └─────────────────────┘ ── dlp ──►     Tier 3 Full DLP (NLP + regex)
+       │ no match
+       ▼
+  ┌─────────────────────┐
+  │  Step 4: Default Deny │  Extension NOT in any whitelist?
+  │  (bypass)             │ ── yes ──► 📄 Forwarded as-is (no scan)
+  └─────────────────────┘
 ```
 
-Files that are source code or documentation are **forwarded as-is** to Copilot. Config and data files are always scanned — there is no longer an extension allowlist that gates scanning; instead the routing engine automatically assigns the most appropriate engine.
+**Architecture: Strict Default-Deny (Whitelist Only)**
+
+Only files whose path or extension is **explicitly listed** — either in the built-in defaults or in this YAML file — are ever scanned. Everything else is bypassed. There is no content sniffing, no blacklists, and no guessing.
+
+**Built-in scanned extensions (always active, no config needed):**
+
+| Tier | Extensions |
+|---|---|
+| **Tier 2 (AST)** | `.json` `.jsonc` `.jsonl` `.yaml` `.yml` `.env` `.properties` `.ini` `.conf` `.cfg` `.config` `.toml` `.npmrc` `.kubeconfig` `.csv` `.tsv` `.netrc` `.pgpass` `.gemrc` `.yarnrc` `.pem` `.key` `.cert` `.crt` `.pub` `.ppk` `.cer` `.asc` `.tf` `.hcl` `.terraformrc` `.tfstate` `.tfvars` `.csproj` `.props` `.targets` `.nuspec` `.xml` `.xsd` `.wsdl` `.secret` `.sh` `.bash` `.zsh` `.bat` `.cmd` `.ps1` `.psm1` `.dockerfile` `.gradle` `.kts` |
+| **Tier 3 (DLP)** | `.txt` `.log` `.md` `.sql` `.graphql` `.gql` `.rtf` |
+
+Add extra extensions below ONLY for proprietary/internal formats not already in the built-in lists.
 
 ---
 
 ## 2. Section: `ast_extensions`
 
-Forces custom or proprietary file extensions through the **Tier 2 AST / Universal KV engine** instead of leaving the decision entirely to the automatic router.
+Adds custom or proprietary file extensions to the **Tier 2 AST whitelist** so they are scanned by the pure-JS parsers (JSON, YAML, XML, ENV, Properties, TOML, HCL, CSV/TSV).
 
 ### When to use it
 
-The Content Sniffer already handles most cases automatically — unknown extensions are sniffed, and if the content looks like JSON/YAML/ENV/Properties the Tree-sitter parser is used; if it looks like a generic key-value format the Universal KV Lexer is used. Add an entry here only when the automatic routing doesn’t pick the right engine (e.g. a format the sniffer doesn’t recognise).
+The built-in whitelist already covers standard config formats. Add entries here only for **proprietary or internal formats** not already in the built-in list.
+
+### Built-in AST extensions (already scanned — do NOT re-add)
+
+| Category | Extensions |
+|---|---|
+| Data interchange | `.json` `.jsonc` `.jsonl` `.yaml` `.yml` |
+| Environment / Properties | `.env` `.properties` `.ini` `.conf` `.cfg` `.config` `.toml` `.npmrc` `.kubeconfig` |
+| Tabular data | `.csv` `.tsv` |
+| Auth / Package managers | `.netrc` `.pgpass` `.gemrc` `.yarnrc` |
+| Keys / Certificates | `.pem` `.key` `.cert` `.crt` `.pub` `.ppk` `.cer` `.asc` |
+| Infrastructure as Code | `.tf` `.hcl` `.terraformrc` `.tfstate` `.tfvars` |
+| Build / Project (XML) | `.csproj` `.props` `.targets` `.nuspec` `.xml` `.xsd` `.wsdl` |
+| Secrets files | `.secret` |
+| Shell scripts | `.sh` `.bash` `.zsh` `.bat` `.cmd` `.ps1` `.psm1` |
+| Docker / Build | `.dockerfile` `.gradle` `.kts` |
 
 ### Syntax
 
 ```yaml
 ast_extensions:
-  - .custom_env      # force through AST/KV engine
+  - .custom_env      # force through AST engine
   - .kube_vars       # helm/kubernetes local var files
   - .mycompany_conf  # vendor-specific config
 ```
@@ -86,11 +112,15 @@ Each entry must start with a `.`. Matching is **case-insensitive**.
 
 ## 3. Section: `full_dlp_extensions`
 
-Forces custom file extensions straight to the **Tier 3 Full DLP** pipeline (regex + Shannon Entropy + Presidio NLP), bypassing the AST/KV engines entirely.
+Forces custom file extensions straight to the **Tier 3 Full DLP** pipeline (regex + Shannon Entropy + Presidio NLP), bypassing the AST engines entirely.
 
 ### When to use it
 
-Use this for log files, audit dumps, chat transcripts, or any unstructured text export from internal tools. These files may contain human PII (names, emails, phone numbers) that the key-name-based AST engine would miss because the data isn’t under a recognisable key.
+Use this for log files, audit dumps, chat transcripts, or any unstructured text export from internal tools. These files may contain human PII (names, emails, phone numbers) that the key-name-based AST engine would miss because the data isn't under a recognisable key.
+
+### Built-in Full DLP extensions (already scanned — do NOT re-add)
+
+`.txt` `.log` `.md` `.sql` `.graphql` `.gql` `.rtf`
 
 ### Syntax
 
@@ -103,7 +133,65 @@ full_dlp_extensions:
 
 ---
 
-## 4. Section: `custom_secrets`
+## 4. Section: `custom_paths`
+
+Overrides routing for **specific files or paths**. Custom path rules have the **highest priority** — they are evaluated before extension whitelists and override all automatic routing.
+
+### When to use it
+
+- Force a specific file to a different tier than its extension would suggest
+- Scan a file that has no recognized extension
+- Exclude a noisy generated file from scanning entirely
+
+### Strategies
+
+| Strategy | Effect |
+|---|---|
+| `AST` | Route to Tier 2 AST engine (key-based masking) |
+| `FULL_DLP` | Route to Tier 3 Full DLP (NLP + regex + entropy) |
+| `IGNORE` | Bypass entirely — never scanned |
+
+### Syntax
+
+```yaml
+custom_paths:
+  - path: "src/config/internal_settings.conf"
+    strategy: AST
+
+  - path: "docs/sensitive_architecture.md"
+    strategy: FULL_DLP
+
+  - path: "generated/api_schema.json"
+    strategy: IGNORE
+```
+
+### Path matching
+
+- Paths are matched against the **workspace-relative file path**
+- Matching is **case-insensitive**
+- **Suffix matching** is supported: `"settings.conf"` matches `"src/config/settings.conf"`
+- Use forward slashes (`/`) — backslashes are normalized automatically
+
+### Example — exclude generated files, force internal config
+
+```yaml
+custom_paths:
+  # This generated JSON is noisy and never contains real secrets
+  - path: "generated/openapi_spec.json"
+    strategy: IGNORE
+
+  # This proprietary binary config actually contains key=value text
+  - path: "config/internal.dat"
+    strategy: AST
+
+  # This .py file contains hardcoded credentials in comments
+  - path: "scripts/legacy_deploy.py"
+    strategy: FULL_DLP
+```
+
+---
+
+## 5. Section: `custom_secrets`
 
 Defines custom internal developer secrets recognised by the **TypeScript engine** (not Presidio). Each entry does two things:
 
@@ -136,7 +224,7 @@ This compiles the regex `\b(acme_live_[A-Za-z0-9_\-]{32})\b` and adds it to the 
 
 ---
 
-## 5. Section: `rules`
+## 6. Section: `rules`
 
 Defines how each detected entity type is anonymized. Any entity type not listed defaults to `replace`.
 
@@ -185,7 +273,7 @@ export SAFECHAT_ENCRYPT_KEY="my32characterlongsecretkey123456"
 
 ---
 
-## 6. Section: `custom_recognizers`
+## 7. Section: `custom_recognizers`
 
 Adds your own regex-based entity detectors without modifying the server. Each recognizer is active for the duration of the request — no restart required.
 
@@ -303,7 +391,7 @@ rules:
 
 ---
 
-## 7. Entity alias reference
+## 8. Entity alias reference
 
 You can use either the friendly alias or the canonical Presidio type — both are accepted, case-insensitively.
 
@@ -330,10 +418,10 @@ For the full catalogue of 70+ entity types (financial, developer, infrastructure
 
 ---
 
-## 8. Complete annotated example
+## 9. Complete annotated example
 
 ```yaml
-# ── 1. Force proprietary extensions into Tier 2 AST/KV engine ─────────────────
+# ── 1. Force proprietary extensions into Tier 2 AST engine ────────────────────
 ast_extensions:
   - .custom_env
   - .kube_vars
@@ -345,7 +433,14 @@ full_dlp_extensions:
   - .splunk_dump
   - .chat_transcript
 
-# ── 3. Internal developer token definitions ────────────────────────────────────
+# ── 3. Path-specific overrides (highest routing priority) ─────────────────────
+custom_paths:
+  - path: "generated/openapi_spec.json"
+    strategy: IGNORE
+  - path: "scripts/legacy_deploy.py"
+    strategy: FULL_DLP
+
+# ── 4. Internal developer token definitions ────────────────────────────────────
 custom_secrets:
   - name: "App Usernames"
     ast_keys: ["username", "db_user", "login"]
@@ -356,7 +451,7 @@ custom_secrets:
     value_charset: "alphanumeric"
     value_length: "32"
 
-# ── 4. Per-entity anonymization operations ────────────────────────────────────
+# ── 5. Per-entity anonymization operations ────────────────────────────────────
 rules:
   # Presidio built-in
   PhoneNumber:    replace   # → <PHONE_NUMBER>
@@ -371,7 +466,7 @@ rules:
   EMPLOYEE_ID:    mask
   BRANCH_CODE:    replace
 
-# ── 5. User-defined Presidio NLP recognizers ──────────────────────────────────
+# ── 6. User-defined Presidio NLP recognizers ──────────────────────────────────
 custom_recognizers:
   - name: EMPLOYEE_ID
     pattern: "EMP-\\d{6}"
@@ -391,11 +486,11 @@ custom_recognizers:
 
 ---
 
-## 9. Common recipes
+## 10. Common recipes
 
 ### No overrides needed (default behaviour)
 
-For standard projects, leave `ast_extensions` and `full_dlp_extensions` empty or absent. The Content Sniffer automatically routes `.json`, `.yaml`, `.yml`, `.env`, `.properties` to Tree-sitter, unknown KV files to the Universal Lexer, and everything else to Full DLP.
+For standard projects, leave `ast_extensions`, `full_dlp_extensions`, and `custom_paths` empty or absent. The built-in whitelist covers all common config formats (`.json`, `.yaml`, `.env`, `.properties`, `.xml`, `.toml`, etc.) and unstructured text (`.txt`, `.md`, `.log`, `.sql`). Any extension not in the whitelist is bypassed (default deny).
 
 ### Java / Spring Boot project — add proprietary formats
 

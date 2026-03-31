@@ -14,22 +14,14 @@
 # │  Start server: uvicorn presidio_server.main:app --port 8000            │
 # └─────────────────────────────────────────────────────────────────────────┘
 #
-# ROUTING: Deny-by-Default, Allow-by-Config
-# ──────────────────────────────────────────
-#   1. Binary files (.pdf, .zip, .exe…)  → BLOCKED (never enter pipeline)
-#   2. Source code (.ts, .py, .java…)    → BYPASS  (forwarded as-is, no scan)
-#   3. Unknown/unrecognized extensions   → BYPASS  (deny-by-default)
-#   4. Structured configs listed below   → Tier 2 AST (key-based masking)
-#   5. Unstructured text listed below    → Tier 3 Full DLP (NLP + regex)
+# ROUTING: Strict Default-Deny (Whitelist Only)
+# ──────────────────────────────────────────────
+#   0. Binary files (.pdf, .zip, .exe…)  → BLOCKED (never enter pipeline)
+#   1. custom_paths (path match)         → highest priority, user-defined
+#   2. ast_extensions whitelist          → Tier 2 AST (key-based masking)
+#   3. full_dlp_extensions whitelist     → Tier 3 Full DLP (NLP + regex)
+#   4. Everything else                   → BYPASS  (default deny, no scan)
 #
-# BUILT-IN SCANNED EXTENSIONS (always scanned, no config needed):
-#   Tier 2 (AST): .json .jsonc .jsonl .yaml .yml .env .properties .ini
-#     .xml .npmrc .kubeconfig .tfvars .conf .cfg .config .toml .csv .tsv
-#     .netrc .pgpass .gemrc .yarnrc .pem .key .cert .crt .pub .ppk .asc
-#     .tf .hcl .terraformrc .tfstate .csproj .props .targets .nuspec .kts
-#     .secret .sh .bash .zsh .bat .cmd .ps1 .psm1 .dockerfile .gradle
-#     .xsd .wsdl
-#   Tier 3 (DLP): .txt .md .log .sql .graphql .gql .rtf
 #
 # Add extra extensions below ONLY for proprietary/internal formats not
 # already covered by the built-in lists above.
@@ -39,6 +31,19 @@
 # Add proprietary or vendor-specific extensions to be scanned by the Tier 2
 # AST engine (pure-JS parsers: JSON, YAML, XML, ENV, Properties, TOML, HCL,
 # CSV/TSV). Unknown extensions are BYPASSED by default — add them here to scan.
+#
+# BUILT-IN AST EXTENSIONS (already scanned — do NOT re-add these):
+#   Data interchange:    .json .jsonc .jsonl .yaml .yml
+#   Environment/Props:   .env .properties .ini .conf .cfg .config .toml
+#                        .npmrc .kubeconfig
+#   Tabular data:        .csv .tsv
+#   Auth/Package Mgrs:   .netrc .pgpass .gemrc .yarnrc
+#   Keys/Certs:          .pem .key .cert .crt .pub .ppk .cer .asc
+#   IaC:                 .tf .hcl .terraformrc .tfstate .tfvars
+#   Build/Project (XML): .csproj .props .targets .nuspec .xml .xsd .wsdl
+#   Secrets files:       .secret
+#   Shell scripts:       .sh .bash .zsh .bat .cmd .ps1 .psm1
+#   Docker/Build:        .dockerfile .gradle .kts
 # ─────────────────────────────────────────────────────────────────────────────
 ast_extensions: 
   # Force these into the Tier 2 AST Guardian (Structure preservation, no NLP)
@@ -46,6 +51,8 @@ ast_extensions:
   - .kube_vars
   - .mycompany_conf
 
+# BUILT-IN FULL DLP EXTENSIONS (already scanned — do NOT re-add these):
+#   .txt .log .md .sql .graphql .gql .rtf
 full_dlp_extensions: 
   # Force these into Tier 3 Full DLP (Regex + Shannon Entropy + Presidio NLP).
   # Use for log files, audit dumps, and chat transcripts that contain human PII
@@ -55,7 +62,35 @@ full_dlp_extensions:
   - .chat_transcript
 
 
-# ── 2. Dynamic Secret Builder ─────────────────────────────────────────────────
+# ── 2. Path-Specific Overrides ────────────────────────────────────────────────
+# Override routing for specific files or paths. These take HIGHEST priority
+# (above both extension whitelists and the binary blocklist).
+#
+# Strategies:
+#   AST      — Tier 2 key-based masking (structured configs)
+#   FULL_DLP — Tier 3 NLP + regex + entropy (unstructured PII)
+#   IGNORE   — bypass entirely (never scanned)
+#
+# Paths are matched against workspace-relative file paths. Matching is
+# case-insensitive and supports suffix matching (e.g. "settings.conf"
+# matches "src/config/settings.conf").
+# ─────────────────────────────────────────────────────────────────────────────
+custom_paths:
+  # Example: Force a config file that has no recognized extension
+  # - path: "src/config/internal_settings.conf"
+  #   strategy: AST
+
+  # Example: Scan a markdown file with Full DLP (already in default DLP list,
+  # but you could use this to force a specific path to a different tier)
+  # - path: "docs/sensitive_architecture.md"
+  #   strategy: FULL_DLP
+
+  # Example: Exclude a noisy generated file from scanning entirely
+  # - path: "generated/api_schema.json"
+  #   strategy: IGNORE
+
+
+# ── 3. Dynamic Secret Builder ─────────────────────────────────────────────────
 # Define custom internal developer secrets here. The extension will:
 # 1. Inject `ast_keys` into the Tier 2 AST parsers so those keys are masked
 #    immediately at the AST level (key-name detection).
@@ -75,7 +110,7 @@ custom_secrets:
     value_length: "32"                    
 
 
-# ── 3. NLP Entity Overrides (Python Presidio Server) ─────────────────────────
+# ── 4. NLP Entity Overrides (Python Presidio Server) ─────────────────────────
 # Define how the Python Heavy Brain server handles Human PII and Financial Data.
 # These rules are passed as part of the API payload to POST /api/sanitize/batch.
 # ALL masking (regex, NLP, entropy) happens server-side.
@@ -98,7 +133,7 @@ rules:
   CARD_EXPIRY: mask    # Custom financial entity from financial.py
 
 
-# ── 4. Custom PII Recognizers (Python Presidio Server) ───────────────────────
+# ── 5. Custom PII Recognizers (Python Presidio Server) ───────────────────────
 # Add custom regexes ONLY for Human Data (e.g., employee IDs, support tickets)
 # that require NLP context words to avoid false positives.
 # These are dynamically registered as Presidio PatternRecognizer objects on

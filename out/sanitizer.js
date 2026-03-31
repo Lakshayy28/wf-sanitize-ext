@@ -114,33 +114,6 @@ function ensureHydrated(config) {
     _hydrated = true;
     _hydratedConfigHash = configHash;
 }
-// ────────────────────────────────────────────────────────────────────────────
-// Config → Server payload helpers
-// ────────────────────────────────────────────────────────────────────────────
-function buildRecognizerPayloads(config) {
-    if (!config?.custom_recognizers?.length) {
-        return undefined;
-    }
-    return config.custom_recognizers.map(r => ({
-        name: r.name,
-        pattern: r.pattern,
-        score: r.score,
-        context: r.context,
-    }));
-}
-function buildSecretPayloads(config) {
-    if (!config?.custom_secrets?.length) {
-        return undefined;
-    }
-    return config.custom_secrets
-        .filter(s => s.value_prefix) // Only send secrets that have regex-buildable definitions
-        .map(s => ({
-        name: s.name,
-        value_prefix: s.value_prefix,
-        value_charset: s.value_charset,
-        value_length: s.value_length,
-    }));
-}
 /**
  * Pipeline for tool output (terminal results, search results, general text).
  * Sends raw text to the server for full sanitization.
@@ -199,13 +172,10 @@ async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
     let current = rawText;
     let modified = false;
     let presidioError;
-    // Build server payloads from config (sent with every server call)
-    const recognizerPayloads = buildRecognizerPayloads(rulesConfig);
-    const secretPayloads = buildSecretPayloads(rulesConfig);
     // PII checker callback for AST parsers — delegates to server
     const piiCheck = async (value) => {
         try {
-            const { sanitized } = await (0, apiClient_1.sanitizeOne)(value, undefined, rulesConfig?.rules, recognizerPayloads, secretPayloads);
+            const { sanitized } = await (0, apiClient_1.sanitizeOne)(value);
             return sanitized;
         }
         catch (err) {
@@ -233,7 +203,7 @@ async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
         }
         // Server safety net — catch any secrets the AST pass missed
         try {
-            const { sanitized, wasModified: serverModified } = await (0, apiClient_1.sanitizeOne)(current, undefined, rulesConfig?.rules, recognizerPayloads, secretPayloads);
+            const { sanitized, wasModified: serverModified } = await (0, apiClient_1.sanitizeOne)(current);
             current = sanitized;
             if (serverModified) {
                 modified = true;
@@ -248,7 +218,7 @@ async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
     }
     // ── Tier 3: Full DLP — send raw text to server ──────────────────────
     try {
-        const { sanitized, wasModified: serverModified } = await (0, apiClient_1.sanitizeOne)(current, undefined, rulesConfig?.rules, recognizerPayloads, secretPayloads);
+        const { sanitized, wasModified: serverModified } = await (0, apiClient_1.sanitizeOne)(current, undefined, rulesConfig?.rules);
         current = sanitized;
         if (serverModified) {
             modified = true;

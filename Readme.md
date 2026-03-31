@@ -9,28 +9,34 @@ A security-focused VS Code Chat Participant (`@safechat`) that automatically det
 ```
 You type: @safechat explain this config #file:config.yaml
                         │
-            Graceful Degradation Router
+            Whitelist-Only Context Router
             reads the file and classifies it
                         │
           ┌─────────────▼──────────────────┐
-          │  Safety Gates (pre-flight)     │  Binary files (.pdf, .zip, .dll…)
-          │  blocked / bypass / truncate   │  → blocked.  Source code (.ts,
-          │                                │  .py…) → bypass (no scan).
-          │                                │  Files > 1 MB or minified lines
-          │                                │  > 10 k chars → regex-only.
+          │  Step 0: Binary Blocklist      │  .pdf, .zip, .dll, .png…
+          │  (blocked — never processed)   │  → 🚫 Rejected.
           └─────────────┬──────────────────┘
                         │
           ┌─────────────▼──────────────────┐
-          │  Tier 2 — Tree-sitter CST      │  Known structured formats parsed
-          │  (JSON · YAML · ENV · Props)   │  to a Concrete Syntax Tree.
-          │  + Content Sniffer for unknown │  Values under sensitive keys are
-          │    extensions                  │  masked; others go to Presidio.
+          │  Step 1: custom_paths          │  Path matches a user rule?
+          │  (highest routing priority)    │  → AST / FULL_DLP / IGNORE
           └─────────────┬──────────────────┘
                         │
           ┌─────────────▼──────────────────┐
-          │  Tier 2B — Universal KV Lexer  │  Proprietary config formats
-          │  (=  :  ->  >>  delimiters)    │  (e.g. .mycompany_conf) — regex
-          │                                │  KV parser masks sensitive keys.
+          │  Step 2: Extension Whitelist   │  Extension in built-in or YAML
+          │  ast_extensions →  Tier 2 AST  │  whitelist?
+          │  full_dlp_extensions → Tier 3  │  → Route to matching tier.
+          └─────────────┬──────────────────┘
+                        │
+          ┌─────────────▼──────────────────┐
+          │  Step 3: Default Deny          │  Extension NOT in any whitelist?
+          │  (bypass — no scan)            │  → 📄 Forwarded as-is to Copilot.
+          └─────────────┬──────────────────┘
+                        │ (scanned files only)
+          ┌─────────────▼──────────────────┐
+          │  Tier 2 — AST Guardian         │  Pure-JS parsers for structured
+          │  (JSON · YAML · XML · ENV ·    │  configs. Values under sensitive
+          │   Props · TOML · HCL · CSV)    │  keys masked; rest to Presidio.
           └─────────────┬──────────────────┘
                         │
           ┌─────────────▼──────────────────┐
@@ -59,19 +65,19 @@ The original and masked versions of each sanitization event are cached locally u
 
 - **`@safechat` Chat Participant** — invoke directly in the Copilot Chat panel; attach any file as context.
 - **Sanitization Mesh** — a mandatory multi-layer checkpoint for ALL data entering the model's context window: attached files, tool reads, search results, and terminal output are all sanitized.
-- **Graceful Degradation Pipeline** — 5-engine routing with automatic fall-through:
+- **Graceful Degradation Pipeline** — whitelist-only routing with automatic fall-through:
   - **Blocked** — binary files (40+ extensions: `.pdf`, `.zip`, `.dll`, `.png`, `.sqlite`, etc.) and NUL-byte content are rejected before any processing.
-  - **Bypass (Tier 1)** — safe files (source code, docs, images) skip scanning entirely for zero overhead.
-  - **Tree-sitter CST (Tier 2)** — JSON, YAML, ENV/dotenv, and Java Properties are parsed into a Concrete Syntax Tree using native WASM grammars. A **Content Sniffer** also detects unknown extensions that contain a known format (e.g. `.myconfig` that is actually JSON). Only values under sensitive keys are masked; all other values are sent to Presidio NLP.
-  - **Universal KV Lexer (Tier 2B)** — proprietary and vendor-specific config files that use `=`, `:`, `->`, or `>>` as delimiters are parsed line-by-line; only lines whose key matches a secret keyword list are masked.
-  - **Full DLP (Tier 3)** — unstructured text gets the complete pipeline: 22-pattern regex dictionary → Shannon Entropy scanner (≥ 3.8 threshold for unknown secrets) → bare high-entropy token detector → Presidio NLP for human PII (12 entity types). Mega-files (> 1 MB) and minified files (first line > 10 000 chars) use this engine but **skip** the Presidio NLP call to protect latency.
+  - **`custom_paths` (highest priority)** — user-defined path rules route specific files to AST, Full DLP, or IGNORE regardless of extension.
+  - **AST Guardian (Tier 2)** — structured configs (`.json`, `.yaml`, `.env`, `.properties`, `.xml`, `.toml`, `.hcl`, `.csv`, etc. — 45+ built-in extensions) are parsed by pure-JS parsers. Values under sensitive keys are masked; all other values are sent to Presidio NLP.
+  - **Full DLP (Tier 3)** — unstructured text (`.txt`, `.md`, `.log`, `.sql`, `.graphql`, `.gql`, `.rtf`) gets the complete pipeline: 22-pattern regex dictionary → Shannon Entropy scanner (≥ 3.8 threshold for unknown secrets) → bare high-entropy token detector → Presidio NLP for human PII (12 entity types). Mega-files (> 1 MB) and minified files (first line > 10 000 chars) use this engine but **skip** the Presidio NLP call to protect latency.
+  - **Default Deny** — any file whose extension is not in the built-in whitelist or `safechat-rules.yaml` is bypassed (forwarded as-is, no scan). No content sniffing, no blacklists, no guessing.
 - **Shannon Entropy Engine** — mathematically detects unknown/future secret formats by measuring randomness. Replaces brittle pattern matching with `calculateShannonEntropy()` and context-anchored `applyEntropyMasking()`.
 - **Safe file tools** — `safechat_read_file` and `safechat_read_directory` are registered as LM tools so the model can read workspace files and directories via a sanitized pipeline.
 - **Native tool blocklist** — native file-read, directory-listing, and workspace-search tools are stripped from the model's tool menu and, if called anyway, are intercepted and rerouted through the safe alternatives.
 - **Terminal-aware sanitization** — ANSI escape codes are stripped; CLI-specific patterns (curl headers, env var exports, JSON credential fields) are caught separately from general file patterns.
 - **12 PII entity types** — names, emails, phone numbers, credit cards, SSNs, IBANs, bank accounts, crypto wallets, IP addresses, URLs, card CVV, and card expiry. Hallucination-prone entities (`US_DRIVER_LICENSE`, `US_ITIN`) are intentionally excluded.
 - **4 anonymizer operations** — `replace`, `mask`, `redact`, or `hash` per entity type, configured in a single YAML file.
-- **File type allowlist** — restrict scanning to only data/config file extensions (`.yaml`, `.json`, `.env`, etc.); non-matching files are forwarded as-is to Copilot without modification.
+- **Strict default-deny whitelist** — only files whose extension or path is explicitly listed (built-in defaults or `safechat-rules.yaml`) are ever scanned; everything else is forwarded as-is to Copilot.
 - **Full agentic behaviour** — passes all available VS Code tools to the LLM and runs an agentic tool-calling loop (up to 15 rounds): search code, read files, run commands — identical to native Copilot Agent mode.
 - **Conversation continuity** — per-file state cache with `mtime`-based invalidation keeps all attached file context live across multiple turns in the same chat.
 - **User-defined custom recognizers** — add your own regex patterns (employee IDs, ticket numbers, internal references) via the YAML config; no server restart needed.
@@ -283,26 +289,34 @@ When multiple files were masked in one session, a QuickPick selector lets you ch
 
 ## Sanitization Pipeline Details
 
-### Smart Router — 3-Tier Content Classification
+### Whitelist-Only Router — Default-Deny Content Classification
 
-The Smart Router (`router.ts`) inspects each file's extension and content to assign it to one of three tiers:
+The Context Router (`router.ts`) uses a strict whitelist-only model to assign each file to a scanning tier:
 
-| Tier | Category | What happens | Example files |
-|---|---|---|---|
-| **1** | `bypass` | No scanning — passed through as-is | `.ts`, `.py`, `.go`, `.md`, `.html` |
-| **2** | `ast` | AST-parsed; only sensitive key values are masked | `.json`, `.yaml`, `.env`, `.properties`, `.xml` |
-| **3** | `full_dlp` | Full regex + entropy + Presidio pipeline | `.log`, `.txt`, `.csv`, `.sql`, unknown formats |
+| Step | Check | Result |
+|---|---|---|
+| **0** | Binary blocklist (`.pdf`, `.zip`, `.exe`, `.png`…) | Blocked — never enters text pipeline |
+| **1** | `custom_paths` rule match | User-defined: `AST` / `FULL_DLP` / `IGNORE` |
+| **2** | `ast_extensions` whitelist (45+ built-in) | Tier 2 AST — key-based masking |
+| **3** | `full_dlp_extensions` whitelist (7 built-in) | Tier 3 Full DLP — NLP + regex + entropy |
+| **4** | Default deny | Bypass — forwarded as-is, no scan |
 
-Files with unknown extensions are sniffed by a content heuristic (`guessUnknownFileType()`) that checks for JSON braces, YAML colons, XML tags, etc.
+**Built-in AST extensions (Tier 2):**
+`.json` `.jsonc` `.jsonl` `.yaml` `.yml` `.env` `.properties` `.ini` `.conf` `.cfg` `.config` `.toml` `.npmrc` `.kubeconfig` `.csv` `.tsv` `.netrc` `.pgpass` `.gemrc` `.yarnrc` `.pem` `.key` `.cert` `.crt` `.pub` `.ppk` `.cer` `.asc` `.tf` `.hcl` `.terraformrc` `.tfstate` `.tfvars` `.csproj` `.props` `.targets` `.nuspec` `.xml` `.xsd` `.wsdl` `.secret` `.sh` `.bash` `.zsh` `.bat` `.cmd` `.ps1` `.psm1` `.dockerfile` `.gradle` `.kts`
+
+**Built-in Full DLP extensions (Tier 3):**
+`.txt` `.log` `.md` `.sql` `.graphql` `.gql` `.rtf`
+
+No content sniffing, no blacklists, no guessing. Add custom extensions via `safechat-rules.yaml`.
 
 ### Tier 2 — AST Guardian Pipeline
 
-Structured files are parsed into a key-value tree. The AST walker:
+Structured files are parsed into a key-value tree by pure-JS parsers. The AST walker:
 1. Checks each key against `DYNAMIC_AST_KEYS` (20 secret-related keywords like `password`, `token`, `secret`, `api_key`, etc.)
 2. If the key is sensitive → masks the value immediately with `[MASKED_BY_SAFECHAT]`
 3. If the key is NOT sensitive → sends the value to Presidio NLP to check for human PII (names, emails, etc.)
 
-Supported formats: JSON, YAML, ENV/dotenv, Java Properties, XML.
+Supported formats: JSON, JSONC, JSONL, YAML, ENV/dotenv, Properties/INI, TOML, XML, HCL, CSV/TSV.
 
 ### Tier 3 — Full DLP Pipeline
 
@@ -357,27 +371,34 @@ When `safechat_read_file` or `safechat_read_directory` masks data during an auto
 
 All user controls live in a single file: `.vscode/safechat-rules.yaml`. This file is read on **every prompt** — no server restart or VS Code reload is required.
 
-The file has four independent sections — use any combination:
+The file has five independent sections — use any combination:
 
 ```yaml
-# 1. Force custom extensions into the Tree-sitter AST engine (Tier 2)
+# 1. Add custom extensions to Tier 2 AST whitelist
 ast_extensions:
   - .custom_env
   - .kube_vars
 
-# 2. Force custom extensions into the Full DLP engine (Tier 3)
+# 2. Add custom extensions to Tier 3 Full DLP whitelist
 full_dlp_extensions:
   - .audit_log
   - .chat_transcript
 
-# 3. Per-entity anonymizer operations
+# 3. Path-specific overrides (highest routing priority)
+custom_paths:
+  - path: "generated/api_schema.json"
+    strategy: IGNORE
+  - path: "scripts/legacy_deploy.py"
+    strategy: FULL_DLP
+
+# 4. Per-entity anonymizer operations
 rules:
   AccountNumber: mask
   PhoneNumber: replace
   US_SSN: redact
   CREDIT_CARD: hash
 
-# 4. User-defined regex recognizers for Presidio NLP (no restart needed)
+# 5. User-defined regex recognizers for Presidio NLP (no restart needed)
 custom_recognizers:
   - name: EMPLOYEE_ID
     pattern: "EMP-\\d{6}"
@@ -389,15 +410,13 @@ custom_recognizers:
 
 ---
 
-### Section 1 — Force AST routing (`ast_extensions`)
+### Section 1 — Add AST extensions (`ast_extensions`)
 
-Extensions listed here are forced through the **Tier 2 AST Guardian** (Tree-sitter parser or Universal KV Lexer, depending on content). Use this for internal proprietary config formats whose content the automatic Content Sniffer might not recognise.
+Extensions listed here are added to the **Tier 2 AST whitelist** (pure-JS parsers for JSON, YAML, XML, ENV, Properties, TOML, HCL, CSV/TSV). The 45+ built-in extensions are always active — use this only for proprietary/internal formats not already covered.
 
-Extensions not listed here are still automatically routed by the Content Sniffer — you only need to list extensions that require an explicit override.
+### Section 2 — Add Full DLP extensions (`full_dlp_extensions`)
 
-### Section 2 — Force Full DLP routing (`full_dlp_extensions`)
-
-Extensions listed here skip the AST/KV engines entirely and go straight to the **Tier 3 Full DLP** pipeline (regex + entropy + Presidio NLP). Use this for log files, audit dumps, and other unstructured text that may contain human PII not detectable by key-name matching.
+Extensions listed here are added to the **Tier 3 Full DLP whitelist** (regex + entropy + Presidio NLP). The 7 built-in extensions (`.txt`, `.log`, `.md`, `.sql`, `.graphql`, `.gql`, `.rtf`) are always active — use this for internal log or audit dump formats.
 
 ---
 
@@ -532,17 +551,11 @@ curl -X POST http://localhost:8000/sanitize \
 wf-sanitize-ext/
 ├── src/
 │   ├── extension.ts          # Chat participant, safe tools, agentic loop, cache helpers
-│   ├── sanitizer.ts          # Thin orchestrator — wires 5-engine graceful degradation pipeline
-│   ├── router.ts             # Graceful Degradation Router — determineSanitizationRoute(), Content Sniffer
-│   ├── treeSitterManager.ts  # WASM grammar loader — bash, json, properties, yaml (parallel init)
-│   ├── regexSanitizer.ts     # Mega-Dictionary, Shannon Entropy Engine, terminal sanitizer
-│   └── astSanitizer.ts       # CST Guardian (Tree-sitter) + Universal KV Lexer (Tier 2B)
-├── wasm/
-│   ├── tree-sitter.wasm      # Tree-sitter runtime (196 KB)
-│   ├── tree-sitter-bash.wasm # ENV / dotenv grammar (1.4 MB)
-│   ├── tree-sitter-json.wasm # JSON grammar (6 KB)
-│   ├── tree-sitter-properties.wasm  # Java Properties / INI grammar (11 KB)
-│   └── tree-sitter-yaml.wasm # YAML grammar (194 KB)
+│   ├── sanitizer.ts          # Thin orchestrator — wires routing + server API delegation
+│   ├── router.ts             # Whitelist-Only Context Router — default-deny, custom_paths
+│   ├── apiClient.ts          # HTTP client for Presidio server (batch sanitize, health check)
+│   ├── regexSanitizer.ts     # Shared constants and stubs (MASK, DYNAMIC_AST_KEYS)
+│   └── astSanitizer.ts       # Pure-JS parsers (JSON, YAML, XML, ENV, Props, TOML, HCL, CSV)
 ├── presidio_server/
 │   ├── main.py               # FastAPI server (Human PII & Financial engine)
 │   ├── profiles.py           # Active entity list (12 types, anti-hallucination)
