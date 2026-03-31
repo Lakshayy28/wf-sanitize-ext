@@ -57,7 +57,7 @@ You type: @safechat explain this config #file:config.yaml
              back to Chat panel
 ```
 
-The original and masked versions of each sanitization event are cached locally under `.vscode/.temp_cache/latest/` so you can inspect exactly what was stripped using the built-in diff viewer.
+The original and masked versions of each sanitization event are cached locally under `.vscode/.temp_cache/<timestamp>/` so you can inspect exactly what was stripped using the built-in diff viewer.
 
 ---
 
@@ -76,7 +76,7 @@ The original and masked versions of each sanitization event are cached locally u
 - **Native tool blocklist** — native file-read, directory-listing, and workspace-search tools are stripped from the model's tool menu and, if called anyway, are intercepted and rerouted through the safe alternatives.
 - **Terminal-aware sanitization** — ANSI escape codes are stripped; CLI-specific patterns (curl headers, env var exports, JSON credential fields) are caught separately from general file patterns.
 - **12 PII entity types** — names, emails, phone numbers, credit cards, SSNs, IBANs, bank accounts, crypto wallets, IP addresses, URLs, card CVV, and card expiry. Hallucination-prone entities (`US_DRIVER_LICENSE`, `US_ITIN`) are intentionally excluded.
-- **4 anonymizer operations** — `replace`, `mask`, `redact`, or `hash` per entity type, configured in a single YAML file.
+- **5 anonymizer operations** — `replace`, `mask`, `redact`, `hash`, or `encrypt` per entity type, configured in a single YAML file.
 - **Strict default-deny whitelist** — only files whose extension or path is explicitly listed (built-in defaults or `safechat-rules.yaml`) are ever scanned; everything else is forwarded as-is to Copilot.
 - **Full agentic behaviour** — passes all available VS Code tools to the LLM and runs an agentic tool-calling loop (up to 15 rounds): search code, read files, run commands — identical to native Copilot Agent mode.
 - **Conversation continuity** — per-file state cache with `mtime`-based invalidation keeps all attached file context live across multiple turns in the same chat.
@@ -132,11 +132,11 @@ python -m spacy download en_core_web_lg
 
 ### 3 — Start the Presidio server
 
-The server must be running if you want Tier 1 detection. Start it in a terminal:
+The server provides NLP-based human PII detection (Tier 3 NLP step). The extension works without it — Tier 2 AST parsing and Tier 3 regex/entropy engines still run.
 
 ```bash
 cd /path/to/wf-sanitize-ext
-.venv/bin/uvicorn presidio_server.main:app --host 0.0.0.0 --port 8000 --reload
+PYTHONPATH="$PWD" presidio_server/.venv/bin/uvicorn presidio_server.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 You should see:
@@ -283,7 +283,7 @@ After each sanitization event a **"View Masked Diff"** button appears in the cha
 - **Left pane** — original file content (as attached or read by the tool)
 - **Right pane** — what was actually sent to Copilot
 
-When multiple files were masked in one session, a QuickPick selector lets you choose which file to inspect. All diffs persist across reloads in `.vscode/.temp_cache/latest/` and new entries are appended without overwriting existing ones.
+When multiple files were masked in one session, a QuickPick selector lets you choose which file to inspect. All diffs persist across reloads in `.vscode/.temp_cache/` (each event in its own timestamped subfolder) and new entries are appended without overwriting existing ones.
 
 ---
 
@@ -430,6 +430,7 @@ Controls how each detected entity type is transformed:
 | `mask` | `************` | Replaces every character with `*`. |
 | `redact` | *(empty string)* | Completely removes the text. |
 | `hash` | `b7531e08…` | One-way SHA-256 digest. Repeatable — identical values produce identical hashes. |
+| `encrypt` | `dGhpcyBp…` | AES-CBC reversible. Requires env var `SAFECHAT_ENCRYPT_KEY` (16, 24, or 32 chars). Falls back to `replace` if key is missing. |
 
 ```yaml
 rules:
@@ -551,10 +552,9 @@ curl -X POST http://localhost:8000/sanitize \
 wf-sanitize-ext/
 ├── src/
 │   ├── extension.ts          # Chat participant, safe tools, agentic loop, cache helpers
-│   ├── sanitizer.ts          # Thin orchestrator — wires routing + server API delegation
+│   ├── sanitizer.ts          # Thin orchestrator — wires routing + Presidio HTTP bridge
 │   ├── router.ts             # Whitelist-Only Context Router — default-deny, custom_paths
-│   ├── apiClient.ts          # HTTP client for Presidio server (batch sanitize, health check)
-│   ├── regexSanitizer.ts     # Shared constants and stubs (MASK, DYNAMIC_AST_KEYS)
+│   ├── regexSanitizer.ts     # Mega-dictionary (22 patterns), Shannon entropy, DYNAMIC_AST_KEYS
 │   └── astSanitizer.ts       # Pure-JS parsers (JSON, YAML, XML, ENV, Props, TOML, HCL, CSV)
 ├── presidio_server/
 │   ├── main.py               # FastAPI server (Human PII & Financial engine)
@@ -569,7 +569,7 @@ wf-sanitize-ext/
 │   ├── launch.json           # Debug configs incl. compound launch
 │   ├── tasks.json            # Build + server tasks
 │   └── .temp_cache/          # Auto-generated diff cache (gitignored)
-│       └── latest/           # Most recent session's masked file pairs + manifest.json
+│       └── <timestamp>/      # Per-event subdirectory: original_context.txt + masked_context.txt
 ├── out/                      # Compiled JS (generated)
 ├── package.json              # Extension manifest
 └── tsconfig.json
@@ -647,8 +647,8 @@ code --install-extension safe-copilot-context-0.0.1.vsix
 - Ensure GitHub Copilot Chat is installed and you are signed in.
 
 **"Advanced PII detection unavailable" warning in chat**
-- The Presidio server is not running. Tier 1 (NLP) is skipped but Tier 2 (regex) and Tier 2b (heuristics) still run.
-- Start the server: `.venv/bin/uvicorn presidio_server.main:app --port 8000 --reload`
+- The Presidio server is not running. Tier 3 NLP (human PII) is skipped but Tier 2 AST and Tier 3 regex/entropy engines still run.
+- Start the server: `PYTHONPATH="$PWD" presidio_server/.venv/bin/uvicorn presidio_server.main:app --port 8000 --reload`
 - Check `safechat.presidioApiUrl` in VS Code settings matches the port you are using.
 
 **"No cached diff available yet" when clicking View Masked Diff**

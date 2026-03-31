@@ -51,9 +51,10 @@ User attaches file(s) to @safechat
   └─────────────────────┘
 ```
 
-**Architecture: Strict Default-Deny (Whitelist Only)**
+**Architecture: Hybrid Edge (TypeScript extension + Python server)**
 
-Only files whose path or extension is **explicitly listed** — either in the built-in defaults or in this YAML file — are ever scanned. Everything else is bypassed. There is no content sniffing, no blacklists, and no guessing.
+- The **TypeScript extension** handles: Regex dictionary (22 patterns), Shannon Entropy scanner, bare token detection, and all Tier 2 AST key-based masking.
+- The **Python Presidio server** handles: NLP-based human PII detection (Tier 3, 12 entity types). The extension works without it — secrets are still caught by the regex/entropy engines.
 
 **Built-in scanned extensions (always active, no config needed):**
 
@@ -245,8 +246,6 @@ rules:
 | `hash` | `b7531e08a7ea1d5b7bec…` | One-way SHA-256 digest. Identical values always produce the same hash |
 | `encrypt` | `dGhpcyBpcyBh…` | AES-CBC reversible. Requires env var `SAFECHAT_ENCRYPT_KEY` (16, 24, or 32 chars). Falls back to `replace` if the key is missing |
 
-> Legacy capitalised values `Mask` and `Replace` still work for backwards compatibility.
-
 ### Examples
 
 ```yaml
@@ -395,6 +394,8 @@ rules:
 
 You can use either the friendly alias or the canonical Presidio type — both are accepted, case-insensitively.
 
+**Active entities (12 — detected by the running server):**
+
 | Friendly alias | Presidio entity type |
 |---|---|
 | `PhoneNumber`, `Phone` | `PHONE_NUMBER` |
@@ -406,15 +407,13 @@ You can use either the friendly alias or the canonical Presidio type — both ar
 | `Person`, `Name` | `PERSON` |
 | `IBAN`, `IBANCode` | `IBAN_CODE` |
 | `Crypto`, `Bitcoin` | `CRYPTO` |
-| `Location` | `LOCATION` |
-| `Date`, `DateTime` | `DATE_TIME` |
 | `URL` | `URL` |
-| `Passport` | `US_PASSPORT` |
-| `DrivingLicense`, `DriversLicense` | `US_DRIVER_LICENSE` |
-| `MedicalLicense` | `MEDICAL_LICENSE` |
-| `NRP` | `NRP` |
+| `CardCVV`, `CVV` | `CARD_CVV` |
+| `CardExpiry` | `CARD_EXPIRY` |
 
-For the full catalogue of 70+ entity types (financial, developer, infrastructure, CI/CD), visit `http://localhost:8000/docs/ui` or `http://localhost:8000/docs/entities`.
+> **Anti-hallucination:** `US_DRIVER_LICENSE` and `US_ITIN` are intentionally **not active** — they cause false positives on source code patterns like `apiVersion: v1`. Other Presidio built-ins (`LOCATION`, `DATE_TIME`, `US_PASSPORT`, `MEDICAL_LICENSE`, `NRP`) are also inactive in the default profile to reduce noise.
+
+For the Swagger UI and full entity catalogue, visit `http://localhost:8000/docs` when the server is running.
 
 ---
 

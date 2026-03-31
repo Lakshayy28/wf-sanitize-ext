@@ -5,13 +5,17 @@
 # It is re-read on every @safechat prompt — no reload or server restart needed.
 #
 # ┌─────────────────────────────────────────────────────────────────────────┐
-# │  ARCHITECTURE: Thin Client (VS Code) / Heavy Brain (Python Server)     │
+# │  ARCHITECTURE: Hybrid Edge (TypeScript extension + Python server)      │
 # │                                                                         │
-# │  Extension reads files → routes them → sends to Presidio server for    │
-# │  sanitization. ALL masking (regex, NLP, entropy) happens server-side.  │
-# │  Without the Python server running, NO sanitization will happen.       │
+# │  TypeScript handles: Regex (22 patterns), Shannon Entropy scanner,     │
+# │                       AST key-based masking (Tier 2), bare token       │
+# │                       detection.                                        │
+# │  Python server handles: NLP PII only (12 entity types, Tier 3).        │
+# │  Without the server: Tier 2 AST + Tier 3 regex/entropy still run.      │
+# │  Graceful degradation — server is optional for secret detection.       │
 # │                                                                         │
-# │  Start server: uvicorn presidio_server.main:app --port 8000            │
+# │  Start server: PYTHONPATH=<workspace> uvicorn                          │
+# │                presidio_server.main:app --port 8000 --reload           │
 # └─────────────────────────────────────────────────────────────────────────┘
 #
 # ROUTING: Strict Default-Deny (Whitelist Only)
@@ -111,14 +115,16 @@ custom_secrets:
 
 
 # ── 4. NLP Entity Overrides (Python Presidio Server) ─────────────────────────
-# Define how the Python Heavy Brain server handles Human PII and Financial Data.
-# These rules are passed as part of the API payload to POST /api/sanitize/batch.
-# ALL masking (regex, NLP, entropy) happens server-side.
+# Define how the Python Presidio server handles Human PII and Financial Data.
+# These rules are passed as part of the API payload to POST /sanitize.
+# The 12 active entities are: PERSON, EMAIL_ADDRESS, PHONE_NUMBER, CREDIT_CARD,
+# US_SSN, IBAN_CODE, US_BANK_NUMBER, CRYPTO, IP_ADDRESS, URL, CARD_CVV, CARD_EXPIRY
 #
-# Operations: 
+# Operations:
 #   replace  — substitute with a labelled placeholder (e.g. <PHONE_NUMBER>)
 #   mask     — substitute with asterisks (e.g. ****)
 #   redact   — completely remove the detected text
+#   hash     — one-way SHA-256 digest (repeatable for same value)
 # ─────────────────────────────────────────────────────────────────────────────
 rules:
   PERSON: replace
