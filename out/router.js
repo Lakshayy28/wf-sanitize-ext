@@ -70,7 +70,7 @@ const MAX_LINE_LENGTH = 10_000;
 // ────────────────────────────────────────────────────────────────────────────
 /** Tier 2: AST-parsed structured configs — key-based masking, no Presidio. */
 const DEFAULT_AST_EXTENSIONS = new Set([
-    '.json', '.yaml', '.yml', '.env', '.properties', '.ini',
+    '.json', '.jsonc', '.jsonl', '.yaml', '.yml', '.env', '.properties', '.ini',
     '.xml', '.npmrc', '.kubeconfig', '.tfvars',
     // Config files
     '.conf', '.cfg', '.config', '.toml',
@@ -81,7 +81,7 @@ const DEFAULT_AST_EXTENSIONS = new Set([
     // Keys/Certs (have key=value structure)
     '.pem', '.key', '.cert', '.crt', '.pub', '.p12', '.ppk', '.cer', '.asc',
     // IaC
-    '.tf', '.hcl', '.terraformrc',
+    '.tf', '.hcl', '.terraformrc', '.tfstate',
     // Build/Project
     '.csproj', '.props', '.targets', '.nuspec', '.kts',
     // Secrets
@@ -90,14 +90,14 @@ const DEFAULT_AST_EXTENSIONS = new Set([
     '.sh', '.bash', '.zsh', '.bat', '.cmd', '.ps1', '.psm1',
     // Docker/Make
     '.dockerfile', 'dockerfile', 'makefile', '.gradle',
+    // XML schemas / services
+    '.xsd', '.wsdl',
 ]);
 /** Tier 3: Full DLP — regex + Shannon entropy + Presidio NLP. */
 const DEFAULT_FULL_DLP_EXTENSIONS = new Set([
     '.txt', '.md', '.log',
-    '.jsonl', '.sql', '.graphql', '.gql',
-    '.xsd', '.wsdl', '.rtf',
-    // Terraform state contains secrets under generic keys like "value"
-    '.tfstate',
+    '.sql', '.graphql', '.gql',
+    '.rtf',
 ]);
 /**
  * Source-code extensions that should NEVER be scanned.
@@ -183,8 +183,8 @@ function isIgnoredExtension(ext) {
 // ────────────────────────────────────────────────────────────────────────────
 /** Map file extensions to the AST parser format they should use. */
 const AST_FORMAT_MAP = {
-    // JSON
-    '.json': 'json',
+    // JSON (jsonc-parser handles comments + trailing commas)
+    '.json': 'json', '.jsonc': 'jsonc', '.jsonl': 'jsonl', '.tfstate': 'json',
     // YAML
     '.yaml': 'yaml', '.yml': 'yaml', '.kubeconfig': 'yaml',
     // ENV
@@ -207,7 +207,7 @@ const AST_FORMAT_MAP = {
     '.tf': 'hcl', '.tfvars': 'hcl', '.hcl': 'hcl',
     '.terraformrc': 'hcl',
     // CSV / TSV
-    '.csv': 'csv', '.tsv': 'csv',
+    '.csv': 'csv', '.tsv': 'tsv',
     // Build scripts (shell = env format)
     '.sh': 'env', '.bash': 'env', '.zsh': 'env', '.bat': 'env',
     '.cmd': 'env', '.ps1': 'env', '.psm1': 'env',

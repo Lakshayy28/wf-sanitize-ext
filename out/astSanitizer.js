@@ -1,13 +1,52 @@
 "use strict";
 /**
- * astSanitizer.ts — Universal AST Guardian
- * ═════════════════════════════════════════
- * Tier 2 engine for structured config files (.json, .yaml, .env, .xml, .properties, .ini).
+ * astSanitizer.ts — Lightweight Pure-JS AST Sanitizer
+ * ════════════════════════════════════════════════════
+ * Tier 2 engine for structured config files.
+ * Uses domain-specific pure-JS parsers (zero WASM / native bindings):
+ *
+ *   JSON/JSONC   → jsonc-parser  (offset-based edits, preserves formatting)
+ *   YAML         → yaml          (AST document walk, preserves comments)
+ *   XML          → fast-xml-parser (DOM traversal)
+ *   ENV/Props    → line-by-line regex (PROP_RE)
+ *   CSV/TSV      → RFC-4180 parser (quote-aware cell splitting)
+ *
  * Parses into AST, identifies sensitive KEYS, masks their VALUES.
  * Guarantees 100% structure retention and zero false positives on code identifiers.
- *
- * No Presidio HTTP calls — purely local, fast key-matching.
  */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.sanitizeJson = sanitizeJson;
 exports.sanitizeYaml = sanitizeYaml;
@@ -16,10 +55,13 @@ exports.sanitizeProperties = sanitizeProperties;
 exports.sanitizeXml = sanitizeXml;
 exports.sanitizeToml = sanitizeToml;
 exports.sanitizeHcl = sanitizeHcl;
-exports.sanitizeCsv = sanitizeCsv;
+exports.sanitizeTabular = sanitizeTabular;
 exports.sanitizeUniversalKeyValue = sanitizeUniversalKeyValue;
 exports.astSanitize = astSanitize;
 const regexSanitizer_1 = require("./regexSanitizer");
+const jsoncParser = __importStar(require("jsonc-parser"));
+const YAML = __importStar(require("yaml"));
+const fast_xml_parser_1 = require("fast-xml-parser");
 /**
  * Process a single AST key-value pair:
  *  1. FAST PATH — key matches the dynamic secret list → instant MASK
@@ -43,76 +85,159 @@ async function processAstValue(key, value, piiCheck) {
     return value;
 }
 // ────────────────────────────────────────────────────────────────────────────
-// JSON Parser — JSON.parse Engine
+// JSON / JSONC / JSONL Parser — jsonc-parser (offset-based editing)
 // ────────────────────────────────────────────────────────────────────────────
 /**
- * Sanitize JSON by parsing with JSON.parse, walking the resulting object tree,
- * and masking string values whose keys match the sensitive-key list.
- * Returns null if the input is not valid JSON (caller should fall back).
+ * Sanitize JSON/JSONC/JSONL files using Microsoft's `jsonc-parser`.
+ * Walks the AST via `visit()`, collects offset-based edits for sensitive
+ * values, then applies them back-to-front so positions stay stable.
+ * Handles comments, trailing commas, and preserves all original formatting.
+ *
+ * Returns null if the input is not valid JSON/JSONC (caller should fall back).
  */
 async function sanitizeJson(text, piiCheck) {
-    let parsed;
-    try {
-        parsed = JSON.parse(text);
-    }
-    catch {
-        return null; // Not valid JSON — caller should fall back
+    // Quick validation — bail if jsonc-parser can't make sense of it
+    const errors = [];
+    jsoncParser.parse(text, errors);
+    if (errors.length > 0 && errors.some(e => e.error === 1 /* jsoncParser.ParseErrorCode.InvalidSymbol */)) {
+        return null;
     }
     let modified = false;
-    async function walk(node) {
-        if (Array.isArray(node)) {
-            const items = [];
-            for (const item of node) {
-                items.push(await walk(item));
+    const edits = [];
+    // Track the current property name as we walk
+    let currentKey;
+    jsoncParser.visit(text, {
+        onObjectProperty(property) {
+            currentKey = property;
+        },
+        onLiteralValue(value, offset, length) {
+            if (currentKey === undefined) {
+                return;
             }
-            return items;
-        }
-        if (node !== null && typeof node === 'object') {
-            const obj = node;
-            const result = {};
-            for (const [key, val] of Object.entries(obj)) {
-                if (typeof val === 'string' && val.length > 0) {
-                    const cleaned = await processAstValue(key, val, piiCheck);
-                    if (cleaned !== val) {
-                        modified = true;
-                    }
-                    result[key] = cleaned;
-                }
-                else if (typeof val === 'object' && val !== null) {
-                    result[key] = await walk(val);
-                }
-                else {
-                    result[key] = val;
-                }
+            if (typeof value !== 'string' || value.length === 0) {
+                currentKey = undefined;
+                return;
             }
-            return result;
+            // We can only do sync checks in the visitor — collect all candidates
+            // and process async operations after the walk
+            edits.push({ offset, length, replacement: currentKey });
+            currentKey = undefined;
+        },
+        onObjectEnd() {
+            currentKey = undefined;
+        },
+    });
+    // Process collected edits: run processAstValue for each candidate
+    const resolvedEdits = [];
+    for (const edit of edits) {
+        const key = edit.replacement; // we stored the key temporarily
+        const rawSlice = text.slice(edit.offset, edit.offset + edit.length);
+        // Extract the actual string value (strip surrounding quotes)
+        let originalValue;
+        try {
+            originalValue = JSON.parse(rawSlice);
         }
-        return node;
+        catch {
+            continue;
+        }
+        if (typeof originalValue !== 'string') {
+            continue;
+        }
+        const cleaned = await processAstValue(key, originalValue, piiCheck);
+        if (cleaned !== originalValue) {
+            modified = true;
+            // Build the replacement including the JSON quotes
+            const jsonEncoded = JSON.stringify(cleaned);
+            resolvedEdits.push({ offset: edit.offset, length: edit.length, replacement: jsonEncoded });
+        }
     }
-    const indent = detectJsonIndent(text);
-    const cleaned = await walk(parsed);
-    const cleanText = JSON.stringify(cleaned, null, indent);
-    return { cleanText, wasModified: modified };
-}
-function detectJsonIndent(text) {
-    const match = text.match(/^[\s]*\n([ \t]+)/m);
-    if (match) {
-        const ws = match[1];
-        if (ws[0] === '\t') {
-            return 1;
-        } // tab-indented, use 1 tab via JSON.stringify
-        return ws.length;
+    if (!modified) {
+        return { cleanText: text, wasModified: false };
     }
-    return 2; // default
+    // Apply edits back-to-front to preserve offsets
+    let result = text;
+    for (let i = resolvedEdits.length - 1; i >= 0; i--) {
+        const e = resolvedEdits[i];
+        result = result.slice(0, e.offset) + e.replacement + result.slice(e.offset + e.length);
+    }
+    return { cleanText: result, wasModified: true };
 }
 // ────────────────────────────────────────────────────────────────────────────
-// YAML Parser — Regex Engine
+// YAML Parser — `yaml` library (AST document walk)
 // ────────────────────────────────────────────────────────────────────────────
 /**
- * Sanitize YAML by splitting into lines, matching `key: value` patterns,
- * and masking string values whose keys match the sensitive-key list.
+ * Sanitize YAML using the `yaml` library's `parseDocument()`.
+ * Walks the concrete syntax tree (CST-aware document model), which preserves:
+ *   - comments, anchors, aliases, block scalars, flow collections
+ *   - original quoting style and indentation
+ *
+ * Mutates scalar values in-place (the document model tracks positions),
+ * then serializes back via `doc.toString()` which re-emits the source
+ * with only the changed values differing.
  */
 async function sanitizeYaml(text, piiCheck) {
+    let doc;
+    try {
+        doc = YAML.parseDocument(text, { keepSourceTokens: true });
+    }
+    catch {
+        // Not valid YAML — fall back to line-by-line regex
+        return sanitizeYamlRegex(text, piiCheck);
+    }
+    // If the document has serious errors, use the regex fallback
+    if (doc.errors.length > 0) {
+        return sanitizeYamlRegex(text, piiCheck);
+    }
+    let modified = false;
+    async function walkNode(node, parentKey) {
+        if (YAML.isMap(node)) {
+            for (const item of node.items) {
+                const keyStr = YAML.isScalar(item.key) ? String(item.key.value) : undefined;
+                if (YAML.isScalar(item.value) && typeof item.value.value === 'string' && keyStr) {
+                    const original = item.value.value;
+                    if (original.length > 0) {
+                        const cleaned = await processAstValue(keyStr, original, piiCheck);
+                        if (cleaned !== original) {
+                            modified = true;
+                            item.value.value = cleaned;
+                        }
+                    }
+                }
+                else if (YAML.isMap(item.value) || YAML.isSeq(item.value)) {
+                    await walkNode(item.value, keyStr);
+                }
+            }
+        }
+        else if (YAML.isSeq(node)) {
+            for (const item of node.items) {
+                if (YAML.isMap(item) || YAML.isSeq(item)) {
+                    await walkNode(item, parentKey);
+                }
+                // Scalar items in sequences: mask if parent key is sensitive
+                if (YAML.isScalar(item) && typeof item.value === 'string' && parentKey) {
+                    const original = item.value;
+                    if (original.length > 0) {
+                        const cleaned = await processAstValue(parentKey, original, piiCheck);
+                        if (cleaned !== original) {
+                            modified = true;
+                            item.value = cleaned;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    await walkNode(doc.contents);
+    if (!modified) {
+        return { cleanText: text, wasModified: false };
+    }
+    return { cleanText: doc.toString(), wasModified: true };
+}
+/**
+ * Regex fallback for YAML files that fail AST parsing.
+ * Matches `key: value` patterns line-by-line.
+ */
+async function sanitizeYamlRegex(text, piiCheck) {
     let modified = false;
     const lines = text.split('\n');
     const result = [];
@@ -240,17 +365,148 @@ async function sanitizeProperties(text, piiCheck) {
     return { cleanText: result.join('\n'), wasModified: modified };
 }
 // ────────────────────────────────────────────────────────────────────────────
-// XML Parser — Regex Engine
+// XML Parser — fast-xml-parser (DOM traversal)
 // ────────────────────────────────────────────────────────────────────────────
+const xmlParserOptions = {
+    ignoreAttributes: false,
+    attributeNamePrefix: '@_',
+    textNodeName: '#text',
+    preserveOrder: true,
+    commentPropName: '#comment',
+    cdataPropName: '#cdata',
+    trimValues: false,
+    parseTagValue: false,
+    parseAttributeValue: false,
+};
+const xmlBuilderOptions = {
+    ignoreAttributes: false,
+    attributeNamePrefix: '@_',
+    textNodeName: '#text',
+    preserveOrder: true,
+    commentPropName: '#comment',
+    cdataPropName: '#cdata',
+    format: true,
+    suppressEmptyNode: false,
+    suppressBooleanAttributes: false,
+};
 /**
- * Sanitize XML by finding <TagName>value</TagName> and sending values
- * through processAstValue (secret-key → MASK, otherwise → Presidio PII check).
- * Also handles attribute-based sensitive values: name="password" value="secret".
+ * Sanitize XML using `fast-xml-parser` for proper DOM-level traversal.
+ * Walks the parsed tree, masking:
+ *   - Text content of elements whose tag name matches sensitive keys
+ *   - Attribute values where the attribute name matches sensitive keys
+ *   - Config-style: `name="password" value="secret"` patterns
+ *
+ * Falls back to the regex-based XML scanner if parsing fails.
  */
 async function sanitizeXml(text, piiCheck) {
+    let parsed;
+    try {
+        const parser = new fast_xml_parser_1.XMLParser(xmlParserOptions);
+        parsed = parser.parse(text);
+    }
+    catch {
+        return sanitizeXmlRegex(text, piiCheck);
+    }
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+        return sanitizeXmlRegex(text, piiCheck);
+    }
+    let modified = false;
+    async function walkXmlNodes(nodes) {
+        for (const node of nodes) {
+            if (typeof node !== 'object' || node === null) {
+                continue;
+            }
+            const obj = node;
+            for (const tagName of Object.keys(obj)) {
+                if (tagName.startsWith('@_') || tagName === '#text' || tagName === '#comment' || tagName === '#cdata') {
+                    continue;
+                }
+                const children = obj[tagName];
+                if (!Array.isArray(children)) {
+                    continue;
+                }
+                for (const child of children) {
+                    if (typeof child !== 'object' || child === null) {
+                        continue;
+                    }
+                    const childObj = child;
+                    // Process text node: <tagName>value</tagName>
+                    if (typeof childObj['#text'] === 'string' && childObj['#text'].trim().length > 0) {
+                        const original = childObj['#text'];
+                        const cleaned = await processAstValue(tagName, original.trim(), piiCheck);
+                        if (cleaned !== original.trim()) {
+                            modified = true;
+                            childObj['#text'] = cleaned;
+                        }
+                    }
+                    // Process attributes: mask if attr name is sensitive
+                    const attrs = childObj[':@'];
+                    if (attrs && typeof attrs === 'object') {
+                        // Config-style detection: name/key attr has sensitive value → mask "value" attr
+                        const nameAttr = (attrs['@_name'] ?? attrs['@_key'] ?? attrs['@_id']);
+                        if (nameAttr && typeof nameAttr === 'string' && (0, regexSanitizer_1.isSensitiveKey)(nameAttr)) {
+                            if (typeof attrs['@_value'] === 'string' && attrs['@_value'].length > 0) {
+                                modified = true;
+                                attrs['@_value'] = regexSanitizer_1.MASK;
+                            }
+                        }
+                        // Individual sensitive attributes
+                        for (const [attrName, attrVal] of Object.entries(attrs)) {
+                            if (!attrName.startsWith('@_')) {
+                                continue;
+                            }
+                            const cleanAttrName = attrName.slice(2); // strip @_ prefix
+                            if (typeof attrVal === 'string' && attrVal.length > 0 && (0, regexSanitizer_1.isSensitiveKey)(cleanAttrName)) {
+                                const cleaned = await processAstValue(cleanAttrName, attrVal, piiCheck);
+                                if (cleaned !== attrVal) {
+                                    modified = true;
+                                    attrs[attrName] = cleaned;
+                                }
+                            }
+                        }
+                    }
+                    // Recurse into nested tags
+                    for (const childTag of Object.keys(childObj)) {
+                        if (childTag === '#text' || childTag === '#comment' || childTag === '#cdata' || childTag === ':@') {
+                            continue;
+                        }
+                        if (Array.isArray(childObj[childTag])) {
+                            // Wrap into the structure walkXmlNodes expects
+                            await walkXmlNodes([{ [childTag]: childObj[childTag] }]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    await walkXmlNodes(parsed);
+    if (!modified) {
+        return { cleanText: text, wasModified: modified };
+    }
+    try {
+        const builder = new fast_xml_parser_1.XMLBuilder(xmlBuilderOptions);
+        const rebuilt = builder.build(parsed);
+        // Preserve XML declaration if original had one
+        const declMatch = text.match(/^<\?xml[^?]*\?>\s*/);
+        const builtDeclMatch = rebuilt.match(/^<\?xml[^?]*\?>\s*/);
+        let cleanText = rebuilt;
+        if (declMatch && !builtDeclMatch) {
+            cleanText = declMatch[0] + rebuilt;
+        }
+        return { cleanText, wasModified: true };
+    }
+    catch {
+        // If builder fails, fall back to regex approach
+        return sanitizeXmlRegex(text, piiCheck);
+    }
+}
+/**
+ * Regex fallback for XML files that fail DOM parsing.
+ */
+async function sanitizeXmlRegex(text, piiCheck) {
     let modified = false;
     let cleanText = text;
-    // Tag-based: <tagName>value</tagName> — process via AST-to-Presidio bridge
+    // Tag-based: <tagName>value</tagName>
     const tagRe = /(<([A-Za-z0-9_.\-:]+)[^>]*>)([^<]+)(<\/\2>)/g;
     const replacements = [];
     let tagMatch;
@@ -268,12 +524,11 @@ async function sanitizeXml(text, piiCheck) {
             }
         }
     }
-    // Apply replacements in reverse order to preserve string positions
     for (let i = replacements.length - 1; i >= 0; i--) {
         const r = replacements[i];
         cleanText = cleanText.slice(0, r.start) + r.text + cleanText.slice(r.end);
     }
-    // Attribute-based: name="password" value="secret" — sync sensitive-key check
+    // Attribute-based: name="password" value="secret"
     cleanText = cleanText.replace(/(\b(?:name|key|id)\s*=\s*["'][^"']*(?:password|secret|token|key|auth|credential|cert|api)[^"']*["']\s+(?:value)\s*=\s*)(["'])([^"']*)\2/gi, (full, prefix, quote, value) => {
         if (value.trim().length > 0) {
             modified = true;
@@ -305,24 +560,26 @@ async function sanitizeHcl(rawText, piiCheck) {
     return sanitizeProperties(rawText, piiCheck);
 }
 // ────────────────────────────────────────────────────────────────────────────
-// CSV / TSV Parser — Header-based Column Sanitizer
+// CSV / TSV Parser — Header-based Column Sanitizer (RFC-4180 quote-aware)
 // ────────────────────────────────────────────────────────────────────────────
 /**
- * Sanitize CSV/TSV files by treating the header row as keys and each data
- * cell as a value.  Runs every cell through processAstValue so that
+ * Sanitize CSV/TSV files by treating the header row as column keys and each
+ * data cell as a value. Runs every cell through processAstValue so that
  * columns like "password", "ssn", "api_key" get masked automatically and
  * other values go through Presidio PII detection.
+ *
+ * @param delimiter — explicit delimiter override. Auto-detected (tab/comma) if omitted.
  */
-async function sanitizeCsv(rawText, piiCheck) {
+async function sanitizeTabular(rawText, piiCheck, delimiter) {
     const lines = rawText.split('\n');
     if (lines.length < 2) {
         // Need at least a header + one data row
         return { cleanText: rawText, wasModified: false };
     }
-    // Detect delimiter: tab-first, then comma
-    const delimiter = lines[0].includes('\t') ? '\t' : ',';
+    // Detect delimiter: explicit param > tab-first > comma
+    const sep = delimiter ?? (lines[0].includes('\t') ? '\t' : ',');
     // Parse header row (strip surrounding quotes)
-    const headers = parseCsvRow(lines[0], delimiter);
+    const headers = parseCsvRow(lines[0], sep);
     if (headers.length === 0) {
         return { cleanText: rawText, wasModified: false };
     }
@@ -335,7 +592,7 @@ async function sanitizeCsv(rawText, piiCheck) {
             resultLines.push(line);
             continue;
         }
-        const cells = parseCsvRow(line, delimiter);
+        const cells = parseCsvRow(line, sep);
         const cleanedCells = [];
         for (let col = 0; col < cells.length; col++) {
             const header = col < headers.length ? headers[col] : `col_${col}`;
@@ -352,7 +609,7 @@ async function sanitizeCsv(rawText, piiCheck) {
             }
         }
         // Rebuild the line — quote cells that contain the delimiter or quotes
-        resultLines.push(cleanedCells.map(c => csvQuote(c, delimiter)).join(delimiter));
+        resultLines.push(cleanedCells.map(c => csvQuote(c, sep)).join(sep));
     }
     return { cleanText: resultLines.join('\n'), wasModified: modified };
 }
@@ -455,10 +712,15 @@ async function sanitizeUniversalKeyValue(rawText) {
  */
 async function astSanitize(text, format, piiCheck) {
     switch (format) {
-        case 'json': {
+        case 'json':
+        case 'jsonc': {
             const result = await sanitizeJson(text, piiCheck);
-            // If JSON parsing fails, fall back to YAML parser (handles key: value generically)
+            // If JSON/JSONC parsing fails, fall back to YAML parser (handles key: value generically)
             return result ?? await sanitizeYaml(text, piiCheck);
+        }
+        case 'jsonl': {
+            // JSONL: each line is an independent JSON object
+            return sanitizeJsonl(text, piiCheck);
         }
         case 'yaml':
             return sanitizeYaml(text, piiCheck);
@@ -473,9 +735,37 @@ async function astSanitize(text, format, piiCheck) {
         case 'hcl':
             return sanitizeHcl(text, piiCheck);
         case 'csv':
-            return sanitizeCsv(text, piiCheck);
+            return sanitizeTabular(text, piiCheck, ',');
+        case 'tsv':
+            return sanitizeTabular(text, piiCheck, '\t');
         default:
             return { cleanText: text, wasModified: false };
     }
+}
+/**
+ * Sanitize JSONL (newline-delimited JSON).
+ * Each non-empty line is independently parsed and sanitized.
+ */
+async function sanitizeJsonl(text, piiCheck) {
+    const lines = text.split('\n');
+    let modified = false;
+    const result = [];
+    for (const line of lines) {
+        if (line.trim().length === 0) {
+            result.push(line);
+            continue;
+        }
+        const lineResult = await sanitizeJson(line, piiCheck);
+        if (lineResult) {
+            result.push(lineResult.cleanText);
+            if (lineResult.wasModified) {
+                modified = true;
+            }
+        }
+        else {
+            result.push(line); // unparseable line — keep as-is
+        }
+    }
+    return { cleanText: result.join('\n'), wasModified: modified };
 }
 //# sourceMappingURL=astSanitizer.js.map
