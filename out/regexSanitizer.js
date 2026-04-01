@@ -5,10 +5,14 @@
  * Tier 3 engine for unstructured text (.txt, .log, terminal, user prompts).
  * Uses Capture Group 1 for secret values so surrounding keys are preserved.
  *
- * Also exports `DYNAMIC_AST_KEYS` consumed by the AST Guardian (astSanitizer).
+ * Also exports `DYNAMIC_AST_KEYS` and `isSensitiveKey()` consumed by the
+ * AST Guardian (astSanitizer). `isSensitiveKey` uses two-tier matching:
+ *   Tier 1 — exact token match against DYNAMIC_AST_KEYS (no substring false-positives)
+ *   Tier 2 — structural suffix match on the last token (catches infinite combinations
+ *             like `myApp_refreshCred`, `svc_api_token_v2` without a word list)
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.HIGH_CONFIDENCE_SECRETS = exports.MASK = exports.DYNAMIC_AST_KEYS = void 0;
+exports.HIGH_CONFIDENCE_SECRETS = exports.MASK = exports.SENSITIVE_SUFFIXES = exports.DYNAMIC_AST_KEYS = void 0;
 exports.isSensitiveKey = isSensitiveKey;
 exports.hydrateCustomSecrets = hydrateCustomSecrets;
 exports.calculateShannonEntropy = calculateShannonEntropy;
@@ -17,27 +21,69 @@ exports.regexSanitize = regexSanitize;
 exports.stripAnsiCodes = stripAnsiCodes;
 exports.terminalSanitize = terminalSanitize;
 // ────────────────────────────────────────────────────────────────────────────
-// Dynamic AST Key list (shared with astSanitizer.ts)
+// Dynamic AST Key set (shared with astSanitizer.ts, extended by hydration)
 // ────────────────────────────────────────────────────────────────────────────
-exports.DYNAMIC_AST_KEYS = [
+exports.DYNAMIC_AST_KEYS = new Set([
     // Infrastructure secrets
-    'secret', 'token', 'password', 'passwd', 'auth', 'credential',
-    'cert', 'ssh', 'bearer', 'client_id', 'client_secret', 'private',
-    'jwt', 'session', 'encryption_key', 'access_key', 'secret_key',
-    'api_key', 'apikey', 'private_key',
+    'secret', 'token', 'password', 'passwd', 'pass', 'pwd', 'passphrase', 'passcode',
+    'auth', 'authorization', 'authentication', 'authenticate',
+    'credential', 'credentials', 'cert', 'certificate', 'bearer', 'ssh',
+    'jwt', 'session', 'private', 'key', 'apikey', 'accesskey', 'secretkey', 'signingkey',
+    'client_id', 'client_secret', 'private_key', 'encryption_key', 'access_key', 'secret_key', 'api_key',
+    // Infrastructure discovery (endpoints, hostnames, connection details)
+    'dsn', 'fqdn', 'owner',
     // PII identifiers (catches SSN/CC/IBAN values under labeled keys)
     'ssn', 'social_security', 'credit_card', 'card_number', 'card_no',
-    'cvv', 'iban', 'bank_account', 'account_number', 'routing_number',
+    'cvv', 'cvc', 'iban', 'bank_account', 'account_number', 'routing_number',
     'national_id', 'passport', 'driver_license', 'drivers_license',
     'dob', 'date_of_birth', 'birth_date',
-];
+]);
 /**
- * Tests whether a key name looks sensitive by matching against DYNAMIC_AST_KEYS.
- * Case-insensitive, matches partial key names (e.g. "db_password" matches "password").
+ * Structural suffixes — if the *last* meaningful token of a key is one of
+ * these, the key is sensitive regardless of its prefix. Covers infinite
+ * new combinations: `myApp_refreshToken`, `svc_api_key_v2`, `serviceAccountCred`.
+ * Exported as a mutable Set so YAML config can extend it at runtime.
+ */
+exports.SENSITIVE_SUFFIXES = new Set([
+    'key', 'keys', 'token', 'tokens', 'secret', 'secrets',
+    'pass', 'pwd', 'cred', 'creds', 'auth', 'cert', 'certs',
+    'passphrase', 'passcode', 'credential', 'credentials',
+    // Infrastructure endpoints & connection details
+    'url', 'uri', 'host', 'hostname', 'endpoint', 'address', 'server', 'dsn', 'webhook',
+    // PII contact fields
+    'username', 'user', 'email', 'phone', 'contact', 'sid',
+]);
+/**
+ * Split a key name into lowercase word tokens, handling snake_case, camelCase,
+ * PascalCase, kebab-case, dots, and numeric separators.
+ *   myApiKey     → ['my', 'api', 'key']
+ *   db_password  → ['db', 'password']
+ *   api-key-v2   → ['api', 'key', 'v2']
+ *   authorName   → ['author', 'name']   ← does NOT match 'auth'
+ *   ACLToken     → ['acl', 'token']
+ */
+function tokenizeKeyName(key) {
+    return key
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2') // ACLKey → ACL_Key
+        .replace(/([a-z\d])([A-Z])/g, '$1_$2') // apiKey → api_Key
+        .toLowerCase()
+        .split(/[\s_\-.:\/\\]+/)
+        .filter(t => t.length > 0);
+}
+/**
+ * Two-tier sensitive key detection.
+ * Tier 1: any word-token in the key exactly matches DYNAMIC_AST_KEYS —
+ *         eliminates substring false-positives ("author" no longer hits "auth").
+ * Tier 2: the last non-version token is a structural suffix —
+ *         catches any `<prefix>_<suffix>` combination without enumerating prefixes.
  */
 function isSensitiveKey(key) {
-    const lower = key.toLowerCase();
-    return exports.DYNAMIC_AST_KEYS.some(k => lower.includes(k));
+    const tokens = tokenizeKeyName(key);
+    if (tokens.some(t => exports.DYNAMIC_AST_KEYS.has(t))) {
+        return true;
+    }
+    const lastMeaningful = [...tokens].reverse().find(t => !/^\d+$/.test(t) && t.length > 1);
+    return lastMeaningful !== undefined && exports.SENSITIVE_SUFFIXES.has(lastMeaningful);
 }
 // ────────────────────────────────────────────────────────────────────────────
 // Mask placeholder
@@ -83,9 +129,12 @@ exports.HIGH_CONFIDENCE_SECRETS = [
     // IBAN: 2 uppercase letters + 2 check digits + 11-30 alphanumeric
     { name: 'IBAN Code', regex: /\b([A-Z]{2}\d{2}[A-Z0-9]{11,30})\b/g },
     // IPv4: whole-match replacement (no capture group to avoid partial masking)
-    { name: 'IPv4 Address', regex: /\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g },
-    { name: 'MAC Address', regex: /\b([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})\b/g },
-    { name: 'Email Address', regex: /\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/g },
+    { name: 'IPv4 Address', regex: /(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/g },
+    // Internal hostnames: *.internal, *.local, *.private (org-internal FQDN patterns)
+    { name: 'Internal Hostname', regex: /\b[a-z0-9][a-z0-9\-]*(?:\.[a-z0-9][a-z0-9\-]*)*\.(?:internal|local|private)\b/gi },
+    { name: 'MAC Address', regex: /(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}/g },
+    { name: 'Certificate Thumbprint', regex: /(?:[0-9A-Fa-f]{2}:){19}[0-9A-Fa-f]{2}/g },
+    { name: 'Email Address', regex: /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/g },
     // Phone: whole-match replacement (no partial capture group)
     { name: 'Phone Number Fallback', regex: /(?:\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g },
 ];
@@ -108,10 +157,7 @@ function hydrateCustomSecrets(customSecrets) {
         // Inject AST keys
         if (def.ast_keys) {
             for (const k of def.ast_keys) {
-                const lower = k.toLowerCase();
-                if (!exports.DYNAMIC_AST_KEYS.includes(lower)) {
-                    exports.DYNAMIC_AST_KEYS.push(lower);
-                }
+                exports.DYNAMIC_AST_KEYS.add(k.toLowerCase());
             }
         }
         // Only compile a value-hunting regex when a prefix is defined.
@@ -274,13 +320,15 @@ function regexSanitize(text) {
         }
         else {
             // Standard handler: Group 1 isolation (mask only the captured secret)
+            // NOTE: when a regex has no capture groups, JS passes the match offset as the
+            // second callback argument. The typeof guard prevents treating that number as a group.
             cleanText = cleanText.replace(rule.regex, (match, group1) => {
                 // Skip if already masked (prevents double-masking when regex safety net runs after AST)
                 if (match.includes(exports.MASK)) {
                     return match;
                 }
                 modified = true;
-                if (group1) {
+                if (typeof group1 === 'string' && group1) {
                     return match.replace(group1, exports.MASK);
                 }
                 return exports.MASK;

@@ -78,10 +78,17 @@ export async function sanitizeJson(
   type Edit = { offset: number; length: number; replacement: string };
   const edits: Edit[] = [];
 
-  // Track the current property name as we walk
+  // Track the current property name and a stack of parent object keys
+  // so that "value" nested under a sensitive key (e.g. db_password.value in
+  // Terraform state) correctly inherits the parent's sensitivity.
   let currentKey: string | undefined;
+  const keyStack: string[] = [];
 
   jsoncParser.visit(text, {
+    onObjectBegin() {
+      keyStack.push(currentKey ?? '');
+      currentKey = undefined;
+    },
     onObjectProperty(property: string) {
       currentKey = property;
     },
@@ -89,12 +96,24 @@ export async function sanitizeJson(
       if (currentKey === undefined) { return; }
       if (typeof value !== 'string' || value.length === 0) { currentKey = undefined; return; }
 
+      // Parent-key inheritance: if this key is a generic "value" (or "default")
+      // and the immediate parent object key is itself sensitive, promote the
+      // effective key so the value is masked directly (e.g. tfstate pattern:
+      //   "db_password": { "value": "Sup3rS3cr3t", "sensitive": true }).
+      const parentKey = keyStack.length > 0 ? keyStack[keyStack.length - 1] : '';
+      const INHERITED_VALUE_KEYS = new Set(['value', 'default', 'data']);
+      const effectiveKey =
+        INHERITED_VALUE_KEYS.has(currentKey) && parentKey && isSensitiveKey(parentKey)
+          ? parentKey
+          : currentKey;
+
       // We can only do sync checks in the visitor — collect all candidates
       // and process async operations after the walk
-      edits.push({ offset, length, replacement: currentKey });
+      edits.push({ offset, length, replacement: effectiveKey });
       currentKey = undefined;
     },
     onObjectEnd() {
+      keyStack.pop();
       currentKey = undefined;
     },
   });
@@ -177,7 +196,15 @@ export async function sanitizeYaml(
         if (YAML.isScalar(item.value) && typeof item.value.value === 'string' && keyStr) {
           const original = item.value.value as string;
           if (original.length > 0) {
-            const cleaned = await processAstValue(keyStr, original, piiCheck);
+            // Parent-key inheritance: "value" / "default" / "data" nested under
+            // a sensitive parent key inherits the parent's sensitivity category
+            // (e.g. Terraform outputs: db_password.value, K8s secret data.password).
+            const INHERITED_VALUE_KEYS = new Set(['value', 'default', 'data']);
+            const effectiveKey =
+              INHERITED_VALUE_KEYS.has(keyStr) && parentKey && isSensitiveKey(parentKey)
+                ? parentKey
+                : keyStr;
+            const cleaned = await processAstValue(effectiveKey, original, piiCheck);
             if (cleaned !== original) {
               modified = true;
               item.value.value = cleaned;

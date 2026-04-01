@@ -15,7 +15,7 @@ import * as http from 'http';
 import * as https from 'https';
 
 // ── Module imports ──────────────────────────────────────────────────────────
-import { regexSanitize, terminalSanitize, stripAnsiCodes, hydrateCustomSecrets, MASK, applyEntropyMasking, DYNAMIC_AST_KEYS } from './regexSanitizer';
+import { regexSanitize, terminalSanitize, stripAnsiCodes, hydrateCustomSecrets, MASK, applyEntropyMasking, DYNAMIC_AST_KEYS, SENSITIVE_SUFFIXES } from './regexSanitizer';
 import { astSanitize, sanitizeUniversalKeyValue, type AstFormat, type PiiChecker } from './astSanitizer';
 import {
   getFileCategory, getAstFormat, readRulesConfig,
@@ -113,19 +113,22 @@ let _hydrated = false;
 let _hydratedConfigHash = '';
 
 function ensureHydrated(config?: RulesConfig): void {
-  const configHash = JSON.stringify(config?.custom_secrets ?? []);
+  const configHash = JSON.stringify([
+    config?.custom_secrets ?? [],
+    config?.sensitive_suffixes ?? [],
+  ]);
   if (_hydrated && configHash === _hydratedConfigHash) { return; }
-  if (!config?.custom_secrets) { _hydrated = true; _hydratedConfigHash = configHash; return; }
-  // Only push custom AST keys (server handles the regex patterns)
-  for (const def of config.custom_secrets) {
+  // Tier 1: custom AST key tokens
+  for (const def of config?.custom_secrets ?? []) {
     if (def.ast_keys) {
       for (const k of def.ast_keys) {
-        const lower = k.toLowerCase();
-        if (!DYNAMIC_AST_KEYS.includes(lower)) {
-          DYNAMIC_AST_KEYS.push(lower);
-        }
+        DYNAMIC_AST_KEYS.add(k.toLowerCase());
       }
     }
+  }
+  // Tier 2: custom structural suffixes
+  for (const suffix of config?.sensitive_suffixes ?? []) {
+    SENSITIVE_SUFFIXES.add(suffix.toLowerCase());
   }
   _hydrated = true;
   _hydratedConfigHash = configHash;

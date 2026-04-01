@@ -94,10 +94,28 @@ custom_paths:
   #   strategy: IGNORE
 
 
-# ── 3. Dynamic Secret Builder ─────────────────────────────────────────────────
+# ── 3a. Sensitive Key Suffix Extensions ──────────────────────────────────────
+# Extend the Tier-2 structural suffix check inside isSensitiveKey().
+# Any key whose last meaningful word-token matches one of these is treated as
+# sensitive — regardless of the prefix. This means you never need to enumerate
+# every possible combination like `myApp_ciphertext` or `svc_vault_enc`.
+#
+# Built-in defaults (always active):
+#   key, token, secret, pass, pwd, cred, auth, cert, passphrase, passcode,
+#   credential, credentials, keys, tokens, secrets, creds, certs
+#
+# Add org-specific suffixes below (lowercase, no underscores):
+# ─────────────────────────────────────────────────────────────────────────────
+sensitive_suffixes:
+  # - cipher         # e.g. svc_cipher, user_vault_cipher
+  # - enc            # e.g. db_password_enc, myApp_enc
+  # - hash           # e.g. passwordHash (if you store raw hashes)
+  # - vault          # e.g. db_vault
+
+# ── 3b. Dynamic Secret Builder ────────────────────────────────────────────────
 # Define custom internal developer secrets here. The extension will:
-# 1. Inject `ast_keys` into the Tier 2 AST parsers so those keys are masked
-#    immediately at the AST level (key-name detection).
+# 1. Inject `ast_keys` into the Tier 1 exact-token lookup so those keys are
+#    masked at the AST level (key-name detection).
 # 2. Pass prefix/charset/length definitions to the Python server, which
 #    dynamically compiles regex patterns for Tier 3 unstructured text scanning.
 # ─────────────────────────────────────────────────────────────────────────────

@@ -72,6 +72,8 @@ export interface RulesConfig {
   custom_paths?: CustomPathRule[];
   custom_secrets?: CustomSecretDef[];
   custom_recognizers?: CustomRecognizerDef[];
+  /** Extra Tier-2 suffix tokens added to isSensitiveKey’s structural suffix check. */
+  sensitive_suffixes?: string[];
 }
 
 // ────────────────────────────────────────────────────────────────────────────

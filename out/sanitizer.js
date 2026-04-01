@@ -135,25 +135,24 @@ function callPresidioApi(text, rulesConfig) {
 let _hydrated = false;
 let _hydratedConfigHash = '';
 function ensureHydrated(config) {
-    const configHash = JSON.stringify(config?.custom_secrets ?? []);
+    const configHash = JSON.stringify([
+        config?.custom_secrets ?? [],
+        config?.sensitive_suffixes ?? [],
+    ]);
     if (_hydrated && configHash === _hydratedConfigHash) {
         return;
     }
-    if (!config?.custom_secrets) {
-        _hydrated = true;
-        _hydratedConfigHash = configHash;
-        return;
-    }
-    // Only push custom AST keys (server handles the regex patterns)
-    for (const def of config.custom_secrets) {
+    // Tier 1: custom AST key tokens
+    for (const def of config?.custom_secrets ?? []) {
         if (def.ast_keys) {
             for (const k of def.ast_keys) {
-                const lower = k.toLowerCase();
-                if (!regexSanitizer_1.DYNAMIC_AST_KEYS.includes(lower)) {
-                    regexSanitizer_1.DYNAMIC_AST_KEYS.push(lower);
-                }
+                regexSanitizer_1.DYNAMIC_AST_KEYS.add(k.toLowerCase());
             }
         }
+    }
+    // Tier 2: custom structural suffixes
+    for (const suffix of config?.sensitive_suffixes ?? []) {
+        regexSanitizer_1.SENSITIVE_SUFFIXES.add(suffix.toLowerCase());
     }
     _hydrated = true;
     _hydratedConfigHash = configHash;
