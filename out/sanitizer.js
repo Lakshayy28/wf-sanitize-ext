@@ -55,6 +55,7 @@ const https = __importStar(require("https"));
 // ── Module imports ──────────────────────────────────────────────────────────
 const regexSanitizer_1 = require("./regexSanitizer");
 const astSanitizer_1 = require("./astSanitizer");
+const piiSanitizer_1 = require("./piiSanitizer");
 const router_1 = require("./router");
 // ── Re-exports for extension.ts ─────────────────────────────────────────────
 var router_2 = require("./router");
@@ -138,6 +139,7 @@ function ensureHydrated(config) {
     const configHash = JSON.stringify([
         config?.custom_secrets ?? [],
         config?.sensitive_suffixes ?? [],
+        config?.pii_patterns ?? {},
     ]);
     if (_hydrated && configHash === _hydratedConfigHash) {
         return;
@@ -154,6 +156,8 @@ function ensureHydrated(config) {
     for (const suffix of config?.sensitive_suffixes ?? []) {
         regexSanitizer_1.SENSITIVE_SUFFIXES.add(suffix.toLowerCase());
     }
+    // Local PII engine: rebuild active patterns from pii_patterns config
+    (0, piiSanitizer_1.hydratePiiConfig)(config?.pii_patterns);
     _hydrated = true;
     _hydratedConfigHash = configHash;
 }
@@ -206,30 +210,18 @@ async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
     let current = rawText;
     let modified = false;
     let presidioError;
-    // PII checker callback for AST-to-Presidio bridge
-    const piiCheck = async (value) => {
-        try {
-            const result = await callPresidioApi(value, rulesConfig);
-            return result.sanitized_text;
-        }
-        catch (err) {
-            if (!presidioError) {
-                presidioError = err instanceof Error ? err.message : String(err);
-            }
-            return value;
-        }
-    };
     // ── Tier 2: AST (structured configs) ────────────────────────────────
+    // 100% synchronous — key-heuristics + local PII regex, zero API calls.
     if (category === 'ast') {
         const astFormat = fileName ? (0, router_1.getAstFormat)(fileName) : undefined;
         if (astFormat) {
-            const astResult = await (0, astSanitizer_1.astSanitize)(current, astFormat, piiCheck);
+            const astResult = (0, astSanitizer_1.astSanitize)(current, astFormat);
             current = astResult.cleanText;
             modified = astResult.wasModified;
         }
         else {
             // No known AST format — try Universal KV Lexer
-            const kvResult = await (0, astSanitizer_1.sanitizeUniversalKeyValue)(current);
+            const kvResult = (0, astSanitizer_1.sanitizeUniversalKeyValue)(current);
             current = kvResult.cleanText;
             if (kvResult.wasModified) {
                 modified = true;
@@ -241,7 +233,7 @@ async function sanitizeOnly(rawText, rulesConfig, fileName, fileSize) {
         if (regResult.wasModified) {
             modified = true;
         }
-        return { cleanText: current, wasModified: modified, presidioError };
+        return { cleanText: current, wasModified: modified };
     }
     // ── Tier 3: Mega-Regex + NLP (full_dlp) ─────────────────────────────
     // Step 1: Regex dictionary + Entropy scanner

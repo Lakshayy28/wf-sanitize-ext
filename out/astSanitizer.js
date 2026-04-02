@@ -59,28 +59,32 @@ exports.sanitizeTabular = sanitizeTabular;
 exports.sanitizeUniversalKeyValue = sanitizeUniversalKeyValue;
 exports.astSanitize = astSanitize;
 const regexSanitizer_1 = require("./regexSanitizer");
+const piiSanitizer_1 = require("./piiSanitizer");
 const jsoncParser = __importStar(require("jsonc-parser"));
 const YAML = __importStar(require("yaml"));
 const fast_xml_parser_1 = require("fast-xml-parser");
+// ────────────────────────────────────────────────────────────────────────────
+// AST Value Processor (100% synchronous — zero API calls)
+// ────────────────────────────────────────────────────────────────────────────
 /**
  * Process a single AST key-value pair:
- *  1. FAST PATH — key matches the dynamic secret list → instant MASK
- *  2. SLOW PATH — send the isolated value to Presidio for human PII detection
- *  3. PASSTHROUGH — return the value unchanged
+ *  1. FAST PATH  — key matches the dynamic secret list → instant MASK
+ *  2. SAFE PATH  — structural keys (version, id, type…) → passthrough
+ *  3. LOCAL PII  — regex-based PII scan on the isolated value (synchronous)
  */
-async function processAstValue(key, value, piiCheck) {
+function processAstValue(key, value) {
     // 1. FAST PATH: Mask known tech secrets instantly
     if ((0, regexSanitizer_1.isSensitiveKey)(key)) {
         return regexSanitizer_1.MASK;
     }
-    // 2. SAFE PATH: Skip Presidio for structural keys to prevent hallucinations
+    // 2. SAFE PATH: Skip scanning for structural keys to prevent false positives
     const IGNORE_KEYS = /^(version|id|lineage|serial|type|kind|namespace|replicas|image|ami)$/i;
     if (IGNORE_KEYS.test(key.trim())) {
         return value;
     }
-    // 3. SLOW PATH: Deep scan for human PII via Presidio NLP
-    if (piiCheck && typeof value === 'string' && value.length > 3) {
-        return piiCheck(value);
+    // 3. LOCAL PII: Synchronous regex scan for PII entities in the value
+    if (typeof value === 'string' && value.length > 3) {
+        return (0, piiSanitizer_1.localPiiScan)(value);
     }
     return value;
 }
@@ -95,7 +99,7 @@ async function processAstValue(key, value, piiCheck) {
  *
  * Returns null if the input is not valid JSON/JSONC (caller should fall back).
  */
-async function sanitizeJson(text, piiCheck) {
+function sanitizeJson(text) {
     // Quick validation — bail if jsonc-parser can't make sense of it
     const errors = [];
     jsoncParser.parse(text, errors);
@@ -160,7 +164,7 @@ async function sanitizeJson(text, piiCheck) {
         if (typeof originalValue !== 'string') {
             continue;
         }
-        const cleaned = await processAstValue(key, originalValue, piiCheck);
+        const cleaned = processAstValue(key, originalValue);
         if (cleaned !== originalValue) {
             modified = true;
             // Build the replacement including the JSON quotes
@@ -192,21 +196,21 @@ async function sanitizeJson(text, piiCheck) {
  * then serializes back via `doc.toString()` which re-emits the source
  * with only the changed values differing.
  */
-async function sanitizeYaml(text, piiCheck) {
+function sanitizeYaml(text) {
     let doc;
     try {
         doc = YAML.parseDocument(text, { keepSourceTokens: true });
     }
     catch {
         // Not valid YAML — fall back to line-by-line regex
-        return sanitizeYamlRegex(text, piiCheck);
+        return sanitizeYamlRegex(text);
     }
     // If the document has serious errors, use the regex fallback
     if (doc.errors.length > 0) {
-        return sanitizeYamlRegex(text, piiCheck);
+        return sanitizeYamlRegex(text);
     }
     let modified = false;
-    async function walkNode(node, parentKey) {
+    function walkNode(node, parentKey) {
         if (YAML.isMap(node)) {
             for (const item of node.items) {
                 const keyStr = YAML.isScalar(item.key) ? String(item.key.value) : undefined;
@@ -220,7 +224,7 @@ async function sanitizeYaml(text, piiCheck) {
                         const effectiveKey = INHERITED_VALUE_KEYS.has(keyStr) && parentKey && (0, regexSanitizer_1.isSensitiveKey)(parentKey)
                             ? parentKey
                             : keyStr;
-                        const cleaned = await processAstValue(effectiveKey, original, piiCheck);
+                        const cleaned = processAstValue(effectiveKey, original);
                         if (cleaned !== original) {
                             modified = true;
                             item.value.value = cleaned;
@@ -228,20 +232,20 @@ async function sanitizeYaml(text, piiCheck) {
                     }
                 }
                 else if (YAML.isMap(item.value) || YAML.isSeq(item.value)) {
-                    await walkNode(item.value, keyStr);
+                    walkNode(item.value, keyStr);
                 }
             }
         }
         else if (YAML.isSeq(node)) {
             for (const item of node.items) {
                 if (YAML.isMap(item) || YAML.isSeq(item)) {
-                    await walkNode(item, parentKey);
+                    walkNode(item, parentKey);
                 }
                 // Scalar items in sequences: mask if parent key is sensitive
                 if (YAML.isScalar(item) && typeof item.value === 'string' && parentKey) {
                     const original = item.value;
                     if (original.length > 0) {
-                        const cleaned = await processAstValue(parentKey, original, piiCheck);
+                        const cleaned = processAstValue(parentKey, original);
                         if (cleaned !== original) {
                             modified = true;
                             item.value = cleaned;
@@ -251,7 +255,7 @@ async function sanitizeYaml(text, piiCheck) {
             }
         }
     }
-    await walkNode(doc.contents);
+    walkNode(doc.contents);
     if (!modified) {
         return { cleanText: text, wasModified: false };
     }
@@ -261,7 +265,7 @@ async function sanitizeYaml(text, piiCheck) {
  * Regex fallback for YAML files that fail AST parsing.
  * Matches `key: value` patterns line-by-line.
  */
-async function sanitizeYamlRegex(text, piiCheck) {
+function sanitizeYamlRegex(text) {
     let modified = false;
     const lines = text.split('\n');
     const result = [];
@@ -299,7 +303,7 @@ async function sanitizeYamlRegex(text, piiCheck) {
                 quoteChar = valStr[0];
                 unquotedVal = valStr.slice(1, -1);
             }
-            const cleaned = await processAstValue(key, unquotedVal, piiCheck);
+            const cleaned = processAstValue(key, unquotedVal);
             if (cleaned !== unquotedVal) {
                 modified = true;
                 if (quoteChar) {
@@ -326,7 +330,7 @@ async function sanitizeYamlRegex(text, piiCheck) {
  * Sanitize .env files by splitting into lines, matching KEY=VALUE patterns,
  * and masking values whose keys match the sensitive-key list.
  */
-async function sanitizeEnv(rawText) {
+function sanitizeEnv(rawText) {
     let modified = false;
     const lines = rawText.split('\n');
     for (let i = 0; i < lines.length; i++) {
@@ -335,7 +339,7 @@ async function sanitizeEnv(rawText) {
         if (match) {
             const [, key, operator, quoteOpen, value, quoteClose, tail] = match;
             if (quoteOpen === quoteClose) {
-                const maskedValue = await processAstValue(key, value);
+                const maskedValue = processAstValue(key, value);
                 if (maskedValue !== value) {
                     modified = true;
                     lines[i] = `${key}${operator}${quoteOpen}${maskedValue}${quoteClose}${tail}`;
@@ -351,7 +355,7 @@ async function sanitizeEnv(rawText) {
 /**
  * Sanitize .properties / .ini files using regex line-by-line matching.
  */
-async function sanitizeProperties(text, piiCheck) {
+function sanitizeProperties(text) {
     let modified = false;
     const lines = text.split('\n');
     const result = [];
@@ -369,7 +373,7 @@ async function sanitizeProperties(text, piiCheck) {
             const trimVal = valuePart.trim();
             // Skip structural characters (block openers/closers in Gradle, HCL, etc.)
             if (trimVal.length > 0 && !/^[{}\[\]()]$/.test(trimVal)) {
-                const cleaned = await processAstValue(keyName, trimVal, piiCheck);
+                const cleaned = processAstValue(keyName, trimVal);
                 if (cleaned !== trimVal) {
                     result.push(`${keyPart}${sep}${cleaned}`);
                     modified = true;
@@ -422,20 +426,20 @@ const xmlBuilderOptions = {
  *
  * Falls back to the regex-based XML scanner if parsing fails.
  */
-async function sanitizeXml(text, piiCheck) {
+function sanitizeXml(text) {
     let parsed;
     try {
         const parser = new fast_xml_parser_1.XMLParser(xmlParserOptions);
         parsed = parser.parse(text);
     }
     catch {
-        return sanitizeXmlRegex(text, piiCheck);
+        return sanitizeXmlRegex(text);
     }
     if (!Array.isArray(parsed) || parsed.length === 0) {
-        return sanitizeXmlRegex(text, piiCheck);
+        return sanitizeXmlRegex(text);
     }
     let modified = false;
-    async function walkXmlNodes(nodes) {
+    function walkXmlNodes(nodes) {
         for (const node of nodes) {
             if (typeof node !== 'object' || node === null) {
                 continue;
@@ -457,7 +461,7 @@ async function sanitizeXml(text, piiCheck) {
                     // Process text node: <tagName>value</tagName>
                     if (typeof childObj['#text'] === 'string' && childObj['#text'].trim().length > 0) {
                         const original = childObj['#text'];
-                        const cleaned = await processAstValue(tagName, original.trim(), piiCheck);
+                        const cleaned = processAstValue(tagName, original.trim());
                         if (cleaned !== original.trim()) {
                             modified = true;
                             childObj['#text'] = cleaned;
@@ -481,7 +485,7 @@ async function sanitizeXml(text, piiCheck) {
                             }
                             const cleanAttrName = attrName.slice(2); // strip @_ prefix
                             if (typeof attrVal === 'string' && attrVal.length > 0 && (0, regexSanitizer_1.isSensitiveKey)(cleanAttrName)) {
-                                const cleaned = await processAstValue(cleanAttrName, attrVal, piiCheck);
+                                const cleaned = processAstValue(cleanAttrName, attrVal);
                                 if (cleaned !== attrVal) {
                                     modified = true;
                                     attrs[attrName] = cleaned;
@@ -496,14 +500,14 @@ async function sanitizeXml(text, piiCheck) {
                         }
                         if (Array.isArray(childObj[childTag])) {
                             // Wrap into the structure walkXmlNodes expects
-                            await walkXmlNodes([{ [childTag]: childObj[childTag] }]);
+                            walkXmlNodes([{ [childTag]: childObj[childTag] }]);
                         }
                     }
                 }
             }
         }
     }
-    await walkXmlNodes(parsed);
+    walkXmlNodes(parsed);
     if (!modified) {
         return { cleanText: text, wasModified: modified };
     }
@@ -521,13 +525,13 @@ async function sanitizeXml(text, piiCheck) {
     }
     catch {
         // If builder fails, fall back to regex approach
-        return sanitizeXmlRegex(text, piiCheck);
+        return sanitizeXmlRegex(text);
     }
 }
 /**
  * Regex fallback for XML files that fail DOM parsing.
  */
-async function sanitizeXmlRegex(text, piiCheck) {
+function sanitizeXmlRegex(text) {
     let modified = false;
     let cleanText = text;
     // Tag-based: <tagName>value</tagName>
@@ -537,7 +541,7 @@ async function sanitizeXmlRegex(text, piiCheck) {
     while ((tagMatch = tagRe.exec(cleanText)) !== null) {
         const [full, openTag, tagName, value, closeTag] = tagMatch;
         if (value.trim().length > 0) {
-            const cleaned = await processAstValue(tagName, value.trim(), piiCheck);
+            const cleaned = processAstValue(tagName, value.trim());
             if (cleaned !== value.trim()) {
                 modified = true;
                 replacements.push({
@@ -569,8 +573,8 @@ async function sanitizeXmlRegex(text, piiCheck) {
  * Sanitize TOML files using the properties regex parser.
  * TOML's `key = value` syntax is compatible with the properties regex engine.
  */
-async function sanitizeToml(rawText, piiCheck) {
-    return sanitizeProperties(rawText, piiCheck);
+function sanitizeToml(rawText) {
+    return sanitizeProperties(rawText);
 }
 // ────────────────────────────────────────────────────────────────────────────
 // HCL Parser — Reuses Properties Regex Engine
@@ -580,8 +584,8 @@ async function sanitizeToml(rawText, piiCheck) {
  * HCL's `key = value` syntax is compatible with the properties regex engine.
  * The structural character guard prevents `{` / `}` corruption.
  */
-async function sanitizeHcl(rawText, piiCheck) {
-    return sanitizeProperties(rawText, piiCheck);
+function sanitizeHcl(rawText) {
+    return sanitizeProperties(rawText);
 }
 // ────────────────────────────────────────────────────────────────────────────
 // CSV / TSV Parser — Header-based Column Sanitizer (RFC-4180 quote-aware)
@@ -590,11 +594,11 @@ async function sanitizeHcl(rawText, piiCheck) {
  * Sanitize CSV/TSV files by treating the header row as column keys and each
  * data cell as a value. Runs every cell through processAstValue so that
  * columns like "password", "ssn", "api_key" get masked automatically and
- * other values go through Presidio PII detection.
+ * other values go through local PII scanning.
  *
  * @param delimiter — explicit delimiter override. Auto-detected (tab/comma) if omitted.
  */
-async function sanitizeTabular(rawText, piiCheck, delimiter) {
+function sanitizeTabular(rawText, delimiter) {
     const lines = rawText.split('\n');
     if (lines.length < 2) {
         // Need at least a header + one data row
@@ -622,7 +626,7 @@ async function sanitizeTabular(rawText, piiCheck, delimiter) {
             const header = col < headers.length ? headers[col] : `col_${col}`;
             const cell = cells[col];
             if (cell.trim().length > 0) {
-                const cleaned = await processAstValue(header, cell, piiCheck);
+                const cleaned = processAstValue(header, cell);
                 if (cleaned !== cell) {
                     modified = true;
                 }
@@ -705,7 +709,7 @@ function csvQuote(cell, delimiter) {
  * entire value portion if positive. This is intentionally conservative
  * because we can't reliably parse custom quoting or comment styles.
  */
-async function sanitizeUniversalKeyValue(rawText) {
+function sanitizeUniversalKeyValue(rawText) {
     let modified = false;
     const lines = rawText.split('\n');
     // Matches: Key (Group 1), Delimiter (Group 2), Value+Comments (Group 3)
@@ -732,36 +736,36 @@ async function sanitizeUniversalKeyValue(rawText) {
 }
 /**
  * Route to the correct AST parser based on the detected format.
- * Passes the optional PiiChecker callback through to each parser.
+ * 100% synchronous — zero API calls. Uses key-heuristics + local PII regex.
  */
-async function astSanitize(text, format, piiCheck) {
+function astSanitize(text, format) {
     switch (format) {
         case 'json':
         case 'jsonc': {
-            const result = await sanitizeJson(text, piiCheck);
+            const result = sanitizeJson(text);
             // If JSON/JSONC parsing fails, fall back to YAML parser (handles key: value generically)
-            return result ?? await sanitizeYaml(text, piiCheck);
+            return result ?? sanitizeYaml(text);
         }
         case 'jsonl': {
             // JSONL: each line is an independent JSON object
-            return sanitizeJsonl(text, piiCheck);
+            return sanitizeJsonl(text);
         }
         case 'yaml':
-            return sanitizeYaml(text, piiCheck);
+            return sanitizeYaml(text);
         case 'env':
             return sanitizeEnv(text);
         case 'properties':
-            return sanitizeProperties(text, piiCheck);
+            return sanitizeProperties(text);
         case 'xml':
-            return sanitizeXml(text, piiCheck);
+            return sanitizeXml(text);
         case 'toml':
-            return sanitizeToml(text, piiCheck);
+            return sanitizeToml(text);
         case 'hcl':
-            return sanitizeHcl(text, piiCheck);
+            return sanitizeHcl(text);
         case 'csv':
-            return sanitizeTabular(text, piiCheck, ',');
+            return sanitizeTabular(text, ',');
         case 'tsv':
-            return sanitizeTabular(text, piiCheck, '\t');
+            return sanitizeTabular(text, '\t');
         default:
             return { cleanText: text, wasModified: false };
     }
@@ -770,7 +774,7 @@ async function astSanitize(text, format, piiCheck) {
  * Sanitize JSONL (newline-delimited JSON).
  * Each non-empty line is independently parsed and sanitized.
  */
-async function sanitizeJsonl(text, piiCheck) {
+function sanitizeJsonl(text) {
     const lines = text.split('\n');
     let modified = false;
     const result = [];
@@ -779,7 +783,7 @@ async function sanitizeJsonl(text, piiCheck) {
             result.push(line);
             continue;
         }
-        const lineResult = await sanitizeJson(line, piiCheck);
+        const lineResult = sanitizeJson(line);
         if (lineResult) {
             result.push(lineResult.cleanText);
             if (lineResult.wasModified) {

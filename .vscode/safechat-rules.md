@@ -13,11 +13,12 @@ This file is the single control panel for the `@safechat` VS Code extension. Eve
 3. [Section: `full_dlp_extensions`](#3-section-full_dlp_extensions)
 4. [Section: `custom_paths`](#4-section-custom_paths)
 5. [Section: `custom_secrets`](#5-section-custom_secrets)
-6. [Section: `rules`](#6-section-rules)
-7. [Section: `custom_recognizers`](#7-section-custom_recognizers)
-8. [Entity alias reference](#8-entity-alias-reference)
-9. [Complete annotated example](#9-complete-annotated-example)
-10. [Common recipes](#10-common-recipes)
+6. [Section: `pii_patterns`](#6-section-pii_patterns)
+7. [Section: `rules`](#7-section-rules)
+8. [Section: `custom_recognizers`](#8-section-custom_recognizers)
+9. [Entity alias reference](#9-entity-alias-reference)
+10. [Complete annotated example](#10-complete-annotated-example)
+11. [Common recipes](#11-common-recipes)
 
 ---
 
@@ -225,7 +226,81 @@ This compiles the regex `\b(acme_live_[A-Za-z0-9_\-]{32})\b` and adds it to the 
 
 ---
 
-## 6. Section: `rules`
+## 6. Section: `pii_patterns`
+
+Controls the **local PII regex engine** that runs on every structured config value in Tier 2 (AST). This engine is 100% local — synchronous, zero network calls, no server required.
+
+### Built-in patterns (always active unless disabled)
+
+| Pattern name | Example value detected |
+|---|---|
+| `US SSN` | `078-05-1120` |
+| `Credit Card` | `4111 1111 1111 1111` |
+| `IBAN` | `GB29NWBK60161331926819` |
+| `Email` | `alice@example.com` |
+| `Phone` | `+1 415-555-0198` |
+| `IPv4` | `192.168.1.100` |
+| `Internal Hostname` | `db-prod.internal`, `cache.local` |
+| `MAC Address` | `00:1A:2B:3C:4D:5E` |
+
+### Sub-keys
+
+#### `disable` — turn off specific built-in patterns
+
+Use when a pattern causes false positives in your codebase (e.g. version strings like `1.0.0.0` matching IPv4, or port numbers matching Phone).
+
+```yaml
+pii_patterns:
+  disable:
+    - IPv4              # version numbers like 1.0.0.0 won't be masked
+    - Phone             # phone-like numbers in configs won't be masked
+    - Internal Hostname # *.internal hostnames expected in configs
+    - MAC Address       # hardware addresses are non-sensitive in your data
+```
+
+Values are **case-insensitive** and must exactly match a name from the built-in table above.
+
+#### `extra_keys` — additional key labels that force an instant MASK
+
+Works identically to `custom_secrets.ast_keys` — any config key matching one of these labels has its value masked immediately at the AST level, before any regex scanning. This is the fastest possible masking path.
+
+```yaml
+pii_patterns:
+  extra_keys:
+    - employee_id
+    - badge_number
+    - member_id
+    - subscriber_id
+```
+
+#### `extra_patterns` — custom organisation-specific value patterns
+
+Add regex patterns to redact org-specific identifiers from individual config values. `pattern` is a JavaScript regex string (no surrounding `/` slashes). All patterns are applied case-insensitively.
+
+```yaml
+pii_patterns:
+  extra_patterns:
+    - name: "Acme Employee Badge"
+      pattern: "EMP-[0-9]{6}"
+    - name: "Internal Ticket ID"
+      pattern: "TICK-[A-Z]{2}[0-9]{8}"
+```
+
+> **Note:** `extra_patterns` scan at the **value** level inside individual config fields (e.g. the value of `employee_id: EMP-004821`). For NLP-context-aware detection across unstructured prose, use [`custom_recognizers`](#8-section-custom_recognizers) instead.
+
+### Comparison: `custom_secrets`, `pii_patterns`, `custom_recognizers`
+
+| | `custom_secrets` | `pii_patterns` | `custom_recognizers` |
+|---|---|---|---|
+| **Engine** | TypeScript (local) | TypeScript (local) | Python Presidio (server) |
+| **Tiers active** | Tier 2 (keys) + Tier 3 (regex) | Tier 2 (AST values) | Tier 3 (Full DLP) |
+| **Detection** | Key label + token prefix | Key label + value regex | NLP + regex with context words |
+| **Server required** | No | No | Yes |
+| **Best for** | Internal API tokens / secrets | PII in config values, org IDs | Human PII in unstructured text |
+
+---
+
+## 7. Section: `rules`
 
 Defines how each detected entity type is anonymized. Any entity type not listed defaults to `replace`.
 
@@ -272,7 +347,7 @@ export SAFECHAT_ENCRYPT_KEY="my32characterlongsecretkey123456"
 
 ---
 
-## 7. Section: `custom_recognizers`
+## 8. Section: `custom_recognizers`
 
 Adds your own regex-based entity detectors without modifying the server. Each recognizer is active for the duration of the request — no restart required.
 
@@ -390,7 +465,7 @@ rules:
 
 ---
 
-## 8. Entity alias reference
+## 9. Entity alias reference
 
 You can use either the friendly alias or the canonical Presidio type — both are accepted, case-insensitively.
 
@@ -417,7 +492,7 @@ For the Swagger UI and full entity catalogue, visit `http://localhost:8000/docs`
 
 ---
 
-## 9. Complete annotated example
+## 10. Complete annotated example
 
 ```yaml
 # ── 1. Force proprietary extensions into Tier 2 AST engine ────────────────────
@@ -450,7 +525,17 @@ custom_secrets:
     value_charset: "alphanumeric"
     value_length: "32"
 
-# ── 5. Per-entity anonymization operations ────────────────────────────────────
+# ── 5. Local PII engine — disable built-ins, add extra keys + patterns ─────────
+pii_patterns:
+  disable:
+    - IPv4              # version numbers won't be masked
+  extra_keys:
+    - employee_id
+  extra_patterns:
+    - name: "Acme Badge"
+      pattern: "EMP-[0-9]{6}"
+
+# ── 6. Per-entity anonymization operations ────────────────────────────────────
 rules:
   # Presidio built-in
   PhoneNumber:    replace   # → <PHONE_NUMBER>
@@ -465,7 +550,7 @@ rules:
   EMPLOYEE_ID:    mask
   BRANCH_CODE:    replace
 
-# ── 6. User-defined Presidio NLP recognizers ──────────────────────────────────
+# ── 7. User-defined Presidio NLP recognizers ──────────────────────────────────
 custom_recognizers:
   - name: EMPLOYEE_ID
     pattern: "EMP-\\d{6}"
@@ -485,7 +570,7 @@ custom_recognizers:
 
 ---
 
-## 10. Common recipes
+## 11. Common recipes
 
 ### No overrides needed (default behaviour)
 

@@ -17,6 +17,7 @@
 
 import * as vscode from 'vscode';
 import type { AstFormat } from './astSanitizer';
+import type { PiiPatternsConfig } from './piiSanitizer';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Safety: Binary blocklist (the ONLY blocklist — files that break parsers)
@@ -73,8 +74,8 @@ export interface RulesConfig {
   custom_secrets?: CustomSecretDef[];
   custom_recognizers?: CustomRecognizerDef[];
   /** Extra Tier-2 suffix tokens added to isSensitiveKey’s structural suffix check. */
-  sensitive_suffixes?: string[];
-}
+  sensitive_suffixes?: string[];  /** Local PII engine config — enable/disable patterns and add custom ones. */
+  pii_patterns?: PiiPatternsConfig;}
 
 // ────────────────────────────────────────────────────────────────────────────
 // File categories

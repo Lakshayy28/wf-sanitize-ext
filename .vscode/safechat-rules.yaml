@@ -157,7 +157,50 @@ rules:
   CARD_EXPIRY: mask    # Custom financial entity from financial.py
 
 
-# ── 5. Custom PII Recognizers (Python Presidio Server) ───────────────────────
+# ── 5. Local PII Engine Config (TypeScript — Tier 2 AST, no server needed) ───
+# Controls the synchronous regex-based PII scanner that runs on every
+# structured config value (JSON, YAML, ENV, XML, HCL, CSV…) in Tier 2.
+# No server required — 100% local, zero latency.
+#
+# Built-in pattern names (use these in `disable`):
+#   'US SSN', 'Credit Card', 'IBAN', 'Email', 'Phone',
+#   'IPv4', 'Internal Hostname', 'MAC Address'
+#
+# Sub-keys:
+#   disable         — list of built-in pattern names to switch off
+#   extra_keys      — extra key labels that trigger an instant MASK
+#                     (works same as custom_secrets.ast_keys)
+#   extra_patterns  — custom org-specific regex patterns
+#                     `pattern` is a JS regex string (no surrounding slashes)
+# ─────────────────────────────────────────────────────────────────────────────
+pii_patterns:
+  disable:
+    # Uncomment to disable specific built-in scanners:
+    # - US SSN            # e.g. SSNs are handled upstream and don't appear in configs
+    # - Credit Card       # e.g. card numbers are tokenised before reaching configs
+    # - IBAN              # e.g. bank IBANs are not a concern in your environment
+    # - Email             # e.g. service account emails are expected in configs
+    # - Phone             # e.g. phone numbers appear innocuously in configs
+    # - IPv4              # e.g. IPs are not considered PII in your org
+    # - Internal Hostname # e.g. *.internal hostnames are expected in configs
+    # - MAC Address       # e.g. hardware MACs are non-sensitive in your data
+
+  extra_keys:
+    # Key labels whose VALUES should always be masked, in addition to built-ins:
+    # - employee_id
+    # - badge_number
+    # - member_id
+    # - subscriber_id
+
+  extra_patterns:
+    # Custom org-specific value patterns to redact from config values:
+    # - name: "Acme Employee Badge"
+    #   pattern: "EMP-[0-9]{6}"
+    # - name: "Internal Ticket ID"
+    #   pattern: "TICK-[A-Z]{2}[0-9]{8}"
+
+
+# ── 6. Custom PII Recognizers (Python Presidio Server) ───────────────────────
 # Add custom regexes ONLY for Human Data (e.g., employee IDs, support tickets)
 # that require NLP context words to avoid false positives.
 # These are dynamically registered as Presidio PatternRecognizer objects on

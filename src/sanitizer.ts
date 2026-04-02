@@ -16,7 +16,8 @@ import * as https from 'https';
 
 // ── Module imports ──────────────────────────────────────────────────────────
 import { regexSanitize, terminalSanitize, stripAnsiCodes, hydrateCustomSecrets, MASK, applyEntropyMasking, DYNAMIC_AST_KEYS, SENSITIVE_SUFFIXES } from './regexSanitizer';
-import { astSanitize, sanitizeUniversalKeyValue, type AstFormat, type PiiChecker } from './astSanitizer';
+import { astSanitize, sanitizeUniversalKeyValue, type AstFormat } from './astSanitizer';
+import { hydratePiiConfig } from './piiSanitizer';
 import {
   getFileCategory, getAstFormat, readRulesConfig,
   type RulesConfig, type FileCategory, type CustomSecretDef,
@@ -116,6 +117,7 @@ function ensureHydrated(config?: RulesConfig): void {
   const configHash = JSON.stringify([
     config?.custom_secrets ?? [],
     config?.sensitive_suffixes ?? [],
+    config?.pii_patterns ?? {},
   ]);
   if (_hydrated && configHash === _hydratedConfigHash) { return; }
   // Tier 1: custom AST key tokens
@@ -130,6 +132,8 @@ function ensureHydrated(config?: RulesConfig): void {
   for (const suffix of config?.sensitive_suffixes ?? []) {
     SENSITIVE_SUFFIXES.add(suffix.toLowerCase());
   }
+  // Local PII engine: rebuild active patterns from pii_patterns config
+  hydratePiiConfig(config?.pii_patterns);
   _hydrated = true;
   _hydratedConfigHash = configHash;
 }
@@ -206,29 +210,17 @@ export async function sanitizeOnly(
   let modified = false;
   let presidioError: string | undefined;
 
-  // PII checker callback for AST-to-Presidio bridge
-  const piiCheck: PiiChecker = async (value: string) => {
-    try {
-      const result = await callPresidioApi(value, rulesConfig);
-      return result.sanitized_text;
-    } catch (err) {
-      if (!presidioError) {
-        presidioError = err instanceof Error ? err.message : String(err);
-      }
-      return value;
-    }
-  };
-
   // ── Tier 2: AST (structured configs) ────────────────────────────────
+  // 100% synchronous — key-heuristics + local PII regex, zero API calls.
   if (category === 'ast') {
     const astFormat = fileName ? getAstFormat(fileName) : undefined;
     if (astFormat) {
-      const astResult = await astSanitize(current, astFormat, piiCheck);
+      const astResult = astSanitize(current, astFormat);
       current = astResult.cleanText;
       modified = astResult.wasModified;
     } else {
       // No known AST format — try Universal KV Lexer
-      const kvResult = await sanitizeUniversalKeyValue(current);
+      const kvResult = sanitizeUniversalKeyValue(current);
       current = kvResult.cleanText;
       if (kvResult.wasModified) { modified = true; }
     }
@@ -238,7 +230,7 @@ export async function sanitizeOnly(
     current = regResult.cleanText;
     if (regResult.wasModified) { modified = true; }
 
-    return { cleanText: current, wasModified: modified, presidioError };
+    return { cleanText: current, wasModified: modified };
   }
 
   // ── Tier 3: Mega-Regex + NLP (full_dlp) ─────────────────────────────
