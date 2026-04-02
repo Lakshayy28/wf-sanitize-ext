@@ -36,7 +36,19 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
+const os = __importStar(require("os"));
+const path = __importStar(require("path"));
 const sanitizer_1 = require("./sanitizer");
+/**
+ * Expand leading `~` or `~user` to the user's home directory.
+ * Also normalises the path (removes trailing slashes, double-slashes, etc.).
+ */
+function expandTilde(p) {
+    if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) {
+        return path.join(os.homedir(), p.slice(1));
+    }
+    return p;
+}
 let extensionPath;
 const fileStateCache = new Map();
 let conversationFileKeys = new Set();
@@ -105,7 +117,7 @@ class SafeReadFileTool {
     /** Set by the chat handler so the tool can push UI feedback (buttons, markdown). */
     _stream;
     async invoke(options, _token) {
-        const filePath = options.input.filePath;
+        const filePath = expandTilde(options.input.filePath);
         console.log('[SafeChat] safechat_read_file invoked for:', filePath);
         // 1. Check SessionStateManager — if already sanitized, serve cached version
         const maskedUri = resolveSessionState(filePath);
@@ -201,7 +213,7 @@ class SafeReadDirectoryTool {
     /** Set by the chat handler so the tool can push UI feedback (buttons, markdown). */
     _stream;
     async invoke(options, _token) {
-        const { directoryPath } = options.input;
+        const directoryPath = expandTilde(options.input.directoryPath);
         const maxDepth = Math.min(options.input.maxDepth ?? 10, SafeReadDirectoryTool.ABSOLUTE_MAX_DEPTH);
         const maxFiles = Math.min(options.input.maxFiles ?? 500, SafeReadDirectoryTool.ABSOLUTE_MAX_FILES);
         console.log('[SafeChat] safechat_read_directory invoked for:', directoryPath, 'maxDepth:', maxDepth, 'maxFiles:', maxFiles);
@@ -355,6 +367,164 @@ class SafeReadDirectoryTool {
 }
 /** Shared instance for direct invocation in the redirect guard */
 const safeReadDirToolInstance = new SafeReadDirectoryTool();
+/**
+ * Shell-Integration-powered terminal tool registered as `safechat_run_terminal`.
+ *
+ * 1. Shows an InputBox so the user can review / edit the command before execution.
+ * 2. Executes via `terminal.shellIntegration.executeCommand()` in a visible,
+ *    interactive native VS Code terminal.
+ * 3. Streams output via `execution.read()`, sanitises it, and returns the clean
+ *    text to the LLM — all within the same chat turn.
+ * 4. Falls back to `sendText` + a "please paste output" message when shell
+ *    integration is not available.
+ */
+class SafeRunTerminalTool {
+    static TIMEOUT_MS = 30_000;
+    static MAX_OUTPUT_BYTES = 512 * 1024;
+    /** Reuse a single named terminal across invocations */
+    terminal;
+    _stream;
+    async invoke(options, _token) {
+        const proposedCommand = options.input.command;
+        const rawCwd = options.input.cwd;
+        console.log('[SafeChat] safechat_run_terminal invoked:', proposedCommand);
+        // ── Step 1: User Edit Interception ──────────────────────────────────
+        const userCommand = await vscode.window.showInputBox({
+            prompt: 'SafeChat wants to run a command. Press Enter to execute, edit it, or press Esc to cancel.',
+            value: proposedCommand,
+        });
+        if (!userCommand) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart('[Execution Cancelled by User]'),
+            ]);
+        }
+        // ── Resolve working directory ───────────────────────────────────────
+        let workDir = rawCwd ? expandTilde(rawCwd) : undefined;
+        if (!workDir) {
+            const folders = vscode.workspace.workspaceFolders;
+            if (folders?.length) {
+                workDir = folders[0].uri.fsPath;
+            }
+        }
+        // ── Step 2: Acquire or create a visible terminal ────────────────────
+        const term = this.getOrCreateTerminal(workDir);
+        term.show();
+        // ── Step 3: Shell Integration path vs fallback ──────────────────────
+        if (term.shellIntegration) {
+            return this.executeViaShellIntegration(term, userCommand);
+        }
+        // Shell integration may not be ready yet on a freshly created terminal.
+        // Wait up to 4 s for it to activate.
+        const si = await this.waitForShellIntegration(term, 4_000);
+        if (si) {
+            return this.executeViaShellIntegration(term, userCommand);
+        }
+        // ── Fallback: sendText (blind) ──────────────────────────────────────
+        console.log('[SafeChat] Shell integration unavailable — falling back to sendText');
+        term.sendText(userCommand);
+        return new vscode.LanguageModelToolResult([
+            new vscode.LanguageModelTextPart(`[Shell Integration Unavailable]: The command \`${userCommand}\` was sent to the visible terminal but output could not be captured automatically. ` +
+                'Ask the user to share the result using `#terminalLastCommand` or to paste the relevant output.'),
+        ]);
+    }
+    // ── Shell Integration execution + streaming ───────────────────────────
+    async executeViaShellIntegration(term, command) {
+        const si = term.shellIntegration;
+        const execution = si.executeCommand(command);
+        // Start reading immediately so we don't miss any data
+        const stream = execution.read();
+        let buffer = '';
+        let timedOut = false;
+        // Set up a timeout race
+        const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve('timeout'), SafeRunTerminalTool.TIMEOUT_MS));
+        // Set up an end-event promise to know when the command finishes
+        const endPromise = new Promise((resolve) => {
+            const disposable = vscode.window.onDidEndTerminalShellExecution((event) => {
+                if (event.execution === execution) {
+                    disposable.dispose();
+                    resolve(event.exitCode);
+                }
+            });
+        });
+        // Read the stream, racing against the timeout
+        try {
+            const readLoop = async () => {
+                for await (const data of stream) {
+                    buffer += data;
+                    if (buffer.length > SafeRunTerminalTool.MAX_OUTPUT_BYTES) {
+                        buffer += '\n[output truncated — exceeded max buffer]';
+                        break;
+                    }
+                }
+            };
+            const result = await Promise.race([readLoop(), timeoutPromise]);
+            if (result === 'timeout') {
+                timedOut = true;
+                buffer += '\n[timed out waiting for command to finish]';
+            }
+        }
+        catch (err) {
+            buffer += `\n[stream error: ${err instanceof Error ? err.message : String(err)}]`;
+        }
+        // If we didn't time out, grab the exit code
+        if (!timedOut) {
+            try {
+                const exitCode = await Promise.race([endPromise, timeoutPromise]);
+                if (exitCode === 'timeout') {
+                    buffer += '\n[timed out waiting for exit code]';
+                }
+                else if (exitCode !== undefined && exitCode !== 0) {
+                    buffer += `\n[exit code: ${exitCode}]`;
+                }
+            }
+            catch {
+                // exit code unavailable — that's fine, we still have the output
+            }
+        }
+        // ── Sanitise and return ─────────────────────────────────────────────
+        const { cleanText, wasModified } = await (0, sanitizer_1.sanitizePipeline)(buffer, 'terminal');
+        console.log('[SafeChat] safechat_run_terminal shell-integration: len=', buffer.length, 'sanitized=', wasModified);
+        // if (wasModified) {
+        //   console.log('\n[SafeChat Debug] 🔴 RAW TERMINAL OUTPUT:\n', buffer);
+        //   console.log('\n[SafeChat Debug] 🟢 MASKED TERMINAL OUTPUT:\n', cleanText);
+        // }
+        if (wasModified && this._stream) {
+            this._stream.markdown('\n\n🛡️ **Terminal output was sanitized — sensitive data masked.**\n\n');
+        }
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(cleanText)]);
+    }
+    // ── Terminal management helpers ───────────────────────────────────────
+    getOrCreateTerminal(cwd) {
+        // Reuse existing SafeChat terminal if it's still alive
+        if (this.terminal) {
+            const alive = vscode.window.terminals.includes(this.terminal);
+            if (alive) {
+                return this.terminal;
+            }
+        }
+        this.terminal = vscode.window.createTerminal({
+            name: 'SafeChat',
+            cwd,
+        });
+        return this.terminal;
+    }
+    waitForShellIntegration(term, timeoutMs) {
+        if (term.shellIntegration) {
+            return Promise.resolve(term.shellIntegration);
+        }
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => { disposable.dispose(); resolve(undefined); }, timeoutMs);
+            const disposable = vscode.window.onDidChangeTerminalShellIntegration((e) => {
+                if (e.terminal === term) {
+                    clearTimeout(timer);
+                    disposable.dispose();
+                    resolve(e.shellIntegration);
+                }
+            });
+        });
+    }
+}
+const safeRunTerminalToolInstance = new SafeRunTerminalTool();
 // ── Activation ──────────────────────────────────────────────────────────────
 function activate(context) {
     extensionPath = context.extensionPath;
@@ -365,7 +535,8 @@ function activate(context) {
     try {
         const fileToolDisposable = vscode.lm.registerTool('safechat_read_file', safeReadFileToolInstance);
         const dirToolDisposable = vscode.lm.registerTool('safechat_read_directory', safeReadDirToolInstance);
-        context.subscriptions.push(fileToolDisposable, dirToolDisposable);
+        const termToolDisposable = vscode.lm.registerTool('safechat_run_terminal', safeRunTerminalToolInstance);
+        context.subscriptions.push(fileToolDisposable, dirToolDisposable, termToolDisposable);
     }
     catch (err) {
         console.error('[SafeChat] registerTool failed — safe tools unavailable:', err);
@@ -455,8 +626,11 @@ function isNativeSearchTool(name, description) {
     const descLower = description.toLowerCase();
     return SEARCH_DESC_KEYWORDS.some(kw => descLower.includes(kw));
 }
-/** Returns true if a tool is a terminal/command-execution tool */
+/** Returns true if a tool is a native terminal/command-execution tool */
 function isTerminalTool(name, description) {
+    if (name === 'safechat_run_terminal') {
+        return false;
+    } // Never block our own tool
     const nameLower = name.toLowerCase();
     const descLower = description.toLowerCase();
     return (/terminal|shell|exec|command|bash|zsh|run_in/i.test(nameLower) ||
@@ -688,7 +862,8 @@ async function chatRequestHandler(request, chatContext, stream, token) {
     const shouldBlockTool = (name, desc) => {
         return isNativeFileReadTool(name, desc)
             || isNativeDirectoryTool(name, desc)
-            || isNativeSearchTool(name, desc);
+            || isNativeSearchTool(name, desc)
+            || isTerminalTool(name, desc);
     };
     // Add priority (user-referenced) tools first — skip malformed schemas and blocked tools
     for (const t of vscode.lm.tools) {
@@ -715,7 +890,7 @@ async function chatRequestHandler(request, chatContext, stream, token) {
         }
     }
     if (nativeBlocked > 0) {
-        console.log(`[SafeChat] Blocked ${nativeBlocked} native file-read/directory/search tool(s) from tool menu`);
+        console.log(`[SafeChat] Blocked ${nativeBlocked} native file-read/directory/search/terminal tool(s) from tool menu`);
     }
     // ── Step 7: Build messages with conversation history ─────────────────
     const messages = [];
@@ -734,9 +909,20 @@ async function chatRequestHandler(request, chatContext, stream, token) {
         'workspace_search, find_files, grep_search, etc.). The `safechat_read_directory` tool recursively ' +
         'reads all files in a directory and sanitizes sensitive data before returning results. ' +
         'It supports `maxDepth` and `maxFiles` parameters to control scope.\n\n' +
-        'Both `safechat_read_file` and `safechat_read_directory` automatically sanitize sensitive data ' +
-        'like passwords, API keys, and PII before returning contents. Using any other file or directory ' +
-        'tool would bypass this security protection.\n\n' +
+        'CRITICAL TERMINAL RULE: You MUST use the `safechat_run_terminal` tool EXCLUSIVELY to run ' +
+        'any terminal or shell command. Do NOT use any other terminal, shell, exec, or command-running ' +
+        'tool (such as run_in_terminal, exec, runCommand, run_task, vscode_get_terminal_confirmation, ' +
+        'execute_command, bash, terminal, etc.). ' +
+        'The user will be shown the command in an edit box before it runs and may modify or cancel it. ' +
+        'The command will execute in a visible, interactive native VS Code terminal. You will automatically ' +
+        'receive the sanitized output when the command finishes — do NOT attempt to run alternative ' +
+        'background tasks or hallucinate the output. ' +
+        'If the tool returns "[Shell Integration Unavailable]", ask the user to share the result using ' +
+        '`#terminalLastCommand` or to paste the relevant output. ' +
+        'Do NOT use terminal commands like `cat`, `head`, `tail`, or `grep` as a workaround to read ' +
+        'files — use `safechat_read_file` instead.\n\n' +
+        'All three `safechat_*` tools automatically sanitize sensitive data like passwords, API keys, ' +
+        'and PII before returning contents. Using any other tool would bypass this security protection.\n\n' +
         'IMPORTANT: Some of the provided file context has been pre-sanitized to protect sensitive data. ' +
         'Treat any `[MASKED_BY_SAFECHAT]` or `<ENTITY_TYPE>` placeholders as redacted secrets — ' +
         'do not attempt to guess their original values. ' +
@@ -773,6 +959,7 @@ async function chatRequestHandler(request, chatContext, stream, token) {
     // ("View Masked Diff" buttons) when autonomous reads trigger masking.
     safeReadFileToolInstance._stream = stream;
     safeReadDirToolInstance._stream = stream;
+    safeRunTerminalToolInstance._stream = stream;
     const MAX_TOOL_ROUNDS = 15;
     const requestOptions = allTools.length > 0
         ? { tools: allTools, toolMode: vscode.LanguageModelChatToolMode.Auto }
@@ -848,6 +1035,19 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                     // Force-sanitize search results via the 'search' pipeline path
                     resultContent = await sanitizeToolResultParts(result.content, 'search');
                 }
+                else if (isTerminalTool(call.name, toolDesc)) {
+                    // ── Redirect: native terminal tool → safechat_run_terminal ────
+                    console.log('[SafeChat] REDIRECT: native terminal tool', call.name, '→ safechat_run_terminal');
+                    const cmd = extractCommandFromInput(call.input);
+                    if (cmd) {
+                        const cwdInput = extractCwdFromInput(call.input);
+                        const safeResult = await safeRunTerminalToolInstance.invoke({ input: { command: cmd, cwd: cwdInput }, toolInvocationToken: request.toolInvocationToken }, token);
+                        resultContent = safeResult.content;
+                    }
+                    else {
+                        resultContent = [new vscode.LanguageModelTextPart('Error: No command found in tool input')];
+                    }
+                }
                 else {
                     const result = await vscode.lm.invokeTool(call.name, {
                         input: call.input,
@@ -918,8 +1118,8 @@ async function sanitizeToolResultParts(parts, mode = 'general') {
             const { cleanText, wasModified } = await (0, sanitizer_1.sanitizePipeline)(val, mode);
             console.log(`[SafeChat] sanitizeToolResultParts[${i}] mode=${mode}: len=${val.length} modified=${wasModified}`);
             if (wasModified) {
-                console.log('[SafeChat] ── before (first 200):', val.slice(0, 200));
-                console.log('[SafeChat] ── after  (first 200):', cleanText.slice(0, 200));
+                // console.log('\n[SafeChat Debug] 🔴 ORIGINAL TOOL RESULT:\n', val);
+                // console.log('\n[SafeChat Debug] 🟢 MASKED TOOL RESULT:\n', cleanText);
             }
             return new vscode.LanguageModelTextPart(cleanText);
         }
@@ -958,6 +1158,38 @@ function extractDirectoryPathFromInput(input) {
         'folderPath', 'folder_path', 'folder', 'dir', 'directory',
         'path', 'uri',
     ]) {
+        const val = obj[key];
+        if (typeof val === 'string' && val.length > 0) {
+            return val;
+        }
+    }
+    return undefined;
+}
+/**
+ * Try to extract a shell command from a tool call's input arguments.
+ */
+function extractCommandFromInput(input) {
+    if (typeof input !== 'object' || input === null) {
+        return undefined;
+    }
+    const obj = input;
+    for (const key of ['command', 'cmd', 'shellCommand', 'shell_command', 'script', 'args', 'input']) {
+        const val = obj[key];
+        if (typeof val === 'string' && val.length > 0) {
+            return val;
+        }
+    }
+    return undefined;
+}
+/**
+ * Try to extract a working directory from a tool call's input arguments.
+ */
+function extractCwdFromInput(input) {
+    if (typeof input !== 'object' || input === null) {
+        return undefined;
+    }
+    const obj = input;
+    for (const key of ['cwd', 'workingDirectory', 'working_directory', 'directory', 'dir']) {
         const val = obj[key];
         if (typeof val === 'string' && val.length > 0) {
             return val;

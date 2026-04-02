@@ -73,7 +73,8 @@ The original and masked versions of each sanitization event are cached locally u
   - **Default Deny** — any file whose extension is not in the built-in whitelist or `safechat-rules.yaml` is bypassed (forwarded as-is, no scan). No content sniffing, no blacklists, no guessing.
 - **Shannon Entropy Engine** — mathematically detects unknown/future secret formats by measuring randomness. Replaces brittle pattern matching with `calculateShannonEntropy()` and context-anchored `applyEntropyMasking()`.
 - **Safe file tools** — `safechat_read_file` and `safechat_read_directory` are registered as LM tools so the model can read workspace files and directories via a sanitized pipeline.
-- **Native tool blocklist** — native file-read, directory-listing, and workspace-search tools are stripped from the model's tool menu and, if called anyway, are intercepted and rerouted through the safe alternatives.
+- **Safe terminal tool** — `safechat_run_terminal` uses VS Code's modern **Terminal Shell Integration API** for a secure yet interactive command execution flow: (1) the LLM proposes a command, (2) you review and edit it in an `InputBox` before execution, (3) the command runs natively in a visible VS Code terminal so you can interact with it (type passwords, watch progress), (4) output is automatically captured via the async `shellIntegration.read()` stream, (5) the extension sanitizes it locally and returns the clean result to the LLM in the same chat turn. No hidden processes, no context loss, full user control.
+- **Native tool blocklist** — native file-read, directory-listing, workspace-search, and terminal tools are stripped from the model's tool menu and, if called anyway, are intercepted and rerouted through the safe alternatives.
 - **Terminal-aware sanitization** — ANSI escape codes are stripped; CLI-specific patterns (curl headers, env var exports, JSON credential fields) are caught separately from general file patterns.
 - **12 PII entity types** — names, emails, phone numbers, credit cards, SSNs, IBANs, bank accounts, crypto wallets, IP addresses, URLs, card CVV, and card expiry. Hallucination-prone entities (`US_DRIVER_LICENSE`, `US_ITIN`) are intentionally excluded.
 - **5 anonymizer operations** — `replace`, `mask`, `redact`, `hash`, or `encrypt` per entity type, configured in a single YAML file.
@@ -499,6 +500,20 @@ Two Language Model Tools are registered with VS Code, making them available to t
 - **Defaults**: `maxDepth: 10` (hard cap: 15), `maxFiles: 500` (hard cap: 1000)
 - **Behaviour**: Recursively collects files (sorted: files first, then directories); checks cache tiers per file; fresh reads are passed through `regexSanitize`; tracks all masked files and appends them to the diff cache in one batch; renders a UI button with the masked file count
 - **Skipped directories**: `node_modules`, `.git`, `.venv`, `__pycache__`, `.temp_cache`, `out`, `dist`, `build`, `.next`, `.nuxt`, `coverage`
+
+### `safechat_run_terminal`
+- **Input**: `{ command: string, cwd?: string }`
+- **User Approval Flow**: When invoked, the LLM's proposed command is shown to you in a VS Code `InputBox` for review, editing, or cancellation before execution.
+- **Execution Architecture** (Shell Integration API):
+  - Creates or reuses a persistent named `SafeChat` terminal
+  - Executes via `term.shellIntegration.executeCommand(command)` in a visible, interactive native terminal
+  - Immediately begins streaming output from `execution.read()` (async iterable) into a local buffer
+  - Accumulates all stdout/stderr (with 512 KB limit and 30 s timeout)
+  - Races against the `onDidEndTerminalShellExecution` event to capture the exit code
+- **Sanitization**: Once the stream closes, the accumulated buffer is passed through `sanitizePipeline(buffer, 'terminal')` — stripping ANSI codes, masking secrets (API keys, tokens, passwords), and redacting PII.
+- **Return to LLM**: The clean, sanitized output is returned immediately in the same chat turn. No delay, no loss of context.
+- **Fallback (Shell Integration Unavailable)**: If the terminal's shell integration is not available (checked with a 4 s timeout), the tool falls back to `sendText()` and instructs you to share the output via `#terminalLastCommand` or paste it manually.
+- **No hidden processes**: Everything runs in a real, visible terminal. You can `Ctrl+C` to interrupt, `Ctrl+D` to exit, type passwords, and watch real-time output.
 
 ---
 

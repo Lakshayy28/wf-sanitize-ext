@@ -95,6 +95,28 @@
             "directoryPath"
           ]
         }
+      },
+      {
+        "name": "safechat_run_terminal",
+        "tags": ["safechat", "terminal", "shell", "command", "security"],
+        "toolReferenceName": "safechat_run_terminal",
+        "displayName": "SafeChat Secure Terminal",
+        "modelDescription": "Executes a shell command and returns sanitized stdout/stderr. Interactive commands (npm login, ssh, sudo) automatically spawn a visible VS Code terminal for the user. ALWAYS use this tool instead of any other terminal or command-running tool.",
+        "icon": "$(shield)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "The shell command to execute."
+            },
+            "cwd": {
+              "type": "string",
+              "description": "Optional working directory. Defaults to the workspace root."
+            }
+          },
+          "required": ["command"]
+        }
       }
     ],
     "configuration": {
