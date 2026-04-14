@@ -66,6 +66,19 @@ export interface CustomRecognizerDef {
   context?: string[];
 }
 
+// ── MCP Triage Router types ─────────────────────────────────────────────────
+
+export type McpRoutingProfile = 'bypass' | 'json-keys' | 'regex-only' | 'nlp-full';
+
+export interface McpRoutingConfig {
+  /** Profile applied to MCP tools that don’t match any wildcard pattern. */
+  default_profile: McpRoutingProfile;
+  /** Max ms allowed for sanitizing an MCP payload before blocking it. */
+  timeout_ms: number;
+  /** Maps each profile to an array of wildcard glob patterns (case-insensitive). */
+  profiles: Record<McpRoutingProfile, string[]>;
+}
+
 export interface RulesConfig {
   rules?: Record<string, string>;
   ast_extensions?: string[];
@@ -75,7 +88,10 @@ export interface RulesConfig {
   custom_recognizers?: CustomRecognizerDef[];
   /** Extra Tier-2 suffix tokens added to isSensitiveKey’s structural suffix check. */
   sensitive_suffixes?: string[];  /** Local PII engine config — enable/disable patterns and add custom ones. */
-  pii_patterns?: PiiPatternsConfig;}
+  pii_patterns?: PiiPatternsConfig;
+  /** MCP Triage Router — controls how MCP tool payloads are sanitized. */
+  mcp_routing?: McpRoutingConfig;
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // File categories
@@ -322,7 +338,8 @@ function normalizeEntityKey(key: string): string {
  *       context: [employee, staff]
  */
 type YamlSection = 'none' | 'rules' | 'ast_extensions' | 'full_dlp_extensions'
-  | 'custom_secrets' | 'custom_paths' | 'custom_recognizers';
+  | 'custom_secrets' | 'custom_paths' | 'custom_recognizers'
+  | 'mcp_routing';
 
 function parseRulesYaml(content: string): RulesConfig {
   const rules: Record<string, string> = {};
@@ -331,6 +348,14 @@ function parseRulesYaml(content: string): RulesConfig {
   const customSecrets: CustomSecretDef[] = [];
   const customPaths: CustomPathRule[] = [];
   const customRecognizers: CustomRecognizerDef[] = [];
+  const mcpRouting: McpRoutingConfig = {
+    default_profile: 'regex-only',
+    timeout_ms: 5000,
+    profiles: { bypass: [], 'json-keys': [], 'regex-only': [], 'nlp-full': [] },
+  };
+  let mcpRoutingFound = false;
+  /** Tracks current sub-profile inside mcp_routing.profiles (e.g. 'bypass', 'json-keys') */
+  let mcpSubProfile: McpRoutingProfile | null = null;
   let section: YamlSection = 'none';
   let currentSecret: Partial<CustomSecretDef> | null = null;
   let currentPath: Partial<CustomPathRule> | null = null;
@@ -386,6 +411,7 @@ function parseRulesYaml(content: string): RulesConfig {
     if (trimmed === 'custom_secrets:')     { flushAll(); section = 'custom_secrets';     continue; }
     if (trimmed === 'custom_paths:')       { flushAll(); section = 'custom_paths';       continue; }
     if (trimmed === 'custom_recognizers:') { flushAll(); section = 'custom_recognizers'; continue; }
+    if (trimmed === 'mcp_routing:')         { flushAll(); section = 'mcp_routing'; mcpRoutingFound = true; mcpSubProfile = null; continue; }
 
     // Must be indented to be inside a section
     if (!/^\s/.test(line)) { flushAll(); section = 'none'; continue; }
@@ -440,6 +466,34 @@ function parseRulesYaml(content: string): RulesConfig {
         if (kvMatch) { parseRecognizerKV(currentRecognizer, kvMatch[1], kvMatch[2]); }
       }
     }
+
+    if (section === 'mcp_routing') {
+      // Top-level scalar keys under mcp_routing:
+      const kvMatch = trimmed.match(/^([\w-]+)\s*:\s*(.+)/);
+      if (kvMatch) {
+        const [, key, rawVal] = kvMatch;
+        const val = rawVal.trim().replace(/^["']|["']$/g, '');
+        if (key === 'default_profile') {
+          const valid: McpRoutingProfile[] = ['bypass', 'json-keys', 'regex-only', 'nlp-full'];
+          if (valid.includes(val as McpRoutingProfile)) {
+            mcpRouting.default_profile = val as McpRoutingProfile;
+          }
+        } else if (key === 'timeout_ms') {
+          const n = parseInt(val, 10);
+          if (!isNaN(n) && n > 0) { mcpRouting.timeout_ms = n; }
+        } else if (key === 'profiles') {
+          // Section header — sub-profiles follow
+          mcpSubProfile = null;
+        } else if (['bypass', 'json-keys', 'regex-only', 'nlp-full'].includes(key)) {
+          // Profile header (bypass:, json-keys:, regex-only:, nlp-full:)
+          mcpSubProfile = key as McpRoutingProfile;
+        }
+      } else if (trimmed.startsWith('- ') && mcpSubProfile) {
+        // List item under a profile
+        const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
+        if (val) { mcpRouting.profiles[mcpSubProfile].push(val); }
+      }
+    }
   }
 
   flushAll();
@@ -460,6 +514,7 @@ function parseRulesYaml(content: string): RulesConfig {
     custom_paths: customPaths.length > 0 ? customPaths : undefined,
     custom_secrets: customSecrets.length > 0 ? customSecrets : undefined,
     custom_recognizers: customRecognizers.length > 0 ? customRecognizers : undefined,
+    mcp_routing: mcpRoutingFound ? mcpRouting : undefined,
   };
 }
 

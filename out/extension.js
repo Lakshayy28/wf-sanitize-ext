@@ -1048,6 +1048,40 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                         resultContent = [new vscode.LanguageModelTextPart('Error: No command found in tool input')];
                     }
                 }
+                else if (call.name.toLowerCase().includes('mcp')) {
+                    // ── Intercept: MCP tool — Zero-Trust sanitization sandbox ──────
+                    console.log(`[SafeChat] INTERCEPT: MCP Tool - ${call.name}`);
+                    const result = await vscode.lm.invokeTool(call.name, {
+                        input: call.input,
+                        toolInvocationToken: request.toolInvocationToken,
+                    }, token);
+                    const mcpConfig = await (0, sanitizer_1.readRulesConfig)();
+                    const timeoutMs = mcpConfig.mcp_routing?.timeout_ms || 5000;
+                    try {
+                        resultContent = await Promise.all(result.content.map(async (part) => {
+                            if (part.value && typeof part.value === 'string') {
+                                // Promise.race: sanitization vs timeout sandbox
+                                const sanitizeTask = (0, sanitizer_1.sanitizeMcpPayload)(part.value, call.name, mcpConfig);
+                                const timeoutTask = new Promise((_, reject) => setTimeout(() => reject(new Error('Sanitization Timeout')), timeoutMs));
+                                const { cleanText, wasModified } = await Promise.race([
+                                    sanitizeTask,
+                                    timeoutTask,
+                                ]);
+                                if (wasModified && safeReadFileToolInstance._stream) {
+                                    safeReadFileToolInstance._stream.markdown(`\n\n\u{1F6E1}\uFE0F **MCP Payload from \`${call.name}\` was sanitized.**\n\n`);
+                                }
+                                return new vscode.LanguageModelTextPart(cleanText);
+                            }
+                            return part;
+                        }));
+                    }
+                    catch (err) {
+                        console.warn(`[SafeChat] MCP Sanitization failed/timed out for ${call.name}:`, err);
+                        resultContent = [
+                            new vscode.LanguageModelTextPart(`[SafeChat Error]: The response from ${call.name} was too large or complex to sanitize within ${timeoutMs}ms. Payload blocked for safety.`),
+                        ];
+                    }
+                }
                 else {
                     const result = await vscode.lm.invokeTool(call.name, {
                         input: call.input,

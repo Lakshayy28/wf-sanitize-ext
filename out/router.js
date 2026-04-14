@@ -282,6 +282,14 @@ function parseRulesYaml(content) {
     const customSecrets = [];
     const customPaths = [];
     const customRecognizers = [];
+    const mcpRouting = {
+        default_profile: 'regex-only',
+        timeout_ms: 5000,
+        profiles: { bypass: [], 'json-keys': [], 'regex-only': [], 'nlp-full': [] },
+    };
+    let mcpRoutingFound = false;
+    /** Tracks current sub-profile inside mcp_routing.profiles (e.g. 'bypass', 'json-keys') */
+    let mcpSubProfile = null;
     let section = 'none';
     let currentSecret = null;
     let currentPath = null;
@@ -359,6 +367,13 @@ function parseRulesYaml(content) {
             section = 'custom_recognizers';
             continue;
         }
+        if (trimmed === 'mcp_routing:') {
+            flushAll();
+            section = 'mcp_routing';
+            mcpRoutingFound = true;
+            mcpSubProfile = null;
+            continue;
+        }
         // Must be indented to be inside a section
         if (!/^\s/.test(line)) {
             flushAll();
@@ -431,6 +446,41 @@ function parseRulesYaml(content) {
                 }
             }
         }
+        if (section === 'mcp_routing') {
+            // Top-level scalar keys under mcp_routing:
+            const kvMatch = trimmed.match(/^([\w-]+)\s*:\s*(.+)/);
+            if (kvMatch) {
+                const [, key, rawVal] = kvMatch;
+                const val = rawVal.trim().replace(/^["']|["']$/g, '');
+                if (key === 'default_profile') {
+                    const valid = ['bypass', 'json-keys', 'regex-only', 'nlp-full'];
+                    if (valid.includes(val)) {
+                        mcpRouting.default_profile = val;
+                    }
+                }
+                else if (key === 'timeout_ms') {
+                    const n = parseInt(val, 10);
+                    if (!isNaN(n) && n > 0) {
+                        mcpRouting.timeout_ms = n;
+                    }
+                }
+                else if (key === 'profiles') {
+                    // Section header — sub-profiles follow
+                    mcpSubProfile = null;
+                }
+                else if (['bypass', 'json-keys', 'regex-only', 'nlp-full'].includes(key)) {
+                    // Profile header (bypass:, json-keys:, regex-only:, nlp-full:)
+                    mcpSubProfile = key;
+                }
+            }
+            else if (trimmed.startsWith('- ') && mcpSubProfile) {
+                // List item under a profile
+                const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
+                if (val) {
+                    mcpRouting.profiles[mcpSubProfile].push(val);
+                }
+            }
+        }
     }
     flushAll();
     // Normalize rule keys
@@ -448,6 +498,7 @@ function parseRulesYaml(content) {
         custom_paths: customPaths.length > 0 ? customPaths : undefined,
         custom_secrets: customSecrets.length > 0 ? customSecrets : undefined,
         custom_recognizers: customRecognizers.length > 0 ? customRecognizers : undefined,
+        mcp_routing: mcpRoutingFound ? mcpRouting : undefined,
     };
 }
 function parsePathKV(pathRule, key, rawValue) {

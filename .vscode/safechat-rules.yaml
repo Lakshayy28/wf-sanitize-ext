@@ -222,3 +222,48 @@ custom_recognizers:
       - customer
       - account
       - billing
+
+
+# ── 7. MCP Triage Router ─────────────────────────────────────────────────────
+# Controls how @safechat routes Model Context Protocol (MCP) tool payloads
+# through the sanitization pipeline. MCP servers can return massive, highly
+# structured payloads — this router prevents V8 lockups, timeouts, and
+# data leaks by matching tool names to sanitization profiles.
+#
+# Profiles:
+#   bypass     — pass payload through unmodified (safe/low-risk tools)
+#   json-keys  — parse JSON, mask values of sensitive keys via AST engine,
+#                fallback to regex-only if JSON.parse fails
+#   regex-only — line-split + semantic batching + concurrent regex scan
+#                (never splits a credential in half)
+#   nlp-full   — full DLP pipeline (regex + Shannon entropy + Presidio NLP)
+#
+# Tool names are matched with wildcard globs (case-insensitive).
+# The first matching profile wins; unmatched tools use default_profile.
+# ─────────────────────────────────────────────────────────────────────────────
+mcp_routing:
+  default_profile: "regex-only"
+  timeout_ms: 5000
+  profiles:
+    bypass:
+      - "*weather*"
+      - "*calc*"
+      - "*time*"
+      - "*ping*"
+    json-keys:
+      - "*github*"
+      - "*gitlab*"
+      - "*bitbucket*"
+      - "*azure_devops*"
+    regex-only:
+      - "*splunk*"
+      - "*datadog*"
+      - "*elastic*"
+      - "*kibana*"
+      - "*grafana*"
+    nlp-full:
+      - "*jira*"
+      - "*confluence*"
+      - "*slack*"
+      - "*teams*"
+      - "*salesforce*"

@@ -15,17 +15,18 @@ import * as http from 'http';
 import * as https from 'https';
 
 // ── Module imports ──────────────────────────────────────────────────────────
-import { regexSanitize, terminalSanitize, stripAnsiCodes, hydrateCustomSecrets, MASK, applyEntropyMasking, DYNAMIC_AST_KEYS, SENSITIVE_SUFFIXES } from './regexSanitizer';
+import { regexSanitize, terminalSanitize, stripAnsiCodes, hydrateCustomSecrets, MASK, applyEntropyMasking, DYNAMIC_AST_KEYS, SENSITIVE_SUFFIXES, isSensitiveKey } from './regexSanitizer';
 import { astSanitize, sanitizeUniversalKeyValue, type AstFormat } from './astSanitizer';
 import { hydratePiiConfig } from './piiSanitizer';
 import {
   getFileCategory, getAstFormat, readRulesConfig,
   type RulesConfig, type FileCategory, type CustomSecretDef,
+  type McpRoutingConfig, type McpRoutingProfile,
 } from './router';
 
 // ── Re-exports for extension.ts ─────────────────────────────────────────────
 export { readRulesConfig, getFileCategory } from './router';
-export type { RulesConfig, FileCategory, CustomSecretDef } from './router';
+export type { RulesConfig, FileCategory, CustomSecretDef, McpRoutingConfig, McpRoutingProfile } from './router';
 export { regexSanitize, stripAnsiCodes, MASK, calculateShannonEntropy, applyEntropyMasking } from './regexSanitizer';
 export type { SecretPattern } from './regexSanitizer';
 
@@ -249,6 +250,163 @@ export async function sanitizeOnly(
   }
 
   return { cleanText: current, wasModified: modified, presidioError };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// MCP Triage Router — Zero-Trust interception for MCP tool payloads
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Matches a tool name against a single wildcard glob pattern (case-insensitive).
+ * Supports `*` as a wildcard that matches any sequence of characters.
+ * e.g. "*weather*" matches "mcp_test_weather", "myWeatherApi", etc.
+ */
+function wildcardMatch(pattern: string, toolName: string): boolean {
+  const regexStr = '^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$';
+  return new RegExp(regexStr, 'i').test(toolName);
+}
+
+/**
+ * Determines which MCP routing profile applies to a given tool name.
+ * Iterates through all profiles and returns the first match.
+ * Falls back to config.default_profile (or 'regex-only' if unset).
+ */
+function matchMcpProfile(toolName: string, config: RulesConfig): McpRoutingProfile {
+  const routing = config.mcp_routing;
+  if (!routing) { return 'regex-only'; }
+
+  const profileOrder: McpRoutingProfile[] = ['bypass', 'json-keys', 'regex-only', 'nlp-full'];
+  for (const profile of profileOrder) {
+    const patterns = routing.profiles[profile];
+    if (patterns && patterns.some(p => wildcardMatch(p, toolName))) {
+      return profile;
+    }
+  }
+
+  return routing.default_profile || 'regex-only';
+}
+
+/**
+ * Regex-only sanitization for a single batch of text (line-joined).
+ * Wraps `regexSanitize` to match the async batch interface.
+ */
+async function localRegexOnlySanitize(
+  batch: string,
+): Promise<{ cleanText: string; wasModified: boolean }> {
+  return regexSanitize(batch);
+}
+
+/**
+ * Recursively mask values of sensitive keys in a parsed JSON object.
+ * Uses `isSensitiveKey` from the AST engine to identify keys.
+ * Returns true if any modifications were made.
+ */
+function maskSensitiveJsonKeys(obj: unknown): boolean {
+  if (typeof obj !== 'object' || obj === null) { return false; }
+  let modified = false;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      if (maskSensitiveJsonKeys(item)) { modified = true; }
+    }
+  } else {
+    const record = obj as Record<string, unknown>;
+    for (const key of Object.keys(record)) {
+      const val = record[key];
+      if (typeof val === 'string' && val.length > 0) {
+        // isSensitiveKey is imported at the top of the file from regexSanitizer
+        if (isSensitiveKey(key)) {
+          record[key] = MASK;
+          modified = true;
+        }
+      } else if (typeof val === 'object' && val !== null) {
+        if (maskSensitiveJsonKeys(val)) { modified = true; }
+      }
+    }
+  }
+
+  return modified;
+}
+
+/**
+ * MCP Triage Router — sanitizes MCP tool payloads based on the routing profile
+ * matched from the tool name against `safechat-rules.yaml` config.
+ *
+ * Profiles:
+ *   bypass    — pass through immediately (safe tools like weather, calc)
+ *   json-keys — parse JSON, mask sensitive key values, re-serialize
+ *   regex-only — semantic line-batching with truncation + concurrent regex
+ *   nlp-full  — full DLP pipeline (regex + Shannon entropy + Presidio NLP)
+ *
+ * The `regex-only` profile implements:
+ *   1. Line splitting (never splits a credential in half)
+ *   2. Contextual truncation (>5000 lines → first 2500 + last 2500 + warning)
+ *   3. Concurrent batching (500 lines/batch via Promise.all)
+ */
+export async function sanitizeMcpPayload(
+  text: string,
+  toolName: string,
+  config: RulesConfig,
+): Promise<{ cleanText: string; wasModified: boolean }> {
+  const profile = matchMcpProfile(toolName, config);
+  console.log(`[SafeChat] MCP Router: tool="${toolName}" → profile="${profile}"`);
+
+  ensureHydrated(config);
+
+  // ── bypass ────────────────────────────────────────────────────────────
+  if (profile === 'bypass') {
+    return { cleanText: text, wasModified: false };
+  }
+
+  // ── json-keys ─────────────────────────────────────────────────────────
+  if (profile === 'json-keys') {
+    try {
+      const parsed = JSON.parse(text);
+      const wasModified = maskSensitiveJsonKeys(parsed);
+      return { cleanText: JSON.stringify(parsed, null, 2), wasModified };
+    } catch {
+      // JSON parse failed — fall through to regex-only
+      console.log(`[SafeChat] MCP json-keys: JSON.parse failed for ${toolName}, falling back to regex-only`);
+    }
+  }
+
+  // ── nlp-full ──────────────────────────────────────────────────────────
+  if (profile === 'nlp-full') {
+    return sanitizePipeline(text, 'general');
+  }
+
+  // ── regex-only (Semantic Line-Batching) ───────────────────────────────
+  let lines = text.split('\n');
+
+  // Step 1: Contextual Truncation
+  if (lines.length > 5000) {
+    const totalLines = lines.length;
+    const head = lines.slice(0, 2500);
+    const tail = lines.slice(-2500);
+    const warningLine = `[... TRUNCATED ${totalLines - 5000} LINES FOR CONTEXT/SANITIZATION LIMITS ...]`;
+    lines = [...head, warningLine, ...tail];
+    console.log(`[SafeChat] MCP regex-only: truncated ${totalLines} → ${lines.length} lines`);
+  }
+
+  // Step 2: Concurrent Batching (500 lines per batch)
+  const BATCH_SIZE = 500;
+  const batches: string[] = [];
+  for (let i = 0; i < lines.length; i += BATCH_SIZE) {
+    batches.push(lines.slice(i, i + BATCH_SIZE).join('\n'));
+  }
+
+  const results = await Promise.all(
+    batches.map(batch => localRegexOnlySanitize(batch)),
+  );
+
+  let wasModified = false;
+  const sanitizedBatches: string[] = [];
+  for (const result of results) {
+    sanitizedBatches.push(result.cleanText);
+    if (result.wasModified) { wasModified = true; }
+  }
+
+  return { cleanText: sanitizedBatches.join('\n'), wasModified };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
