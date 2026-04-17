@@ -7,9 +7,10 @@
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │  ARCHITECTURE: Hybrid Edge (TypeScript extension + Python server)      │
 # │                                                                         │
-# │  TypeScript handles: Regex (22 patterns), Shannon Entropy scanner,     │
-# │                       AST key-based masking (Tier 2), bare token       │
-# │                       detection.                                        │
+# │  TypeScript handles: Regex (22 patterns), AST key-based masking,       │
+# │                       Shannon Entropy, Dynamic GitIgnore routing,      │
+# │                       Symlink Jails, Prompt Injection Data-Fences,     │
+# │                       and UTF-16/Homoglyph normalization.              │
 # │  Python server handles: NLP PII only (12 entity types, Tier 3).        │
 # │  Without the server: Tier 2 AST + Tier 3 regex/entropy still run.      │
 # │  Graceful degradation — server is optional for secret detection.       │
@@ -20,7 +21,7 @@
 #
 # ROUTING: Strict Default-Deny (Whitelist Only)
 # ──────────────────────────────────────────────
-#   0. Binary files (.pdf, .zip, .exe…)  → BLOCKED (never enter pipeline)
+#   0. Binary files / GitIgnored files   → BLOCKED (never enter pipeline)
 #   1. custom_paths (path match)         → highest priority, user-defined
 #   2. ast_extensions whitelist          → Tier 2 AST (key-based masking)
 #   3. full_dlp_extensions whitelist     → Tier 3 Full DLP (NLP + regex)
@@ -229,6 +230,12 @@ custom_recognizers:
 # through the sanitization pipeline. MCP servers can return massive, highly
 # structured payloads — this router prevents V8 lockups, timeouts, and
 # data leaks by matching tool names to sanitization profiles.
+#
+# Timeout Controls:
+#   timeout_ms — Defines the max milliseconds for the string DOM sanitization
+#                (default: 5000ms). If exceeded, payload is gracefully blocked. 
+#                (Note: Tool execution itself is hard-capped at 30 seconds,
+#                 after which runaway MCP processes are actively killed).
 #
 # Profiles:
 #   bypass     — pass payload through unmodified (safe/low-risk tools)
