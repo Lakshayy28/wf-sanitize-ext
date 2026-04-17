@@ -18,7 +18,8 @@
  */
 
 import * as vscode from 'vscode';
-import { smartSanitize, MASK } from './sanitizer';
+import * as yaml from 'yaml';
+import { smartSanitize, MASK, updateConfig } from './sanitizer';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Write-Guard: tool name + description matching
@@ -159,6 +160,27 @@ function extractToolOutputAsString(res: vscode.LanguageModelToolResult): string 
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Dynamic Workspace Config Loader
+// ────────────────────────────────────────────────────────────────────────────
+
+async function loadWorkspaceConfig() {
+  try {
+    const uris = await vscode.workspace.findFiles('safechat.yml', '**/node_modules/**', 1);
+    if (uris.length > 0) {
+      const fileData = await vscode.workspace.fs.readFile(uris[0]);
+      const text = Buffer.from(fileData).toString('utf-8');
+      const parsed = yaml.parse(text);
+      updateConfig(parsed);
+    } else {
+      updateConfig(null);
+    }
+  } catch (err) {
+    console.error('[SafeChat] Error loading safechat.yml:', err);
+    updateConfig(null); // safely fallback
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Extension Activation
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -171,6 +193,21 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(participant);
 
   console.log('[SafeChat] Smart Proxy activated — Polyglot AST Router online');
+
+  // Load safechat.yml config on startup
+  loadWorkspaceConfig();
+
+  // Watch for safechat.yml file modifications in workspace
+  const watcher = vscode.workspace.createFileSystemWatcher('**/safechat.yml');
+  
+  watcher.onDidChange(() => loadWorkspaceConfig());
+  watcher.onDidCreate(() => loadWorkspaceConfig());
+  watcher.onDidDelete(() => {
+    console.log('[SafeChat] safechat.yml deleted. Reverting to base config.');
+    updateConfig(null);
+  });
+
+  context.subscriptions.push(watcher);
 }
 
 // ────────────────────────────────────────────────────────────────────────────

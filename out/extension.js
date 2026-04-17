@@ -53,6 +53,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 const vscode = __importStar(require("vscode"));
+const yaml = __importStar(require("yaml"));
 const sanitizer_1 = require("./sanitizer");
 // ────────────────────────────────────────────────────────────────────────────
 // Write-Guard: tool name + description matching
@@ -187,6 +188,27 @@ function extractToolOutputAsString(res) {
     return parts.join('\n');
 }
 // ────────────────────────────────────────────────────────────────────────────
+// Dynamic Workspace Config Loader
+// ────────────────────────────────────────────────────────────────────────────
+async function loadWorkspaceConfig() {
+    try {
+        const uris = await vscode.workspace.findFiles('safechat.yml', '**/node_modules/**', 1);
+        if (uris.length > 0) {
+            const fileData = await vscode.workspace.fs.readFile(uris[0]);
+            const text = Buffer.from(fileData).toString('utf-8');
+            const parsed = yaml.parse(text);
+            (0, sanitizer_1.updateConfig)(parsed);
+        }
+        else {
+            (0, sanitizer_1.updateConfig)(null);
+        }
+    }
+    catch (err) {
+        console.error('[SafeChat] Error loading safechat.yml:', err);
+        (0, sanitizer_1.updateConfig)(null); // safely fallback
+    }
+}
+// ────────────────────────────────────────────────────────────────────────────
 // Extension Activation
 // ────────────────────────────────────────────────────────────────────────────
 function activate(context) {
@@ -194,6 +216,17 @@ function activate(context) {
     participant.iconPath = new vscode.ThemeIcon('shield');
     context.subscriptions.push(participant);
     console.log('[SafeChat] Smart Proxy activated — Polyglot AST Router online');
+    // Load safechat.yml config on startup
+    loadWorkspaceConfig();
+    // Watch for safechat.yml file modifications in workspace
+    const watcher = vscode.workspace.createFileSystemWatcher('**/safechat.yml');
+    watcher.onDidChange(() => loadWorkspaceConfig());
+    watcher.onDidCreate(() => loadWorkspaceConfig());
+    watcher.onDidDelete(() => {
+        console.log('[SafeChat] safechat.yml deleted. Reverting to base config.');
+        (0, sanitizer_1.updateConfig)(null);
+    });
+    context.subscriptions.push(watcher);
 }
 // ────────────────────────────────────────────────────────────────────────────
 // The Universal Interceptor (chat request handler)

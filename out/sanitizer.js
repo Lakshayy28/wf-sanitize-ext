@@ -58,6 +58,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.HIGH_CONFIDENCE_SECRETS = exports.MASK = void 0;
+exports.updateConfig = updateConfig;
 exports.regexSanitize = regexSanitize;
 exports.maskObjectValues = maskObjectValues;
 exports.truncateAndSanitize = truncateAndSanitize;
@@ -69,6 +70,18 @@ const fast_xml_parser_1 = require("fast-xml-parser");
 // ────────────────────────────────────────────────────────────────────────────
 exports.MASK = '[MASKED_BY_SAFECHAT]';
 const MAX_BUDGET_BYTES = 250_000; // 250 KB
+const IS_DEV_MODE = true;
+/**
+ * Dual-Mode Logger: Avoids CWE-532 (Sensitive Logging) in production.
+ */
+function logRedaction(patternName, matchedSecret) {
+    if (IS_DEV_MODE) {
+        console.warn(`[SafeChat DEBUG] Redacted ${patternName}: "${matchedSecret}"`);
+    }
+    else {
+        console.info(`[SafeChat AUDIT] Redacted ${patternName} (length: ${matchedSecret.length})`);
+    }
+}
 exports.HIGH_CONFIDENCE_SECRETS = [
     // ── Cloud & CI/CD ─────────────────────────────────────────────────────
     { name: 'AWS Access Key', regex: /\b(AKIA[0-9A-Z]{16})\b/g },
@@ -110,9 +123,17 @@ exports.HIGH_CONFIDENCE_SECRETS = [
     { name: 'Phone Number Fallback', regex: /(?:\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g },
 ];
 // ────────────────────────────────────────────────────────────────────────────
-// Code file extensions (bypass — no scanning needed for source code)
+// Configuration Management (`safechat.yml` dynamic routing)
 // ────────────────────────────────────────────────────────────────────────────
-const CODE_EXTENSIONS = new Set([
+// Routing sets (mutable base configs)
+let BYPASS_EXTENSIONS = new Set();
+let AST_JSON_EXTENSIONS = new Set();
+let AST_YAML_EXTENSIONS = new Set();
+let AST_XML_EXTENSIONS = new Set();
+let AST_ENV_EXTENSIONS = new Set();
+let DYNAMIC_PATTERNS = [];
+// Defaults (Fallback)
+const DEFAULT_BYPASS = [
     '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
     '.py', '.pyw',
     '.java', '.kt', '.kts', '.scala',
@@ -135,24 +156,91 @@ const CODE_EXTENSIONS = new Set([
     '.tf', '.hcl', // Terraform / HCL
     '.proto',
     '.graphql', '.gql',
-]);
+];
+const DEFAULT_AST_JSON = ['.json', '.jsonc', '.json5'];
+const DEFAULT_AST_YAML = ['.yaml', '.yml'];
+const DEFAULT_AST_XML = ['.xml', '.xsl', '.xslt', '.svg', '.plist'];
+const DEFAULT_AST_ENV = ['.env', '.ini', '.cfg', '.properties', '.env.local', '.env.production', '.env.development'];
+function resetToDefaults() {
+    BYPASS_EXTENSIONS = new Set(DEFAULT_BYPASS);
+    AST_JSON_EXTENSIONS = new Set(DEFAULT_AST_JSON);
+    AST_YAML_EXTENSIONS = new Set(DEFAULT_AST_YAML);
+    AST_XML_EXTENSIONS = new Set(DEFAULT_AST_XML);
+    AST_ENV_EXTENSIONS = new Set(DEFAULT_AST_ENV);
+    DYNAMIC_PATTERNS = [];
+}
+// Initial bootstrap
+resetToDefaults();
+/**
+ * Updates dynamic configuration arrays/sets based on safechat.yml.
+ * If config is null/undefined, resets to hardcoded defaults.
+ */
+function updateConfig(config) {
+    if (!config) {
+        console.log('[SafeChat] Config absent or removed. Resetting to defaults.');
+        resetToDefaults();
+        return;
+    }
+    // Populate Extensions Sets if supplied 
+    if (config.routing) {
+        if (Array.isArray(config.routing.bypass)) {
+            BYPASS_EXTENSIONS = new Set(config.routing.bypass);
+        }
+        if (Array.isArray(config.routing.ast_json)) {
+            AST_JSON_EXTENSIONS = new Set(config.routing.ast_json);
+        }
+        if (Array.isArray(config.routing.ast_yaml)) {
+            AST_YAML_EXTENSIONS = new Set(config.routing.ast_yaml);
+        }
+        if (Array.isArray(config.routing.ast_xml)) {
+            AST_XML_EXTENSIONS = new Set(config.routing.ast_xml);
+        }
+        if (Array.isArray(config.routing.ast_env)) {
+            AST_ENV_EXTENSIONS = new Set(config.routing.ast_env);
+        }
+    }
+    else {
+        // If routing block isn't present, preserve defaults
+        resetToDefaults();
+    }
+    // Populate Custom Regex Patterns
+    DYNAMIC_PATTERNS = [];
+    if (Array.isArray(config.custom_patterns)) {
+        for (const pat of config.custom_patterns) {
+            if (pat.name && pat.regex) {
+                try {
+                    // Use 'g' flag for sequential replacement
+                    let r = new RegExp(pat.regex, 'g');
+                    DYNAMIC_PATTERNS.push({ name: pat.name, regex: r });
+                }
+                catch (err) {
+                    console.warn(`[SafeChat] Failed to compile regex for custom pattern "${pat.name}":`, err);
+                }
+            }
+        }
+    }
+    console.log('[SafeChat] Configuration updated successfully from safechat.yml.');
+}
 // ────────────────────────────────────────────────────────────────────────────
 // Tier 1: Pure Regex Sanitizer
 // ────────────────────────────────────────────────────────────────────────────
 /**
- * Runs the 22-pattern enterprise regex dictionary against `text`.
+ * Runs the 22-pattern enterprise regex dictionary + dynamic patterns.
  * Every pattern uses `lastIndex`-reset via fresh `.replace()` calls
  * to avoid stale-state bugs on global regexes.
  */
 function regexSanitize(text) {
     let wasModified = false;
     let current = text;
-    for (const pattern of exports.HIGH_CONFIDENCE_SECRETS) {
+    // Combine built-in secrets with user-defined dynamic patterns
+    const allPatterns = [...exports.HIGH_CONFIDENCE_SECRETS, ...DYNAMIC_PATTERNS];
+    for (const pattern of allPatterns) {
         // Reset lastIndex for global regexes to avoid stale state
         pattern.regex.lastIndex = 0;
         if (pattern.isUrlAuth) {
             const replaced = current.replace(pattern.regex, (_full, proto, _auth, host) => {
                 wasModified = true;
+                logRedaction(pattern.name, _auth);
                 return `${proto}${exports.MASK}${host}`;
             });
             if (replaced !== current) {
@@ -162,6 +250,8 @@ function regexSanitize(text) {
         else {
             const replaced = current.replace(pattern.regex, (full, captured) => {
                 wasModified = true;
+                const secretValue = captured !== undefined ? captured : full;
+                logRedaction(pattern.name, secretValue);
                 if (captured !== undefined) {
                     return full.replace(captured, exports.MASK);
                 }
@@ -319,11 +409,11 @@ const XML_PARSER_OPTS = {
 function smartSanitize(text, fileExtension) {
     const ext = (fileExtension ?? '').toLowerCase().replace(/^\.?/, '.');
     // ── Code files: bypass completely ─────────────────────────────────────
-    if (CODE_EXTENSIONS.has(ext)) {
+    if (BYPASS_EXTENSIONS.has(ext)) {
         return { cleanText: text, wasModified: false, route: 'bypass:code' };
     }
     // ── JSON ──────────────────────────────────────────────────────────────
-    if (ext === '.json' || ext === '.jsonc' || ext === '.json5') {
+    if (AST_JSON_EXTENSIONS.has(ext)) {
         try {
             const parsed = JSON.parse(text);
             const { masked, wasModified } = maskObjectValues(parsed);
@@ -339,7 +429,7 @@ function smartSanitize(text, fileExtension) {
         }
     }
     // ── YAML ──────────────────────────────────────────────────────────────
-    if (ext === '.yaml' || ext === '.yml') {
+    if (AST_YAML_EXTENSIONS.has(ext)) {
         try {
             const parsed = yaml.parse(text);
             const { masked, wasModified } = maskObjectValues(parsed);
@@ -355,7 +445,7 @@ function smartSanitize(text, fileExtension) {
         }
     }
     // ── XML ───────────────────────────────────────────────────────────────
-    if (ext === '.xml' || ext === '.xsl' || ext === '.xslt' || ext === '.svg' || ext === '.plist') {
+    if (AST_XML_EXTENSIONS.has(ext)) {
         try {
             const parser = new fast_xml_parser_1.XMLParser(XML_PARSER_OPTS);
             const parsed = parser.parse(text);
@@ -377,8 +467,7 @@ function smartSanitize(text, fileExtension) {
         }
     }
     // ── ENV / INI ─────────────────────────────────────────────────────────
-    if (ext === '.env' || ext === '.ini' || ext === '.cfg' || ext === '.properties'
-        || ext === '.env.local' || ext === '.env.production' || ext === '.env.development') {
+    if (AST_ENV_EXTENSIONS.has(ext)) {
         try {
             const { cleanText, wasModified } = sanitizeEnvText(text);
             return { cleanText, wasModified, route: 'line:env' };
