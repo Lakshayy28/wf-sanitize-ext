@@ -1,12 +1,46 @@
 /**
- * Minimalist Pure Proxy Sanitizer
+ * sanitizer.ts — Smart Proxy: Polyglot AST Router + Regex DLP Engine
+ * ════════════════════════════════════════════════════════════════════
+ *
+ * Architecture:
+ *   1. smartSanitize(text, ext?) — The public entry point.
+ *      Routes structured formats (JSON, YAML, XML, ENV/INI) through
+ *      format-aware AST parsing → selective value masking → reconstruction.
+ *      Code files are bypassed entirely.  Unstructured text falls through
+ *      to the truncation + regex catch-all.
+ *
+ *   2. maskObjectValues(obj) — Recursive Universal Object Masker.
+ *      Walks any JS object/array tree.  String leaves are piped through
+ *      regexSanitize().  Primitives pass through untouched.
+ *
+ *   3. regexSanitize(text) — 22-pattern enterprise dictionary.
+ *      Sequential replacement with capture-group-aware masking.
+ *
+ *   4. truncateAndSanitize(text) — 250KB budget guard.
+ *      Slices at the nearest newline, then runs regexSanitize().
+ *
+ * Every AST parser is wrapped in try/catch.  Parse failures NEVER
+ * fail-open — they fall through to truncateAndSanitize().
  */
+
+import * as yaml from 'yaml';
+import { XMLParser, XMLBuilder } from 'fast-xml-parser';
+
+// ────────────────────────────────────────────────────────────────────────────
+// Constants
+// ────────────────────────────────────────────────────────────────────────────
+
 export const MASK = '[MASKED_BY_SAFECHAT]';
-const MAX_BUDGET_BYTES = 250_000;
+const MAX_BUDGET_BYTES = 250_000; // 250 KB
+
+// ────────────────────────────────────────────────────────────────────────────
+// Secret Pattern Dictionary (22 Enterprise Regex Patterns)
+// ────────────────────────────────────────────────────────────────────────────
 
 export interface SecretPattern {
   name: string;
   regex: RegExp;
+  /** When true the regex uses 3 capture groups: protocol (G1), auth (G2), @host (G3). */
   isUrlAuth?: boolean;
 }
 
@@ -36,60 +70,332 @@ export const HIGH_CONFIDENCE_SECRETS: SecretPattern[] = [
   { name: 'RSA/PEM Private Key',    regex: /(-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|DSA\s+|ENCRYPTED\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|DSA\s+|ENCRYPTED\s+)?PRIVATE\s+KEY-----)/g },
   { name: 'JWT Token',              regex: /\b(eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]*)\b/g },
 
-  // ── Generic URLs ─────────────────────────────────────
+  // ── Generic URL Secrets ───────────────────────────────────────────────
   { name: 'URL Query Parameter Secret', regex: /(?:password|passwd|secret|token|api_?key|auth)=([^&\s"']+)/gi },
   { name: 'Credential URL', regex: /\b([a-zA-Z0-9+.-]+:\/\/)([^@\s]+)(@[a-zA-Z0-9.-]+(?::[\d]+)?(?:\/[^\s"']*)?)/gi, isUrlAuth: true },
 
-  // ── Keyless Credential Files ──────────────────────────────────────────────
+  // ── Keyless Credential Files ──────────────────────────────────────────
   { name: 'Netrc Password', regex: /(?:password|passwd)\s+([^\s]+)/gi },
   { name: 'Pgpass Password', regex: /^(?:[^:\r\n]+:){4}([^:\r\n]+)$/gm },
 
-  // ── Standard PII Fallback ──────
-  { name: 'US SSN', regex: /\b(\d{3}-\d{2}-\d{4})\b/g },
-  { name: 'Credit Card Number', regex: /\b(\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{1,7})\b/g },
-  { name: 'IBAN Code', regex: /\b([A-Z]{2}\d{2}[A-Z0-9]{11,30})\b/g },
-  { name: 'IPv4 Address',     regex: /(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/g },
-  { name: 'Internal Hostname', regex: /\b[a-z0-9][a-z0-9\-]*(?:\.[a-z0-9][a-z0-9\-]*)*\.(?:internal|local|private)\b/gi },
-  { name: 'MAC Address',           regex: /(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}/g },
-  { name: 'Certificate Thumbprint', regex: /(?:[0-9A-Fa-f]{2}:){19}[0-9A-Fa-f]{2}/g },
-  { name: 'Email Address',          regex: /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/g },
-  { name: 'Phone Number Fallback', regex: /(?:\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g },
+  // ── Standard PII Fallback ─────────────────────────────────────────────
+  { name: 'US SSN',                  regex: /\b(\d{3}-\d{2}-\d{4})\b/g },
+  { name: 'Credit Card Number',      regex: /\b(\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{1,7})\b/g },
+  { name: 'IBAN Code',               regex: /\b([A-Z]{2}\d{2}[A-Z0-9]{11,30})\b/g },
+  { name: 'IPv4 Address',            regex: /(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/g },
+  { name: 'Internal Hostname',       regex: /\b[a-z0-9][a-z0-9\-]*(?:\.[a-z0-9][a-z0-9\-]*)*\.(?:internal|local|private)\b/gi },
+  { name: 'MAC Address',             regex: /(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}/g },
+  { name: 'Certificate Thumbprint',  regex: /(?:[0-9A-Fa-f]{2}:){19}[0-9A-Fa-f]{2}/g },
+  { name: 'Email Address',           regex: /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/g },
+  { name: 'Phone Number Fallback',   regex: /(?:\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g },
 ];
 
+// ────────────────────────────────────────────────────────────────────────────
+// Code file extensions (bypass — no scanning needed for source code)
+// ────────────────────────────────────────────────────────────────────────────
+
+const CODE_EXTENSIONS = new Set([
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.py', '.pyw',
+  '.java', '.kt', '.kts', '.scala',
+  '.go',
+  '.rs',
+  '.c', '.h', '.cpp', '.hpp', '.cc', '.cxx',
+  '.cs',
+  '.rb',
+  '.php',
+  '.swift',
+  '.m', '.mm',         // Objective-C
+  '.dart',
+  '.lua',
+  '.r', '.R',
+  '.pl', '.pm',        // Perl
+  '.sh', '.bash', '.zsh', '.fish',
+  '.ps1', '.psm1',     // PowerShell
+  '.sql',
+  '.vue', '.svelte',
+  '.tf', '.hcl',       // Terraform / HCL
+  '.proto',
+  '.graphql', '.gql',
+]);
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tier 1: Pure Regex Sanitizer
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Runs the 22-pattern enterprise regex dictionary against `text`.
+ * Every pattern uses `lastIndex`-reset via fresh `.replace()` calls
+ * to avoid stale-state bugs on global regexes.
+ */
 export function regexSanitize(text: string): { cleanText: string; wasModified: boolean } {
   let wasModified = false;
   let current = text;
-  
-  if (Buffer.byteLength(current, 'utf-8') > MAX_BUDGET_BYTES) {
-    const bytes = Buffer.from(current, 'utf-8');
-    const safeSubsetStr = bytes.subarray(0, MAX_BUDGET_BYTES).toString('utf-8');
-    const lastNewline = safeSubsetStr.lastIndexOf('\n');
-    let safeCut = safeSubsetStr.length;
-    if (lastNewline > 0) {
-      safeCut = lastNewline;
-    }
-    current = safeSubsetStr.slice(0, safeCut) + `\n\n[... TRUNCATED: payload exceeded 250KB budget ...]`;
-    wasModified = true;
-  }
 
   for (const pattern of HIGH_CONFIDENCE_SECRETS) {
+    // Reset lastIndex for global regexes to avoid stale state
+    pattern.regex.lastIndex = 0;
+
     if (pattern.isUrlAuth) {
-      if (current.match(pattern.regex)) {
-        current = current.replace(pattern.regex, `$1${MASK}$3`);
+      const replaced = current.replace(pattern.regex, (_full, proto, _auth, host) => {
         wasModified = true;
-      }
+        return `${proto}${MASK}${host}`;
+      });
+      if (replaced !== current) { current = replaced; }
     } else {
-      if (current.match(pattern.regex)) {
-        current = current.replace(pattern.regex, (full, captured) => {
-          wasModified = true;
-          if (captured !== undefined) {
-             return full.replace(captured, MASK);
-          }
-          return MASK;
-        });
-      }
+      const replaced = current.replace(pattern.regex, (full, captured) => {
+        wasModified = true;
+        if (captured !== undefined) {
+          return full.replace(captured, MASK);
+        }
+        return MASK;
+      });
+      if (replaced !== current) { current = replaced; }
     }
   }
 
   return { cleanText: current, wasModified };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tier 2: Universal Object Masker (recursive AST walker)
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Maximum recursion depth to prevent stack overflow on adversarial inputs. */
+const MAX_DEPTH = 64;
+
+/**
+ * Recursively walks any JS object/array tree.
+ * - Strings  → piped through `regexSanitize()`.
+ * - Arrays   → mapped recursively.
+ * - Objects  → keys preserved, values recursively masked.
+ * - Primitives (number, boolean, null, undefined) → returned as-is.
+ *
+ * Returns `{ masked, wasModified }` so callers know if anything changed.
+ */
+export function maskObjectValues(
+  obj: unknown,
+  depth: number = 0,
+): { masked: unknown; wasModified: boolean } {
+  // Depth guard
+  if (depth > MAX_DEPTH) {
+    return { masked: obj, wasModified: false };
+  }
+
+  // Null / undefined
+  if (obj === null || obj === undefined) {
+    return { masked: obj, wasModified: false };
+  }
+
+  // String — the leaf node where actual scanning happens
+  if (typeof obj === 'string') {
+    const { cleanText, wasModified } = regexSanitize(obj);
+    return { masked: cleanText, wasModified };
+  }
+
+  // Primitive passthrough (number, boolean, bigint, symbol)
+  if (typeof obj !== 'object') {
+    return { masked: obj, wasModified: false };
+  }
+
+  // Array — map recursively
+  if (Array.isArray(obj)) {
+    let anyModified = false;
+    const maskedArr = obj.map(item => {
+      const { masked, wasModified } = maskObjectValues(item, depth + 1);
+      if (wasModified) { anyModified = true; }
+      return masked;
+    });
+    return { masked: maskedArr, wasModified: anyModified };
+  }
+
+  // Object — iterate keys, recursively mask values, leave keys intact
+  let anyModified = false;
+  const maskedObj: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    const { masked, wasModified } = maskObjectValues(value, depth + 1);
+    maskedObj[key] = masked;
+    if (wasModified) { anyModified = true; }
+  }
+  return { masked: maskedObj, wasModified: anyModified };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Truncation + Regex Fallback (catch-all for unstructured text)
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Enforces a 250KB byte budget, then runs the regex dictionary.
+ * Truncation slices at the nearest preceding newline to avoid splitting
+ * tokens or credentials mid-match.
+ */
+export function truncateAndSanitize(text: string): { cleanText: string; wasModified: boolean } {
+  let current = text;
+  let wasTruncated = false;
+
+  const byteLen = Buffer.byteLength(current, 'utf-8');
+  if (byteLen > MAX_BUDGET_BYTES) {
+    const buf = Buffer.from(current, 'utf-8');
+    const sliced = buf.subarray(0, MAX_BUDGET_BYTES).toString('utf-8');
+    const lastNl = sliced.lastIndexOf('\n');
+    const safeCut = lastNl > 0 ? lastNl : sliced.length;
+    current = sliced.slice(0, safeCut) +
+      '\n\n[... TRUNCATED: payload exceeded 250KB budget ...]';
+    wasTruncated = true;
+  }
+
+  const { cleanText, wasModified } = regexSanitize(current);
+  return { cleanText, wasModified: wasModified || wasTruncated };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// ENV / INI line-by-line parser
+// ────────────────────────────────────────────────────────────────────────────
+
+function sanitizeEnvText(text: string): { cleanText: string; wasModified: boolean } {
+  let wasModified = false;
+  const lines = text.split('\n');
+
+  const sanitizedLines = lines.map(line => {
+    const trimmed = line.trim();
+
+    // Preserve comments and blank lines
+    if (trimmed === '' || trimmed.startsWith('#') || trimmed.startsWith(';')) {
+      return line;
+    }
+
+    const eqIdx = line.indexOf('=');
+    if (eqIdx === -1) {
+      // No assignment — run regex on the whole line
+      const { cleanText, wasModified: lm } = regexSanitize(line);
+      if (lm) { wasModified = true; }
+      return cleanText;
+    }
+
+    const key = line.slice(0, eqIdx);
+    let value = line.slice(eqIdx + 1);
+
+    // Strip optional surrounding quotes for scanning, then re-wrap
+    let quote = '';
+    const trimVal = value.trim();
+    if ((trimVal.startsWith('"') && trimVal.endsWith('"')) ||
+        (trimVal.startsWith("'") && trimVal.endsWith("'"))) {
+      quote = trimVal[0];
+      value = trimVal.slice(1, -1);
+    }
+
+    const { cleanText: maskedVal, wasModified: vm } = regexSanitize(value);
+    if (vm) { wasModified = true; }
+
+    return quote
+      ? `${key}=${quote}${maskedVal}${quote}`
+      : `${key}=${maskedVal}`;
+  });
+
+  return { cleanText: sanitizedLines.join('\n'), wasModified };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// XML parser config (shared between parser and builder)
+// ────────────────────────────────────────────────────────────────────────────
+
+const XML_PARSER_OPTS = {
+  ignoreAttributes: false,
+  attributeNamePrefix: '@_',
+  preserveOrder: false,
+  trimValues: false,
+};
+
+// ────────────────────────────────────────────────────────────────────────────
+// The Smart Router (public entry point)
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Routes text through the appropriate sanitization pathway based on file
+ * extension.  Structured formats are parsed → masked → reconstructed.
+ * Code files are bypassed.  Unknown / unstructured text falls through to
+ * the 250KB truncation + pure regex catch-all.
+ *
+ * **Every AST parser is try/catch'd.  Parse failures NEVER fail-open —
+ * they fall through to `truncateAndSanitize()` (fail-closed).**
+ */
+export function smartSanitize(
+  text: string,
+  fileExtension?: string,
+): { cleanText: string; wasModified: boolean; route: string } {
+  const ext = (fileExtension ?? '').toLowerCase().replace(/^\.?/, '.');
+
+  // ── Code files: bypass completely ─────────────────────────────────────
+  if (CODE_EXTENSIONS.has(ext)) {
+    return { cleanText: text, wasModified: false, route: 'bypass:code' };
+  }
+
+  // ── JSON ──────────────────────────────────────────────────────────────
+  if (ext === '.json' || ext === '.jsonc' || ext === '.json5') {
+    try {
+      const parsed = JSON.parse(text);
+      const { masked, wasModified } = maskObjectValues(parsed);
+      return {
+        cleanText: JSON.stringify(masked, null, 2),
+        wasModified,
+        route: 'ast:json',
+      };
+    } catch (err) {
+      console.warn('[SafeChat] JSON parse failed, falling back to regex:', err);
+      return { ...truncateAndSanitize(text), route: 'fallback:json-parse-error' };
+    }
+  }
+
+  // ── YAML ──────────────────────────────────────────────────────────────
+  if (ext === '.yaml' || ext === '.yml') {
+    try {
+      const parsed = yaml.parse(text);
+      const { masked, wasModified } = maskObjectValues(parsed);
+      return {
+        cleanText: yaml.stringify(masked, { indent: 2 }),
+        wasModified,
+        route: 'ast:yaml',
+      };
+    } catch (err) {
+      console.warn('[SafeChat] YAML parse failed, falling back to regex:', err);
+      return { ...truncateAndSanitize(text), route: 'fallback:yaml-parse-error' };
+    }
+  }
+
+  // ── XML ───────────────────────────────────────────────────────────────
+  if (ext === '.xml' || ext === '.xsl' || ext === '.xslt' || ext === '.svg' || ext === '.plist') {
+    try {
+      const parser = new XMLParser(XML_PARSER_OPTS);
+      const parsed = parser.parse(text);
+      const { masked, wasModified } = maskObjectValues(parsed);
+      const builder = new XMLBuilder({
+        ...XML_PARSER_OPTS,
+        format: true,
+        suppressEmptyNode: false,
+      });
+      return {
+        cleanText: builder.build(masked),
+        wasModified,
+        route: 'ast:xml',
+      };
+    } catch (err) {
+      console.warn('[SafeChat] XML parse failed, falling back to regex:', err);
+      return { ...truncateAndSanitize(text), route: 'fallback:xml-parse-error' };
+    }
+  }
+
+  // ── ENV / INI ─────────────────────────────────────────────────────────
+  if (ext === '.env' || ext === '.ini' || ext === '.cfg' || ext === '.properties'
+      || ext === '.env.local' || ext === '.env.production' || ext === '.env.development') {
+    try {
+      const { cleanText, wasModified } = sanitizeEnvText(text);
+      return { cleanText, wasModified, route: 'line:env' };
+    } catch (err) {
+      console.warn('[SafeChat] ENV parse failed, falling back to regex:', err);
+      return { ...truncateAndSanitize(text), route: 'fallback:env-parse-error' };
+    }
+  }
+
+  // ── Catch-all: unstructured text (.log, .txt, .md, .csv, terminal, etc.)
+  return { ...truncateAndSanitize(text), route: 'regex:catch-all' };
 }

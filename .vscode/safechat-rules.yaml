@@ -1,276 +1,111 @@
 # =============================================================================
-# SafeChat Master Configuration
+# SafeChat Smart Proxy — Configuration
 # =============================================================================
-# This file controls the behavior of the @safechat VS Code Extension.
-# It is re-read on every @safechat prompt — no reload or server restart needed.
+# This file provides optional tuning for the @safechat VS Code Extension.
 #
 # ┌─────────────────────────────────────────────────────────────────────────┐
-# │  ARCHITECTURE: Hybrid Edge (TypeScript extension + Python server)      │
+# │  ARCHITECTURE: Smart Proxy (Polyglot AST Router)                       │
 # │                                                                         │
-# │  TypeScript handles: Regex (22 patterns), AST key-based masking,       │
-# │                       Shannon Entropy, Dynamic GitIgnore routing,      │
-# │                       Symlink Jails, Prompt Injection Data-Fences,     │
-# │                       and UTF-16/Homoglyph normalization.              │
-# │  Python server handles: NLP PII only (12 entity types, Tier 3).        │
-# │  Without the server: Tier 2 AST + Tier 3 regex/entropy still run.      │
-# │  Graceful degradation — server is optional for secret detection.       │
+# │  Zero custom tools. All native Copilot tools execute unimpeded.        │
+# │  Results are intercepted and routed through format-aware sanitizers:    │
 # │                                                                         │
-# │  Start server: PYTHONPATH=<workspace> uvicorn                          │
-# │                presidio_server.main:app --port 8000 --reload           │
+# │    .json / .jsonc    → JSON.parse → maskObjectValues → JSON.stringify  │
+# │    .yaml / .yml      → yaml.parse → maskObjectValues → yaml.stringify  │
+# │    .xml / .svg       → XMLParser  → maskObjectValues → XMLBuilder      │
+# │    .env / .ini       → Line-by-line key=value → regexSanitize(value)  │
+# │    .ts/.py/.go/etc   → BYPASS (code files are safe)                    │
+# │    .log/.txt/unknown → truncateAndSanitize (250KB + 22 regex patterns)│
+# │                                                                         │
+# │  Write-Guard: file-write + terminal tools checked for [MASKED] tokens  │
+# │  Fail-Closed: AST parse errors always fall to regex, never fail-open   │
 # └─────────────────────────────────────────────────────────────────────────┘
 #
-# ROUTING: Strict Default-Deny (Whitelist Only)
-# ──────────────────────────────────────────────
-#   0. Binary files / GitIgnored files   → BLOCKED (never enter pipeline)
-#   1. custom_paths (path match)         → highest priority, user-defined
-#   2. ast_extensions whitelist          → Tier 2 AST (key-based masking)
-#   3. full_dlp_extensions whitelist     → Tier 3 Full DLP (NLP + regex)
-#   4. Everything else                   → BYPASS  (default deny, no scan)
-#
-#
-# Add extra extensions below ONLY for proprietary/internal formats not
-# already covered by the built-in lists above.
 # =============================================================================
 
-# ── 1. AST Routing Overrides ─────────────────────────────────────────────────
-# Add proprietary or vendor-specific extensions to be scanned by the Tier 2
-# AST engine (pure-JS parsers: JSON, YAML, XML, ENV, Properties, TOML, HCL,
-# CSV/TSV). Unknown extensions are BYPASSED by default — add them here to scan.
+
+# ── 1. Code File Bypass Extensions ───────────────────────────────────────────
+# Source code files are BYPASSED by default (never scanned). The following
+# 40+ extensions are hardcoded in sanitizer.ts:
 #
-# BUILT-IN AST EXTENSIONS (already scanned — do NOT re-add these):
-#   Data interchange:    .json .jsonc .jsonl .yaml .yml
-#   Environment/Props:   .env .properties .ini .conf .cfg .config .toml
-#                        .npmrc .kubeconfig
-#   Tabular data:        .csv .tsv
-#   Auth/Package Mgrs:   .netrc .pgpass .gemrc .yarnrc
-#   Keys/Certs:          .pem .key .cert .crt .pub .ppk .cer .asc
-#   IaC:                 .tf .hcl .terraformrc .tfstate .tfvars
-#   Build/Project (XML): .csproj .props .targets .nuspec .xml .xsd .wsdl
-#   Secrets files:       .secret
-#   Shell scripts:       .sh .bash .zsh .bat .cmd .ps1 .psm1
-#   Docker/Build:        .dockerfile .gradle .kts
+#   .ts .tsx .js .jsx .mjs .cjs .py .pyw .java .kt .kts .scala .go .rs
+#   .c .h .cpp .hpp .cc .cxx .cs .rb .php .swift .m .mm .dart .lua .r .R
+#   .pl .pm .sh .bash .zsh .fish .ps1 .psm1 .sql .vue .svelte .tf .hcl
+#   .proto .graphql .gql
+#
+# To add additional bypass extensions, use the VS Code setting:
+#   "safechat.ignoreExtensions": [".myext", ".custom"]
 # ─────────────────────────────────────────────────────────────────────────────
-ast_extensions: 
-  # Force these into the Tier 2 AST Guardian (Structure preservation, no NLP)
-  - .custom_env
-  - .kube_vars
-  - .mycompany_conf
-
-# BUILT-IN FULL DLP EXTENSIONS (already scanned — do NOT re-add these):
-#   .txt .log .md .sql .graphql .gql .rtf
-full_dlp_extensions: 
-  # Force these into Tier 3 Full DLP (Regex + Shannon Entropy + Presidio NLP).
-  # Use for log files, audit dumps, and chat transcripts that contain human PII
-  # not detectable by the key-name-based AST engine.
-  - .audit_log
-  - .splunk_dump
-  - .chat_transcript
 
 
-# ── 2. Path-Specific Overrides ────────────────────────────────────────────────
-# Override routing for specific files or paths. These take HIGHEST priority
-# (above both extension whitelists and the binary blocklist).
+# ── 2. Regex Pattern Dictionary (22 Patterns) ───────────────────────────────
+# The following patterns run on ALL non-bypassed text. They are hardcoded
+# in sanitizer.ts and cannot be disabled via config:
 #
-# Strategies:
-#   AST      — Tier 2 key-based masking (structured configs)
-#   FULL_DLP — Tier 3 NLP + regex + entropy (unstructured PII)
-#   IGNORE   — bypass entirely (never scanned)
+# Cloud & CI/CD:
+#   AWS Access Key (AKIA...), GCP Service Account (private_key),
+#   Azure Shared Key (AccountKey=), GitHub Token (ghp_/gho_/ghu_/ghs_/ghr_),
+#   GitLab Token (glpat-), Jenkins Token, Harness Token (pat./sat.),
+#   OpenShift Token (sha256~), LambdaTest/SauceLabs credentials
 #
-# Paths are matched against workspace-relative file paths. Matching is
-# case-insensitive and supports suffix matching (e.g. "settings.conf"
-# matches "src/config/settings.conf").
+# APIs & Comms:
+#   Slack (xoxb-/xoxp-), Stripe (sk_live_/pk_live_), SendGrid (SG.),
+#   NPM (npm_), HashiCorp Vault (hvs./hvb./hvr.), SonarQube (sqp_/squ_),
+#   Terraform Cloud (*.atlasv1.*), Bitbucket (ATBB/ATCTT)
+#
+# Crypto Material:
+#   RSA/PEM Private Keys (-----BEGIN...PRIVATE KEY-----), JWT (eyJ...)
+#
+# URLs:
+#   Query parameter secrets (?password=&token=), Credential URLs (user:pass@host)
+#
+# Credentials:
+#   .netrc password fields, .pgpass colon-delimited passwords
+#
+# Standard PII:
+#   US SSN (xxx-xx-xxxx), Credit Card (16 digits), IBAN, IPv4, Internal
+#   Hostname (*.internal/*.local), MAC Address, Certificate Thumbprint,
+#   Email Address, Phone Number
 # ─────────────────────────────────────────────────────────────────────────────
-custom_paths:
-  # Example: Force a config file that has no recognized extension
-  # - path: "src/config/internal_settings.conf"
-  #   strategy: AST
-
-  # Example: Scan a markdown file with Full DLP (already in default DLP list,
-  # but you could use this to force a specific path to a different tier)
-  # - path: "docs/sensitive_architecture.md"
-  #   strategy: FULL_DLP
-
-  # Example: Exclude a noisy generated file from scanning entirely
-  # - path: "generated/api_schema.json"
-  #   strategy: IGNORE
 
 
-# ── 3a. Sensitive Key Suffix Extensions ──────────────────────────────────────
-# Extend the Tier-2 structural suffix check inside isSensitiveKey().
-# Any key whose last meaningful word-token matches one of these is treated as
-# sensitive — regardless of the prefix. This means you never need to enumerate
-# every possible combination like `myApp_ciphertext` or `svc_vault_enc`.
+# ── 3. AST-Parsed Formats ───────────────────────────────────────────────────
+# The following formats are parsed structurally. Keys/tags/attributes are
+# preserved; only VALUES are piped through the regex dictionary:
 #
-# Built-in defaults (always active):
-#   key, token, secret, pass, pwd, cred, auth, cert, passphrase, passcode,
-#   credential, credentials, keys, tokens, secrets, creds, certs
+# JSON:  .json .jsonc .json5
+# YAML:  .yaml .yml
+# XML:   .xml .xsl .xslt .svg .plist
+# ENV:   .env .ini .cfg .properties .env.local .env.production .env.development
 #
-# Add org-specific suffixes below (lowercase, no underscores):
+# If parsing fails for ANY reason, the text falls to truncateAndSanitize()
+# (fail-closed guarantee — never fails open).
 # ─────────────────────────────────────────────────────────────────────────────
-sensitive_suffixes:
-  # - cipher         # e.g. svc_cipher, user_vault_cipher
-  # - enc            # e.g. db_password_enc, myApp_enc
-  # - hash           # e.g. passwordHash (if you store raw hashes)
-  # - vault          # e.g. db_vault
 
-# ── 3b. Dynamic Secret Builder ────────────────────────────────────────────────
-# Define custom internal developer secrets here. The extension will:
-# 1. Inject `ast_keys` into the Tier 1 exact-token lookup so those keys are
-#    masked at the AST level (key-name detection).
-# 2. Pass prefix/charset/length definitions to the Python server, which
-#    dynamically compiles regex patterns for Tier 3 unstructured text scanning.
+
+# ── 4. Write-Guard Tool Patterns ────────────────────────────────────────────
+# The following tool names trigger the Write-Guard check. If the tool's
+# INPUT contains [MASKED_BY_SAFECHAT], a warning is emitted to the chat
+# stream before execution:
+#
+# File Writes:
+#   vscode_applyWorkspaceEdit, apply_workspace_edit, apply_edit, edit_file,
+#   write_file, create_file, insert_edit, replace_string, apply_diff,
+#   save_file, overwrite_file
+#
+# Terminal Execution:
+#   run_command, terminal_execute, run_in_terminal, vscode_runCommand,
+#   exec, execute_command, bash
+#
+# Description keywords also trigger:
+#   "apply workspace edit", "write to file", "create a file",
+#   "run a command", "execute command", "terminal", "shell command"
 # ─────────────────────────────────────────────────────────────────────────────
-custom_secrets:
-  # Catch Base64 encoded usernames or DB logins in configurations
-  - name: "App Usernames"
-    ast_keys: ["username", "db_user", "login"] 
-
-  # Example: Dynamically compiles \b(acme_live_[A-Za-z0-9_\-]{32})\b
-  - name: "Acme Corp Production Token"
-    ast_keys: ["acme_prod", "acme_token"]
-    value_prefix: "acme_live_"            
-    value_charset: "alphanumeric"         # Options: alphanumeric, hex, base64, all
-    value_length: "32"                    
 
 
-# ── 4. NLP Entity Overrides (Python Presidio Server) ─────────────────────────
-# Define how the Python Presidio server handles Human PII and Financial Data.
-# These rules are passed as part of the API payload to POST /sanitize.
-# The 12 active entities are: PERSON, EMAIL_ADDRESS, PHONE_NUMBER, CREDIT_CARD,
-# US_SSN, IBAN_CODE, US_BANK_NUMBER, CRYPTO, IP_ADDRESS, URL, CARD_CVV, CARD_EXPIRY
-#
-# Operations:
-#   replace  — substitute with a labelled placeholder (e.g. <PHONE_NUMBER>)
-#   mask     — substitute with asterisks (e.g. ****)
-#   redact   — completely remove the detected text
-#   hash     — one-way SHA-256 digest (repeatable for same value)
+# ── 5. Truncation Budget ────────────────────────────────────────────────────
+# Non-AST payloads (catch-all route) exceeding 250KB are truncated at the
+# nearest newline before scanning. This prevents:
+#   - V8 heap pressure from multi-MB regex operations
+#   - LLM context window overflow
+#   - Catastrophic regex backtracking on massive inputs
 # ─────────────────────────────────────────────────────────────────────────────
-rules:
-  PERSON: replace
-  EMAIL_ADDRESS: replace
-  PHONE_NUMBER: replace
-  CREDIT_CARD: mask
-  US_SSN: mask
-  IP_ADDRESS: replace
-  IBAN_CODE: mask
-  URL: replace
-  CARD_CVV: mask       # Custom financial entity from financial.py
-  CARD_EXPIRY: mask    # Custom financial entity from financial.py
-
-
-# ── 5. Local PII Engine Config (TypeScript — Tier 2 AST, no server needed) ───
-# Controls the synchronous regex-based PII scanner that runs on every
-# structured config value (JSON, YAML, ENV, XML, HCL, CSV…) in Tier 2.
-# No server required — 100% local, zero latency.
-#
-# Built-in pattern names (use these in `disable`):
-#   'US SSN', 'Credit Card', 'IBAN', 'Email', 'Phone',
-#   'IPv4', 'Internal Hostname', 'MAC Address'
-#
-# Sub-keys:
-#   disable         — list of built-in pattern names to switch off
-#   extra_keys      — extra key labels that trigger an instant MASK
-#                     (works same as custom_secrets.ast_keys)
-#   extra_patterns  — custom org-specific regex patterns
-#                     `pattern` is a JS regex string (no surrounding slashes)
-# ─────────────────────────────────────────────────────────────────────────────
-pii_patterns:
-  disable:
-    # Uncomment to disable specific built-in scanners:
-    # - US SSN            # e.g. SSNs are handled upstream and don't appear in configs
-    # - Credit Card       # e.g. card numbers are tokenised before reaching configs
-    # - IBAN              # e.g. bank IBANs are not a concern in your environment
-    # - Email             # e.g. service account emails are expected in configs
-    # - Phone             # e.g. phone numbers appear innocuously in configs
-    # - IPv4              # e.g. IPs are not considered PII in your org
-    # - Internal Hostname # e.g. *.internal hostnames are expected in configs
-    # - MAC Address       # e.g. hardware MACs are non-sensitive in your data
-
-  extra_keys:
-    # Key labels whose VALUES should always be masked, in addition to built-ins:
-    # - employee_id
-    # - badge_number
-    # - member_id
-    # - subscriber_id
-
-  extra_patterns:
-    # Custom org-specific value patterns to redact from config values:
-    # - name: "Acme Employee Badge"
-    #   pattern: "EMP-[0-9]{6}"
-    # - name: "Internal Ticket ID"
-    #   pattern: "TICK-[A-Z]{2}[0-9]{8}"
-
-
-# ── 6. Custom PII Recognizers (Python Presidio Server) ───────────────────────
-# Add custom regexes ONLY for Human Data (e.g., employee IDs, support tickets)
-# that require NLP context words to avoid false positives.
-# These are dynamically registered as Presidio PatternRecognizer objects on
-# the server at runtime.
-# ─────────────────────────────────────────────────────────────────────────────
-custom_recognizers:
-  - name: EMPLOYEE_ID
-    pattern: "EMP-\\d{6}"
-    score: 0.9
-    context:
-      - employee
-      - staff
-      - badge
-
-  - name: CUSTOMER_ACCOUNT
-    pattern: "CUST-[A-Z]{2}\\d{8}"
-    score: 0.9
-    context:
-      - customer
-      - account
-      - billing
-
-
-# ── 7. MCP Triage Router ─────────────────────────────────────────────────────
-# Controls how @safechat routes Model Context Protocol (MCP) tool payloads
-# through the sanitization pipeline. MCP servers can return massive, highly
-# structured payloads — this router prevents V8 lockups, timeouts, and
-# data leaks by matching tool names to sanitization profiles.
-#
-# Timeout Controls:
-#   timeout_ms — Defines the max milliseconds for the string DOM sanitization
-#                (default: 5000ms). If exceeded, payload is gracefully blocked. 
-#                (Note: Tool execution itself is hard-capped at 30 seconds,
-#                 after which runaway MCP processes are actively killed).
-#
-# Profiles:
-#   bypass     — pass payload through unmodified (safe/low-risk tools)
-#   json-keys  — parse JSON, mask values of sensitive keys via AST engine,
-#                fallback to regex-only if JSON.parse fails
-#   regex-only — line-split + semantic batching + concurrent regex scan
-#                (never splits a credential in half)
-#   nlp-full   — full DLP pipeline (regex + Shannon entropy + Presidio NLP)
-#
-# Tool names are matched with wildcard globs (case-insensitive).
-# The first matching profile wins; unmatched tools use default_profile.
-# ─────────────────────────────────────────────────────────────────────────────
-mcp_routing:
-  default_profile: "regex-only"
-  timeout_ms: 5000
-  profiles:
-    bypass:
-      - "*weather*"
-      - "*calc*"
-      - "*time*"
-      - "*ping*"
-    json-keys:
-      - "*github*"
-      - "*gitlab*"
-      - "*bitbucket*"
-      - "*azure_devops*"
-    regex-only:
-      - "*splunk*"
-      - "*datadog*"
-      - "*elastic*"
-      - "*kibana*"
-      - "*grafana*"
-    nlp-full:
-      - "*jira*"
-      - "*confluence*"
-      - "*slack*"
-      - "*teams*"
-      - "*salesforce*"
