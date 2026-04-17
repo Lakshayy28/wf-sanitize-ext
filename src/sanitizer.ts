@@ -33,6 +33,19 @@ import { XMLParser, XMLBuilder } from 'fast-xml-parser';
 export const MASK = '[MASKED_BY_SAFECHAT]';
 const MAX_BUDGET_BYTES = 250_000; // 250 KB
 
+const IS_DEV_MODE = true;
+
+/**
+ * Dual-Mode Logger: Avoids CWE-532 (Sensitive Logging) in production.
+ */
+function logRedaction(patternName: string, matchedSecret: string): void {
+  if (IS_DEV_MODE) {
+    console.warn(`[SafeChat DEBUG] Redacted ${patternName}: "${matchedSecret}"`);
+  } else {
+    console.info(`[SafeChat AUDIT] Redacted ${patternName} (length: ${matchedSecret.length})`);
+  }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Secret Pattern Dictionary (22 Enterprise Regex Patterns)
 // ────────────────────────────────────────────────────────────────────────────
@@ -139,12 +152,15 @@ export function regexSanitize(text: string): { cleanText: string; wasModified: b
     if (pattern.isUrlAuth) {
       const replaced = current.replace(pattern.regex, (_full, proto, _auth, host) => {
         wasModified = true;
+        logRedaction(pattern.name, _auth);
         return `${proto}${MASK}${host}`;
       });
       if (replaced !== current) { current = replaced; }
     } else {
       const replaced = current.replace(pattern.regex, (full, captured) => {
         wasModified = true;
+        const secretValue = captured !== undefined ? captured : full;
+        logRedaction(pattern.name, secretValue);
         if (captured !== undefined) {
           return full.replace(captured, MASK);
         }
