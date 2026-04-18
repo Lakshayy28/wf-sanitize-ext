@@ -2,26 +2,6 @@
 /**
  * sanitizer.ts — Smart Proxy: Polyglot AST Router + Regex DLP Engine
  * ════════════════════════════════════════════════════════════════════
- *
- * Architecture:
- *   1. smartSanitize(text, ext?) — The public entry point.
- *      Routes structured formats (JSON, YAML, XML, ENV/INI) through
- *      format-aware AST parsing → selective value masking → reconstruction.
- *      Code files are bypassed entirely.  Unstructured text falls through
- *      to the truncation + regex catch-all.
- *
- *   2. maskObjectValues(obj) — Recursive Universal Object Masker.
- *      Walks any JS object/array tree.  String leaves are piped through
- *      regexSanitize().  Primitives pass through untouched.
- *
- *   3. regexSanitize(text) — 22-pattern enterprise dictionary.
- *      Sequential replacement with capture-group-aware masking.
- *
- *   4. truncateAndSanitize(text) — 250KB budget guard.
- *      Slices at the nearest newline, then runs regexSanitize().
- *
- * Every AST parser is wrapped in try/catch.  Parse failures NEVER
- * fail-open — they fall through to truncateAndSanitize().
  */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -60,6 +40,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.HIGH_CONFIDENCE_SECRETS = exports.MASK = void 0;
 exports.updateConfig = updateConfig;
 exports.regexSanitize = regexSanitize;
+exports.calculateEntropy = calculateEntropy;
 exports.maskObjectValues = maskObjectValues;
 exports.truncateAndSanitize = truncateAndSanitize;
 exports.smartSanitize = smartSanitize;
@@ -71,9 +52,6 @@ const fast_xml_parser_1 = require("fast-xml-parser");
 exports.MASK = '[MASKED_BY_SAFECHAT]';
 const MAX_BUDGET_BYTES = 250_000; // 250 KB
 const IS_DEV_MODE = true;
-/**
- * Dual-Mode Logger: Avoids CWE-532 (Sensitive Logging) in production.
- */
 function logRedaction(patternName, matchedSecret) {
     if (IS_DEV_MODE) {
         console.warn(`[SafeChat DEBUG] Redacted ${patternName}: "${matchedSecret}"`);
@@ -83,56 +61,26 @@ function logRedaction(patternName, matchedSecret) {
     }
 }
 exports.HIGH_CONFIDENCE_SECRETS = [
-    // ── Cloud & CI/CD ─────────────────────────────────────────────────────
-    { name: 'AWS Access Key', regex: /\b(AKIA[0-9A-Z]{16})\b/g },
-    { name: 'GCP Service Account', regex: /"type"\s*:\s*"service_account"[\s\S]*?"private_key"\s*:\s*"(-----BEGIN PRIVATE KEY[\s\S]*?-----END PRIVATE KEY-----\\n)"/g },
-    { name: 'Azure Shared Key', regex: /\bAccountKey=([A-Za-z0-9+/]{86}==)\b/g },
-    { name: 'GitHub Token', regex: /\b(gh[pousr]_[A-Za-z0-9_]{36}|github_pat_[A-Za-z0-9_]{82})\b/g },
-    { name: 'GitLab Token', regex: /\b(glpat-[A-Za-z0-9_\-]{20})\b/g },
-    { name: 'Jenkins Token', regex: /\b(11[a-f0-9]{32})\b/g },
-    { name: 'Harness Token', regex: /\b(?:pat|sat)\.[A-Za-z0-9_-]{20,}\.([A-Za-z0-9_-]{20,})\b/g },
-    { name: 'OpenShift Token', regex: /\b(sha256~[A-Za-z0-9_\-]{43})\b/g },
-    { name: 'LambdaTest/SauceLabs', regex: /(?:https?:\/\/)[a-zA-Z0-9_.-]+:([a-zA-Z0-9]{32,64})@hub\.(?:lambdatest|saucelabs)\.com/g },
-    // ── APIs & Comms ──────────────────────────────────────────────────────
+    { name: 'AWS Access Key', regex: /\b(AKIA|ASIA|AGPA|AIDA|AROA|AIPA)[A-Z0-9]{16}\b/g },
+    { name: 'Stripe Key', regex: /\b([spr]k_(?:live|test)_[A-Za-z0-9]{24,99})\b/g },
     { name: 'Slack Token', regex: /\b(xox[bpas]-[0-9A-Za-z\-]+)\b/g },
-    { name: 'Stripe Key', regex: /\b([spr]k_(?:live|test)_[A-Za-z0-9]{24,})\b/g },
-    { name: 'SendGrid Key', regex: /\b(SG\.[A-Za-z0-9\-_]{16,32}\.[A-Za-z0-9\-_]{32,64})\b/g },
-    { name: 'NPM Token', regex: /\b(npm_[a-zA-Z0-9]{36})\b/g },
-    { name: 'HashiCorp Vault Token', regex: /\b((?:hvs|hvb|hvr|s)\.[A-Za-z0-9_\-]{24,120})\b/g },
-    { name: 'SonarQube Token', regex: /\b(sq[pua]_[A-Za-z0-9]{40})\b/g },
-    { name: 'Terraform Cloud Token', regex: /\b([A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9]{67})\b/g },
-    { name: 'Bitbucket Token', regex: /\b(ATBB[A-Za-z0-9]{28}|ATCTT[A-Za-z0-9]{171,})\b/g },
-    // ── Cryptographic Material ────────────────────────────────────────────
-    { name: 'RSA/PEM Private Key', regex: /(-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|DSA\s+|ENCRYPTED\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|DSA\s+|ENCRYPTED\s+)?PRIVATE\s+KEY-----)/g },
-    { name: 'JWT Token', regex: /\b(eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]*)\b/g },
-    // ── Generic URL Secrets ───────────────────────────────────────────────
-    { name: 'URL Query Parameter Secret', regex: /(?:password|passwd|secret|token|api_?key|auth)=([^&\s"']+)/gi },
-    { name: 'Credential URL', regex: /\b([a-zA-Z0-9+.-]+:\/\/)([^@\s]+)(@[a-zA-Z0-9.-]+(?::[\d]+)?(?:\/[^\s"']*)?)/gi, isUrlAuth: true },
-    // ── Keyless Credential Files ──────────────────────────────────────────
-    { name: 'Netrc Password', regex: /(?:password|passwd)\s+([^\s]+)/gi },
+    { name: 'GitHub Token', regex: /\b(gh[pousr]_[A-Za-z0-9_]{36}|github_pat_[A-Za-z0-9_]{22}_[A-Za-z0-9_]{59})\b/g },
+    { name: 'IPv4 Address', regex: /\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g },
+    { name: 'Email Address', regex: /\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/g },
+    { name: 'Credit Card Number', regex: /\b(?!(?:9007199254740991))(?:4[0-9]{12}(?:[0-9]{3})?|[25][1-7][0-9]{14}|6(?:011|5[0-9][0-9])[0-9]{12}|3[47][0-9]{13})\b/g },
+    { name: 'URI Password', regex: /(?:\w+:\/\/)[^:\s@]+:([^:@\s]{6,})@/g },
+    { name: 'Connection String Password', regex: /(?:password|pwd|secret)\s*=\s*([^;'"\s\\]{6,})/gi },
     { name: 'Pgpass Password', regex: /^(?:[^:\r\n]+:){4}([^:\r\n]+)$/gm },
-    // ── Standard PII Fallback ─────────────────────────────────────────────
-    { name: 'US SSN', regex: /\b(\d{3}-\d{2}-\d{4})\b/g },
-    { name: 'Credit Card Number', regex: /\b(\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{1,7})\b/g },
-    { name: 'IBAN Code', regex: /\b([A-Z]{2}\d{2}[A-Z0-9]{11,30})\b/g },
-    { name: 'IPv4 Address', regex: /(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/g },
-    { name: 'Internal Hostname', regex: /\b[a-z0-9][a-z0-9\-]*(?:\.[a-z0-9][a-z0-9\-]*)*\.(?:internal|local|private)\b/gi },
-    { name: 'MAC Address', regex: /(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}/g },
-    { name: 'Certificate Thumbprint', regex: /(?:[0-9A-Fa-f]{2}:){19}[0-9A-Fa-f]{2}/g },
-    { name: 'Email Address', regex: /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/g },
-    { name: 'Phone Number Fallback', regex: /(?:\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g },
 ];
 // ────────────────────────────────────────────────────────────────────────────
 // Configuration Management (`safechat.yml` dynamic routing)
 // ────────────────────────────────────────────────────────────────────────────
-// Routing sets (mutable base configs)
 let BYPASS_EXTENSIONS = new Set();
 let AST_JSON_EXTENSIONS = new Set();
 let AST_YAML_EXTENSIONS = new Set();
 let AST_XML_EXTENSIONS = new Set();
 let AST_ENV_EXTENSIONS = new Set();
 let DYNAMIC_PATTERNS = [];
-// Defaults (Fallback)
 const DEFAULT_BYPASS = [
     '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
     '.py', '.pyw',
@@ -144,16 +92,16 @@ const DEFAULT_BYPASS = [
     '.rb',
     '.php',
     '.swift',
-    '.m', '.mm', // Objective-C
+    '.m', '.mm',
     '.dart',
     '.lua',
     '.r', '.R',
-    '.pl', '.pm', // Perl
+    '.pl', '.pm',
     '.sh', '.bash', '.zsh', '.fish',
-    '.ps1', '.psm1', // PowerShell
+    '.ps1', '.psm1',
     '.sql',
     '.vue', '.svelte',
-    '.tf', '.hcl', // Terraform / HCL
+    '.tf', '.hcl',
     '.proto',
     '.graphql', '.gql',
 ];
@@ -169,19 +117,13 @@ function resetToDefaults() {
     AST_ENV_EXTENSIONS = new Set(DEFAULT_AST_ENV);
     DYNAMIC_PATTERNS = [];
 }
-// Initial bootstrap
 resetToDefaults();
-/**
- * Updates dynamic configuration arrays/sets based on safechat.yml.
- * If config is null/undefined, resets to hardcoded defaults.
- */
 function updateConfig(config) {
     if (!config) {
         console.log('[SafeChat] Config absent or removed. Resetting to defaults.');
         resetToDefaults();
         return;
     }
-    // Populate Extensions Sets if supplied 
     if (config.routing) {
         if (Array.isArray(config.routing.bypass)) {
             BYPASS_EXTENSIONS = new Set(config.routing.bypass);
@@ -200,16 +142,13 @@ function updateConfig(config) {
         }
     }
     else {
-        // If routing block isn't present, preserve defaults
         resetToDefaults();
     }
-    // Populate Custom Regex Patterns
     DYNAMIC_PATTERNS = [];
     if (Array.isArray(config.custom_patterns)) {
         for (const pat of config.custom_patterns) {
             if (pat.name && pat.regex) {
                 try {
-                    // Use 'g' flag for sequential replacement
                     let r = new RegExp(pat.regex, 'g');
                     DYNAMIC_PATTERNS.push({ name: pat.name, regex: r });
                 }
@@ -219,28 +158,21 @@ function updateConfig(config) {
             }
         }
     }
-    console.log('[SafeChat] Configuration updated successfully from safechat.yml.');
 }
 // ────────────────────────────────────────────────────────────────────────────
 // Tier 1: Pure Regex Sanitizer
 // ────────────────────────────────────────────────────────────────────────────
-/**
- * Runs the 22-pattern enterprise regex dictionary + dynamic patterns.
- * Every pattern uses `lastIndex`-reset via fresh `.replace()` calls
- * to avoid stale-state bugs on global regexes.
- */
-function regexSanitize(text) {
+function regexSanitize(text, redactions = []) {
     let wasModified = false;
     let current = text;
-    // Combine built-in secrets with user-defined dynamic patterns
     const allPatterns = [...exports.HIGH_CONFIDENCE_SECRETS, ...DYNAMIC_PATTERNS];
     for (const pattern of allPatterns) {
-        // Reset lastIndex for global regexes to avoid stale state
         pattern.regex.lastIndex = 0;
         if (pattern.isUrlAuth) {
             const replaced = current.replace(pattern.regex, (_full, proto, _auth, host) => {
                 wasModified = true;
                 logRedaction(pattern.name, _auth);
+                redactions.push(pattern.name);
                 return `${proto}${exports.MASK}${host}`;
             });
             if (replaced !== current) {
@@ -252,6 +184,7 @@ function regexSanitize(text) {
                 wasModified = true;
                 const secretValue = captured !== undefined ? captured : full;
                 logRedaction(pattern.name, secretValue);
+                redactions.push(pattern.name);
                 if (captured !== undefined) {
                     return full.replace(captured, exports.MASK);
                 }
@@ -262,45 +195,83 @@ function regexSanitize(text) {
             }
         }
     }
+    // THE FIX: Removed '=' from the core character class to stop swallowing KEY=VALUE statements.
+    // Added (?:={1,2})? at the end to gracefully support Base64 padding without breaking config lines.
+    const genericTokenRegex = /([A-Za-z0-9+/_\-@!#$%^&*?]{16,}(?:={1,2})?)/g;
+    const replacedWithEntropy = current.replace(genericTokenRegex, (match, p1, offset, originalString) => {
+        if (hasSecretContext(originalString, offset)) {
+            wasModified = true;
+            logRedaction('Anchored Secret', match);
+            redactions.push('Anchored Secret');
+            return exports.MASK;
+        }
+        const entropy = calculateEntropy(match);
+        if (entropy > 4.5) {
+            wasModified = true;
+            logRedaction('High Entropy Token', match);
+            redactions.push('High Entropy Token');
+            return exports.MASK;
+        }
+        return match;
+    });
+    if (replacedWithEntropy !== current) {
+        current = replacedWithEntropy;
+    }
     return { cleanText: current, wasModified };
+}
+function hasSecretContext(text, matchIndex) {
+    const prefix = text.substring(Math.max(0, matchIndex - 40), matchIndex).toLowerCase();
+    const anchorRegex = /secret|token|key|password|passwd|pwd|api|cred|auth|cert|signature/i;
+    const assignmentRegex = /[:=]\s*["']?$/;
+    return anchorRegex.test(prefix) || assignmentRegex.test(prefix);
+}
+function calculateEntropy(str) {
+    if (!str) {
+        return 0;
+    }
+    const len = str.length;
+    const frequencies = new Map();
+    for (let i = 0; i < len; i++) {
+        const char = str[i];
+        frequencies.set(char, (frequencies.get(char) ?? 0) + 1);
+    }
+    let entropy = 0;
+    for (const count of frequencies.values()) {
+        const p = count / len;
+        entropy -= p * Math.log2(p);
+    }
+    return entropy;
 }
 // ────────────────────────────────────────────────────────────────────────────
 // Tier 2: Universal Object Masker (recursive AST walker)
 // ────────────────────────────────────────────────────────────────────────────
-/** Maximum recursion depth to prevent stack overflow on adversarial inputs. */
 const MAX_DEPTH = 64;
-/**
- * Recursively walks any JS object/array tree.
- * - Strings  → piped through `regexSanitize()`.
- * - Arrays   → mapped recursively.
- * - Objects  → keys preserved, values recursively masked.
- * - Primitives (number, boolean, null, undefined) → returned as-is.
- *
- * Returns `{ masked, wasModified }` so callers know if anything changed.
- */
-function maskObjectValues(obj, depth = 0) {
-    // Depth guard
+const SENSITIVE_KEY_HEURISTIC = /secret|password|passwd|pwd|token|key|api|cred|auth|cert/i;
+function maskObjectValues(obj, depth = 0, currentKey, redactions = []) {
     if (depth > MAX_DEPTH) {
         return { masked: obj, wasModified: false };
     }
-    // Null / undefined
     if (obj === null || obj === undefined) {
         return { masked: obj, wasModified: false };
     }
-    // String — the leaf node where actual scanning happens
     if (typeof obj === 'string') {
-        const { cleanText, wasModified } = regexSanitize(obj);
+        if (currentKey && SENSITIVE_KEY_HEURISTIC.test(currentKey)) {
+            if (obj.length > 0 && obj !== exports.MASK) {
+                redactions.push('Key Heuristic Match');
+                return { masked: exports.MASK, wasModified: true };
+            }
+            return { masked: obj, wasModified: false };
+        }
+        const { cleanText, wasModified } = regexSanitize(obj, redactions);
         return { masked: cleanText, wasModified };
     }
-    // Primitive passthrough (number, boolean, bigint, symbol)
     if (typeof obj !== 'object') {
         return { masked: obj, wasModified: false };
     }
-    // Array — map recursively
     if (Array.isArray(obj)) {
         let anyModified = false;
         const maskedArr = obj.map(item => {
-            const { masked, wasModified } = maskObjectValues(item, depth + 1);
+            const { masked, wasModified } = maskObjectValues(item, depth + 1, undefined, redactions);
             if (wasModified) {
                 anyModified = true;
             }
@@ -308,12 +279,11 @@ function maskObjectValues(obj, depth = 0) {
         });
         return { masked: maskedArr, wasModified: anyModified };
     }
-    // Object — iterate keys, recursively mask values, leave keys intact
     let anyModified = false;
     const maskedObj = {};
-    for (const [key, value] of Object.entries(obj)) {
-        const { masked, wasModified } = maskObjectValues(value, depth + 1);
-        maskedObj[key] = masked;
+    for (const [k, value] of Object.entries(obj)) {
+        const { masked, wasModified } = maskObjectValues(value, depth + 1, k, redactions);
+        maskedObj[k] = masked;
         if (wasModified) {
             anyModified = true;
         }
@@ -321,14 +291,9 @@ function maskObjectValues(obj, depth = 0) {
     return { masked: maskedObj, wasModified: anyModified };
 }
 // ────────────────────────────────────────────────────────────────────────────
-// Truncation + Regex Fallback (catch-all for unstructured text)
+// Truncation + Regex Fallback
 // ────────────────────────────────────────────────────────────────────────────
-/**
- * Enforces a 250KB byte budget, then runs the regex dictionary.
- * Truncation slices at the nearest preceding newline to avoid splitting
- * tokens or credentials mid-match.
- */
-function truncateAndSanitize(text) {
+function truncateAndSanitize(text, redactions = []) {
     let current = text;
     let wasTruncated = false;
     const byteLen = Buffer.byteLength(current, 'utf-8');
@@ -340,26 +305,25 @@ function truncateAndSanitize(text) {
         current = sliced.slice(0, safeCut) +
             '\n\n[... TRUNCATED: payload exceeded 250KB budget ...]';
         wasTruncated = true;
+        redactions.push('Payload Truncation (>250KB)');
     }
-    const { cleanText, wasModified } = regexSanitize(current);
+    const { cleanText, wasModified } = regexSanitize(current, redactions);
     return { cleanText, wasModified: wasModified || wasTruncated };
 }
 // ────────────────────────────────────────────────────────────────────────────
 // ENV / INI line-by-line parser
 // ────────────────────────────────────────────────────────────────────────────
-function sanitizeEnvText(text) {
+function sanitizeEnvText(text, redactions = []) {
     let wasModified = false;
     const lines = text.split('\n');
     const sanitizedLines = lines.map(line => {
         const trimmed = line.trim();
-        // Preserve comments and blank lines
         if (trimmed === '' || trimmed.startsWith('#') || trimmed.startsWith(';')) {
             return line;
         }
         const eqIdx = line.indexOf('=');
         if (eqIdx === -1) {
-            // No assignment — run regex on the whole line
-            const { cleanText, wasModified: lm } = regexSanitize(line);
+            const { cleanText, wasModified: lm } = regexSanitize(line, redactions);
             if (lm) {
                 wasModified = true;
             }
@@ -367,7 +331,6 @@ function sanitizeEnvText(text) {
         }
         const key = line.slice(0, eqIdx);
         let value = line.slice(eqIdx + 1);
-        // Strip optional surrounding quotes for scanning, then re-wrap
         let quote = '';
         const trimVal = value.trim();
         if ((trimVal.startsWith('"') && trimVal.endsWith('"')) ||
@@ -375,19 +338,22 @@ function sanitizeEnvText(text) {
             quote = trimVal[0];
             value = trimVal.slice(1, -1);
         }
-        const { cleanText: maskedVal, wasModified: vm } = regexSanitize(value);
+        if (SENSITIVE_KEY_HEURISTIC.test(key.trim())) {
+            if (value.length > 0 && value !== exports.MASK) {
+                redactions.push('ENV Key Heuristic Match');
+                wasModified = true;
+                return quote ? `${key}=${quote}${exports.MASK}${quote}` : `${key}=${exports.MASK}`;
+            }
+            return quote ? `${key}=${quote}${value}${quote}` : `${key}=${value}`;
+        }
+        const { cleanText: maskedVal, wasModified: vm } = regexSanitize(value, redactions);
         if (vm) {
             wasModified = true;
         }
-        return quote
-            ? `${key}=${quote}${maskedVal}${quote}`
-            : `${key}=${maskedVal}`;
+        return quote ? `${key}=${quote}${maskedVal}${quote}` : `${key}=${maskedVal}`;
     });
     return { cleanText: sanitizedLines.join('\n'), wasModified };
 }
-// ────────────────────────────────────────────────────────────────────────────
-// XML parser config (shared between parser and builder)
-// ────────────────────────────────────────────────────────────────────────────
 const XML_PARSER_OPTS = {
     ignoreAttributes: false,
     attributeNamePrefix: '@_',
@@ -397,59 +363,50 @@ const XML_PARSER_OPTS = {
 // ────────────────────────────────────────────────────────────────────────────
 // The Smart Router (public entry point)
 // ────────────────────────────────────────────────────────────────────────────
-/**
- * Routes text through the appropriate sanitization pathway based on file
- * extension.  Structured formats are parsed → masked → reconstructed.
- * Code files are bypassed.  Unknown / unstructured text falls through to
- * the 250KB truncation + pure regex catch-all.
- *
- * **Every AST parser is try/catch'd.  Parse failures NEVER fail-open —
- * they fall through to `truncateAndSanitize()` (fail-closed).**
- */
-function smartSanitize(text, fileExtension) {
-    const ext = (fileExtension ?? '').toLowerCase().replace(/^\.?/, '.');
-    // ── Code files: bypass completely ─────────────────────────────────────
-    if (BYPASS_EXTENSIONS.has(ext)) {
-        return { cleanText: text, wasModified: false, route: 'bypass:code' };
+function smartSanitize(text, fileExtension, logFn = () => { }) {
+    const redactions = [];
+    if (text.startsWith('Error invoking tool')) {
+        return { cleanText: text, wasModified: false, route: 'bypass:tool-error', redactions };
     }
-    // ── JSON ──────────────────────────────────────────────────────────────
+    const ext = (fileExtension ?? '').toLowerCase().replace(/^\.?/, '.');
+    if (BYPASS_EXTENSIONS.has(ext)) {
+        return { cleanText: text, wasModified: false, route: 'bypass:code', redactions };
+    }
     if (AST_JSON_EXTENSIONS.has(ext)) {
         try {
             const parsed = JSON.parse(text);
-            const { masked, wasModified } = maskObjectValues(parsed);
+            const { masked, wasModified } = maskObjectValues(parsed, 0, undefined, redactions);
             return {
                 cleanText: JSON.stringify(masked, null, 2),
                 wasModified,
                 route: 'ast:json',
+                redactions,
             };
         }
         catch (err) {
-            console.warn('[SafeChat] JSON parse failed, falling back to regex:', err);
-            return { ...truncateAndSanitize(text), route: 'fallback:json-parse-error' };
+            return { ...truncateAndSanitize(text, redactions), route: 'fallback:json-parse-error', redactions };
         }
     }
-    // ── YAML ──────────────────────────────────────────────────────────────
     if (AST_YAML_EXTENSIONS.has(ext)) {
         try {
             const parsed = yaml.parse(text);
-            const { masked, wasModified } = maskObjectValues(parsed);
+            const { masked, wasModified } = maskObjectValues(parsed, 0, undefined, redactions);
             return {
                 cleanText: yaml.stringify(masked, { indent: 2 }),
                 wasModified,
                 route: 'ast:yaml',
+                redactions,
             };
         }
         catch (err) {
-            console.warn('[SafeChat] YAML parse failed, falling back to regex:', err);
-            return { ...truncateAndSanitize(text), route: 'fallback:yaml-parse-error' };
+            return { ...truncateAndSanitize(text, redactions), route: 'fallback:yaml-parse-error', redactions };
         }
     }
-    // ── XML ───────────────────────────────────────────────────────────────
     if (AST_XML_EXTENSIONS.has(ext)) {
         try {
             const parser = new fast_xml_parser_1.XMLParser(XML_PARSER_OPTS);
             const parsed = parser.parse(text);
-            const { masked, wasModified } = maskObjectValues(parsed);
+            const { masked, wasModified } = maskObjectValues(parsed, 0, undefined, redactions);
             const builder = new fast_xml_parser_1.XMLBuilder({
                 ...XML_PARSER_OPTS,
                 format: true,
@@ -459,25 +416,22 @@ function smartSanitize(text, fileExtension) {
                 cleanText: builder.build(masked),
                 wasModified,
                 route: 'ast:xml',
+                redactions,
             };
         }
         catch (err) {
-            console.warn('[SafeChat] XML parse failed, falling back to regex:', err);
-            return { ...truncateAndSanitize(text), route: 'fallback:xml-parse-error' };
+            return { ...truncateAndSanitize(text, redactions), route: 'fallback:xml-parse-error', redactions };
         }
     }
-    // ── ENV / INI ─────────────────────────────────────────────────────────
     if (AST_ENV_EXTENSIONS.has(ext)) {
         try {
-            const { cleanText, wasModified } = sanitizeEnvText(text);
-            return { cleanText, wasModified, route: 'line:env' };
+            const { cleanText, wasModified } = sanitizeEnvText(text, redactions);
+            return { cleanText, wasModified, route: 'line:env', redactions };
         }
         catch (err) {
-            console.warn('[SafeChat] ENV parse failed, falling back to regex:', err);
-            return { ...truncateAndSanitize(text), route: 'fallback:env-parse-error' };
+            return { ...truncateAndSanitize(text, redactions), route: 'fallback:env-parse-error', redactions };
         }
     }
-    // ── Catch-all: unstructured text (.log, .txt, .md, .csv, terminal, etc.)
-    return { ...truncateAndSanitize(text), route: 'regex:catch-all' };
+    return { ...truncateAndSanitize(text, redactions), route: 'regex:catch-all', redactions };
 }
 //# sourceMappingURL=sanitizer.js.map

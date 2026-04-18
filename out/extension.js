@@ -2,20 +2,6 @@
 /**
  * extension.ts — Smart Proxy: Universal Interceptor + Context Router
  * ═══════════════════════════════════════════════════════════════════
- *
- * Architecture:
- *   Zero custom tools.  Copilot uses ALL native tools unimpeded.
- *   We sit invisibly in the agent loop:
- *     1. Let the LLM pick any tool it wants.
- *     2. Execute it natively via vscode.lm.invokeTool.
- *     3. Force-stringify the output (anti-object-injection).
- *     4. Extract the file extension from the tool input (if available).
- *     5. Pipe through smartSanitize(text, ext) — the Polyglot AST Router.
- *     6. Hand the sanitized string back to the LLM.
- *
- *   The Write-Guard intercepts write + terminal tools and emits a
- *   Markdown warning if the payload contains [MASKED_BY_SAFECHAT],
- *   preventing disk/system corruption from masked tokens.
  */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -51,53 +37,47 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.proxyLog = void 0;
 exports.activate = activate;
 const vscode = __importStar(require("vscode"));
 const yaml = __importStar(require("yaml"));
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
 const sanitizer_1 = require("./sanitizer");
 // ────────────────────────────────────────────────────────────────────────────
-// Write-Guard: tool name + description matching
+// Permanent Disk Logging
 // ────────────────────────────────────────────────────────────────────────────
-/**
- * Hardcoded list of native tools that mutate files or execute commands.
- * Both file-write AND terminal tools are included — masked tokens in
- * either pathway can cause disk corruption or shell injection.
- */
+function writeAuditToDisk(receiptText) {
+    if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+        return;
+    }
+    const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+    const auditDir = path.join(workspaceRoot, '.safechat');
+    const auditFile = path.join(auditDir, 'audit.log');
+    try {
+        if (!fs.existsSync(auditDir)) {
+            fs.mkdirSync(auditDir, { recursive: true });
+        }
+        fs.appendFileSync(auditFile, receiptText + '\n');
+    }
+    catch (err) {
+        console.error('[SafeChat] Failed to write to audit log:', err);
+    }
+}
+// ────────────────────────────────────────────────────────────────────────────
+// Write-Guard & Extension Utils
+// ────────────────────────────────────────────────────────────────────────────
 const WRITE_TOOL_PATTERNS = [
-    // File writes
-    /^vscode_applyWorkspaceEdit$/i,
-    /^apply_workspace_edit$/i,
-    /^apply_edit$/i,
-    /^edit_file$/i,
-    /^write_file$/i,
-    /^create_file$/i,
-    /^insert_edit/i,
-    /^replace_string/i,
-    /^apply_diff/i,
-    /^save_file$/i,
-    /^overwrite_file$/i,
-    // Terminal execution
-    /^run_command$/i,
-    /^terminal_execute$/i,
-    /^run_in_terminal$/i,
-    /^vscode_runCommand$/i,
-    /^exec$/i,
-    /^execute_command$/i,
-    /^bash$/i,
+    /^vscode_applyWorkspaceEdit$/i, /^apply_workspace_edit$/i, /^apply_edit$/i,
+    /^edit_file$/i, /^write_file$/i, /^create_file$/i, /^insert_edit/i,
+    /^replace_string/i, /^apply_diff/i, /^save_file$/i, /^overwrite_file$/i,
+    /^run_command$/i, /^terminal_execute$/i, /^run_in_terminal$/i,
+    /^vscode_runCommand$/i, /^exec$/i, /^execute_command$/i, /^bash$/i,
 ];
 const WRITE_DESC_KEYWORDS = [
-    'apply workspace edit',
-    'write to file',
-    'create a file',
-    'insert into file',
-    'replace in file',
-    'apply changes',
-    'save file',
-    'make a code change',
-    'run a command',
-    'execute command',
-    'terminal',
-    'shell command',
+    'apply workspace edit', 'write to file', 'create a file', 'insert into file',
+    'replace in file', 'apply changes', 'save file', 'make a code change',
+    'run a command', 'execute command', 'terminal', 'shell command',
 ];
 function isNativeWriteTool(name, description) {
     if (WRITE_TOOL_PATTERNS.some(p => p.test(name))) {
@@ -106,66 +86,96 @@ function isNativeWriteTool(name, description) {
     const descLower = description.toLowerCase();
     return WRITE_DESC_KEYWORDS.some(kw => descLower.includes(kw));
 }
-// ────────────────────────────────────────────────────────────────────────────
-// File Extension Extractor
-// ────────────────────────────────────────────────────────────────────────────
-/**
- * Attempts to extract a file extension from the tool's input object.
- * Looks for common property names that carry file paths:
- *   uri, filePath, path, file, fileName, resource
- * Returns the extension (e.g. '.json') or undefined for non-file tools.
- */
 function extractFileExtension(input) {
     if (!input || typeof input !== 'object') {
         return undefined;
     }
     const record = input;
-    // Check common keys that carry file paths
     const pathKeys = ['uri', 'filePath', 'path', 'file', 'fileName', 'resource', 'fsPath'];
+    // 1. Check standard file arguments
     for (const key of pathKeys) {
         const val = record[key];
-        if (typeof val === 'string' && val.length > 0) {
+        if (typeof val === 'string' && val.length > 0)
             return extractExtFromPath(val);
+    }
+    // 2. THE FIX: Parse terminal commands to extract target files (e.g., "cat .env")
+    if (typeof record['command'] === 'string') {
+        const parts = record['command'].split(/\s+/);
+        for (const part of parts) {
+            const ext = extractExtFromPath(part);
+            if (ext)
+                return ext;
         }
     }
-    // deep scan: look for nested objects with these keys
+    // 3. Deep scan for nested objects
     for (const val of Object.values(record)) {
         if (val && typeof val === 'object' && !Array.isArray(val)) {
             const nested = val;
             for (const key of pathKeys) {
                 const nv = nested[key];
-                if (typeof nv === 'string' && nv.length > 0) {
+                if (typeof nv === 'string' && nv.length > 0)
                     return extractExtFromPath(nv);
-                }
             }
         }
     }
     return undefined;
 }
 function extractExtFromPath(pathStr) {
-    // Handle compound extensions like .env.local, .env.production
     const basename = pathStr.split(/[/\\]/).pop() ?? '';
-    if (/^\.env\./i.test(basename)) {
-        return basename.toLowerCase(); // e.g. ".env.local"
-    }
+    if (/^\.env\./i.test(basename))
+        return basename.toLowerCase();
     const dotIdx = basename.lastIndexOf('.');
-    if (dotIdx > 0) {
+    if (dotIdx > 0)
         return basename.slice(dotIdx).toLowerCase();
-    }
-    // No extension — check if it's a dotfile like .env
-    if (basename.startsWith('.') && basename.length > 1) {
-        return basename.toLowerCase(); // e.g. ".env"
-    }
+    if (basename.startsWith('.') && basename.length > 1)
+        return basename.toLowerCase();
     return undefined;
 }
-// ────────────────────────────────────────────────────────────────────────────
-// Tool Output → String Extraction (anti-object-injection)
-// ────────────────────────────────────────────────────────────────────────────
-/**
- * Force-stringifies every part of a LanguageModelToolResult.
- * PromptTsxPart objects are JSON.stringify'd to prevent object-injection
- * bypasses where a crafted object could evade string-based regex scanning.
- */
+function extractFilePath(input) {
+    if (!input || typeof input !== 'object') {
+        return 'unknown context';
+    }
+    const record = input;
+    const pathKeys = ['uri', 'filePath', 'path', 'file', 'fileName', 'resource', 'fsPath', 'command'];
+    for (const key of pathKeys) {
+        const val = record[key];
+        if (typeof val === 'string' && val.length > 0)
+            return val;
+    }
+    for (const val of Object.values(record)) {
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+            const nested = val;
+            for (const key of pathKeys) {
+                const nv = nested[key];
+                if (typeof nv === 'string' && nv.length > 0)
+                    return nv;
+            }
+        }
+    }
+    return 'unknown context';
+}
+// ── HELPER: Flattens VS Code's internal PromptTsx AST into raw file text ──
+function flattenTsxTree(obj) {
+    if (!obj || typeof obj !== 'object')
+        return '';
+    let text = '';
+    if (typeof obj.text === 'string') {
+        text += obj.text;
+    }
+    if (Array.isArray(obj.children)) {
+        for (const child of obj.children) {
+            text += flattenTsxTree(child);
+        }
+    }
+    else {
+        for (const val of Object.values(obj)) {
+            if (val && typeof val === 'object') {
+                text += flattenTsxTree(val);
+            }
+        }
+    }
+    return text;
+}
 function extractToolOutputAsString(res) {
     const parts = [];
     for (const part of res.content) {
@@ -173,15 +183,11 @@ function extractToolOutputAsString(res) {
             parts.push(part.value);
         }
         else if (part instanceof vscode.LanguageModelPromptTsxPart) {
-            try {
-                parts.push(JSON.stringify(part.value, null, 2));
-            }
-            catch {
-                parts.push(String(part.value));
-            }
+            // THE FIX: Flatten the AST to raw text so the Polyglot Router can actually parse it!
+            const extractedText = flattenTsxTree(part.value);
+            parts.push(extractedText ? extractedText : JSON.stringify(part.value, null, 2));
         }
         else {
-            // Unknown part type — force string coercion
             parts.push(String(part));
         }
     }
@@ -205,20 +211,16 @@ async function loadWorkspaceConfig() {
     }
     catch (err) {
         console.error('[SafeChat] Error loading safechat.yml:', err);
-        (0, sanitizer_1.updateConfig)(null); // safely fallback
+        (0, sanitizer_1.updateConfig)(null);
     }
 }
-// ────────────────────────────────────────────────────────────────────────────
-// Extension Activation
-// ────────────────────────────────────────────────────────────────────────────
 function activate(context) {
+    exports.proxyLog = vscode.window.createOutputChannel('SafeChat Audit');
+    exports.proxyLog.appendLine('[SafeChat] Smart Proxy Audit Log Initialized.');
     const participant = vscode.chat.createChatParticipant('safecopilot.safeChat', chatRequestHandler);
     participant.iconPath = new vscode.ThemeIcon('shield');
     context.subscriptions.push(participant);
-    console.log('[SafeChat] Smart Proxy activated — Polyglot AST Router online');
-    // Load safechat.yml config on startup
     loadWorkspaceConfig();
-    // Watch for safechat.yml file modifications in workspace
     const watcher = vscode.workspace.createFileSystemWatcher('**/safechat.yml');
     watcher.onDidChange(() => loadWorkspaceConfig());
     watcher.onDidCreate(() => loadWorkspaceConfig());
@@ -229,11 +231,10 @@ function activate(context) {
     context.subscriptions.push(watcher);
 }
 // ────────────────────────────────────────────────────────────────────────────
-// The Universal Interceptor (chat request handler)
+// The Universal Interceptor
 // ────────────────────────────────────────────────────────────────────────────
 async function chatRequestHandler(request, chatContext, stream, token) {
     const messages = [];
-    // ── Replay previous conversation turns ────────────────────────────────
     for (const turn of chatContext.history) {
         if (turn instanceof vscode.ChatRequestTurn) {
             if (turn.participant === 'safecopilot.safeChat') {
@@ -254,10 +255,8 @@ async function chatRequestHandler(request, chatContext, stream, token) {
             }
         }
     }
-    // ── Current user message ──────────────────────────────────────────────
     messages.push(vscode.LanguageModelChatMessage.User(request.prompt));
     const model = request.model;
-    // ── Expose ALL native tools — no blocking, no custom tools ────────────
     const allTools = vscode.lm.tools.map(t => ({
         name: t.name,
         description: t.description,
@@ -267,7 +266,6 @@ async function chatRequestHandler(request, chatContext, stream, token) {
         ? { tools: allTools, toolMode: vscode.LanguageModelChatToolMode.Auto }
         : {};
     const MAX_TOOL_ROUNDS = 15;
-    // ── Agentic Loop ──────────────────────────────────────────────────────
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
         const chatResponse = await model.sendRequest(messages, requestOptions, token);
         const toolCalls = [];
@@ -281,26 +279,20 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                 toolCalls.push(chunk);
             }
         }
-        // No tool calls — LLM is done, exit the loop
         if (toolCalls.length === 0) {
             break;
         }
-        // Record the assistant's response in message history
         const assistantParts = [];
         if (assistantText) {
             assistantParts.push(new vscode.LanguageModelTextPart(assistantText));
         }
         assistantParts.push(...toolCalls);
         messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
-        // ── Execute & Quarantine Loop ─────────────────────────────────────
         const toolResultParts = [];
         for (const call of toolCalls) {
             stream.progress(`Running tool: ${call.name}…`);
             console.log('[SafeChat] Tool call:', call.name);
             const toolDesc = vscode.lm.tools.find(t => t.name === call.name)?.description ?? '';
-            // ── Write-Guard ─────────────────────────────────────────────────
-            // Check BEFORE execution: if a write/terminal tool's input contains
-            // masked tokens, warn the developer in the chat stream.
             if (isNativeWriteTool(call.name, toolDesc)) {
                 const inputStr = JSON.stringify(call.input ?? {});
                 if (inputStr.includes(sanitizer_1.MASK)) {
@@ -310,11 +302,9 @@ async function chatRequestHandler(request, chatContext, stream, token) {
                         `operation carefully.\n\n`);
                 }
             }
-            // ── Native Execution ────────────────────────────────────────────
             let rawOutput = '';
             try {
                 const result = await vscode.lm.invokeTool(call.name, { input: call.input, toolInvocationToken: request.toolInvocationToken }, token);
-                // Force stringify — anti-object-injection quarantine
                 rawOutput = extractToolOutputAsString(result);
             }
             catch (err) {
@@ -322,10 +312,26 @@ async function chatRequestHandler(request, chatContext, stream, token) {
             }
             // ── Context Router: extract extension → smartSanitize ──────────
             const ext = extractFileExtension(call.input);
-            const { cleanText, wasModified, route } = (0, sanitizer_1.smartSanitize)(rawOutput, ext);
+            const { cleanText, wasModified, route, redactions } = (0, sanitizer_1.smartSanitize)(rawOutput, ext);
             if (wasModified) {
-                stream.markdown(`\n🛡️ **SafeChat Proxy** (\`${route}\`): Scrubbed sensitive data ` +
-                    `from \`${call.name}\` output.\n\n`);
+                const filename = extractFilePath(call.input);
+                const uniqueRedactions = Array.from(new Set(redactions)).join(', ');
+                // 1. Notify the UI
+                stream.markdown(`\n🛡️ **SafeChat Proxy** (\`${route}\`): Scrubbed ${redactions.length} secrets from \`${filename}\`.\n\n`);
+                // 2. Format the Receipt
+                const timestamp = new Date().toISOString();
+                const receiptString = `\n======================================================\n` +
+                    `[AUDIT RECEIPT] 🛡️ FILE SANITIZED: ${filename}\n` +
+                    `[TIMESTAMP]     ${timestamp}\n` +
+                    `[ROUTE]         ${route}\n` +
+                    `[SECRETS SAVED] ${redactions.length}\n` +
+                    `[TYPES CAUGHT]  ${uniqueRedactions}\n` +
+                    `[PAYLOAD SENT TO COPILOT]:\n\n${cleanText}\n` +
+                    `======================================================\n`;
+                // 3. Print to Output Channel (for live viewing)
+                exports.proxyLog.appendLine(receiptString);
+                // 4. Write to Hard Drive (for permanent forensic storage)
+                writeAuditToDisk(receiptString);
             }
             // ── Hand sanitized result back to the LLM ─────────────────────
             toolResultParts.push(new vscode.LanguageModelToolResultPart(call.callId, [new vscode.LanguageModelTextPart(cleanText)]));
