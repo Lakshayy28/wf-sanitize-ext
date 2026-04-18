@@ -223,6 +223,16 @@ export function calculateEntropy(str: string): number {
 const MAX_DEPTH = 64;
 const SENSITIVE_KEY_HEURISTIC = /secret|password|passwd|pwd|token|key|api|cred|auth|cert/i;
 
+// ── SAFE REFERENCE HELPER FUNCTION HERE ──
+function isSafeReference(value: string, key: string): boolean {
+  if (/^[A-Z][A-Z0-9_]{2,64}$/.test(value)) return true;
+  if (/^[a-zA-Z0-9_.-]+(\/[a-zA-Z0-9_.-]+)+$/.test(value)) return true;
+  const valLower = value.toLowerCase();
+  if (valLower === key.toLowerCase()) return true;
+  if (/^[a-z0-9_-]{2,40}$/.test(value) && calculateEntropy(value) < 3.5) return true;
+  return false;
+}
+
 export function maskObjectValues(
   obj: unknown,
   depth: number = 0,
@@ -238,13 +248,27 @@ export function maskObjectValues(
   }
 
   if (typeof obj === 'string') {
+    // 1. Check if the key implies a secret
     if (currentKey && SENSITIVE_KEY_HEURISTIC.test(currentKey)) {
+      
+      // 2. Verify it isn't an empty string or already masked
       if (obj.length > 0 && obj !== MASK) {
-        redactions.push('Key Heuristic Match');
+        
+        // 3. THE FIX: Check if it is a structural pointer instead of a secret
+        if (isSafeReference(obj, currentKey)) {
+          // It's a safe Vault/K8s/EnvVar reference. Pass it to regex just in case, but don't auto-mask.
+          const { cleanText, wasModified } = regexSanitize(obj, redactions);
+          return { masked: cleanText, wasModified };
+        }
+
+        // It failed the safe reference check. Mask it unconditionally.
+        redactions.push(`Key Heuristic Match (${currentKey})`);
         return { masked: MASK, wasModified: true };
       }
       return { masked: obj, wasModified: false };
     }
+    
+    // Not a sensitive key. Run standard regex scan.
     const { cleanText, wasModified } = regexSanitize(obj, redactions);
     return { masked: cleanText, wasModified };
   }
