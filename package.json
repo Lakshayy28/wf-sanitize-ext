@@ -47,7 +47,8 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "copy-grammars": "mkdir -p grammars && cp node_modules/tree-sitter-wasms/out/tree-sitter-json.wasm grammars/ && cp node_modules/@tree-sitter-grammars/tree-sitter-yaml/tree-sitter-yaml.wasm grammars/ && cp node_modules/web-tree-sitter/tree-sitter.wasm grammars/",
+    "compile": "npm run copy-grammars && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts"
   },
@@ -60,8 +61,10 @@
     "typescript": "^5.3.0"
   },
   "dependencies": {
-    "fast-xml-parser": "^5.5.9",
-    "jsonc-parser": "^3.3.1",
+    "@tree-sitter-grammars/tree-sitter-toml": "^0.6.0",
+    "@tree-sitter-grammars/tree-sitter-yaml": "^0.7.1",
+    "tree-sitter-wasms": "^0.1.13",
+    "web-tree-sitter": "0.24.7",
     "yaml": "^2.8.3"
   }
 }

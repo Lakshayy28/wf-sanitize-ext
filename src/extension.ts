@@ -7,7 +7,7 @@ import * as vscode from 'vscode';
 import * as yaml from 'yaml';
 import * as fs from 'fs';
 import * as path from 'path';
-import { smartSanitize, MASK, updateConfig } from './sanitizer';
+import { routeAndSanitize, MASK, updateConfig, initRouter, type ToolContext } from './router';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Permanent Disk Logging
@@ -15,6 +15,7 @@ import { smartSanitize, MASK, updateConfig } from './sanitizer';
 
 function writeAuditToDisk(receiptText: string) {
   if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+    console.warn('[SafeChat] No workspace folders found — audit log will not be written to disk.');
     return;
   }
   
@@ -27,6 +28,7 @@ function writeAuditToDisk(receiptText: string) {
       fs.mkdirSync(auditDir, { recursive: true });
     }
     fs.appendFileSync(auditFile, receiptText + '\n');
+    console.log(`[SafeChat] Audit entry written to ${auditFile}`);
   } catch (err) {
     console.error('[SafeChat] Failed to write to audit log:', err);
   }
@@ -184,9 +186,18 @@ async function loadWorkspaceConfig() {
 
 export let proxyLog: vscode.OutputChannel;
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
   proxyLog = vscode.window.createOutputChannel('SafeChat Audit');
   proxyLog.appendLine('[SafeChat] Smart Proxy Audit Log Initialized.');
+
+  // Initialize Gitleaks + Tree-Sitter engines
+  try {
+    await initRouter(context.extensionPath);
+    proxyLog.appendLine('[SafeChat] Gitleaks + Tree-Sitter engines ready.');
+  } catch (err) {
+    proxyLog.appendLine(`[SafeChat] Engine init failed: ${err}`);
+    console.error('[SafeChat] Engine init failed:', err);
+  }
 
   const participant = vscode.chat.createChatParticipant(
     'safecopilot.safeChat',
@@ -314,9 +325,14 @@ async function chatRequestHandler(
         }`;
       }
 
-      // ── Context Router: extract extension → smartSanitize ──────────
+      // ── Context Router: extract extension → routeAndSanitize ──────
       const ext = extractFileExtension(call.input);
-      const { cleanText, wasModified, route, redactions } = smartSanitize(rawOutput, ext);
+      const toolContext: ToolContext = {
+        toolName: call.name,
+        toolInput: call.input,
+        command: typeof (call.input as any)?.command === 'string' ? (call.input as any).command : undefined,
+      };
+      const { cleanText, wasModified, route, redactions } = await routeAndSanitize(rawOutput, ext, toolContext);
 
       if (wasModified) {
         const filename = extractFilePath(call.input);

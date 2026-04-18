@@ -1,587 +1,351 @@
 "use strict";
 /**
- * router.ts — Whitelist-Only Context Router
- * ══════════════════════════════════════════
- * Strict Default-Deny architecture: ONLY files whose extension or path is
- * explicitly mapped (in the built-in defaults OR in safechat-rules.yaml)
- * are scanned. Everything else is bypassed.
- *
- * Routing priority:
- *   0. Binary blocklist          → blocked (never enters text pipeline)
- *   1. custom_paths (path match) → highest priority, user-defined strategy
- *   2. ast_extensions            → Tier 2 AST (pure-JS parsers)
- *   3. full_dlp_extensions       → Tier 3 Full DLP (server: regex + NLP)
- *   4. Default deny              → bypass (forwarded as-is, no scan)
- *
- * NO blacklists. NO content sniffing. NO guessing.
+ * router.ts — Central Routing Controller
+ * ═══════════════════════════════════════
+ * Routes tool outputs through the appropriate sanitization pipeline:
+ * - Source code → bypass (no scanning)
+ * - Flat files (.env, .ini, .properties) → Gitleaks raw scan
+ * - Structured files (JSON, YAML, TOML) → Gitleaks raw scan + Tree-Sitter verification
+ * - XML → Gitleaks raw scan (no WASM grammar available)
+ * - Terminal / MCP / unknown → heuristic-based Gitleaks scan
  */
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getAstFormat = getAstFormat;
-exports.getFileCategory = getFileCategory;
-exports.readRulesConfig = readRulesConfig;
-const vscode = __importStar(require("vscode"));
+exports.MASK = void 0;
+exports.updateConfig = updateConfig;
+exports.initRouter = initRouter;
+exports.routeAndSanitize = routeAndSanitize;
+const gitleaksEngine_1 = require("./gitleaksEngine");
+const treeSitterEngine_1 = require("./treeSitterEngine");
+const heuristic_1 = require("./heuristic");
 // ────────────────────────────────────────────────────────────────────────────
-// Safety: Binary blocklist (the ONLY blocklist — files that break parsers)
+// Constants
 // ────────────────────────────────────────────────────────────────────────────
-/** Binary extensions that must never enter the text pipeline. */
-const BINARY_BLOCKLIST = new Set([
-    '.pdf', '.zip', '.gz', '.tar', '.bz2', '.xz', '.7z', '.rar',
-    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff',
-    '.mp3', '.mp4', '.wav', '.avi', '.mkv', '.mov', '.flac', '.ogg',
-    '.exe', '.dll', '.so', '.dylib', '.bin', '.o', '.obj', '.a', '.lib',
-    '.wasm', '.class', '.pyc', '.pyo',
-    '.sqlite', '.db', '.mdb', '.accdb',
-    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-    '.ttf', '.otf', '.woff', '.woff2', '.eot',
-    '.p12', '.pfx', '.jks', '.keystore',
-]);
-/** Max file size (bytes) for full NLP pipeline. Above this → fast regex only. */
-const MAX_NLP_FILE_SIZE = 1_000_000; // 1 MB
-/** Max single-line length before we treat the file as minified. */
-const MAX_LINE_LENGTH = 10_000;
+exports.MASK = '[MASKED_BY_SAFECHAT]';
+const MAX_BUDGET_BYTES = 250_000; // 250 KB
 // ────────────────────────────────────────────────────────────────────────────
-// Built-in default extension whitelist
+// Extension Set Defaults
 // ────────────────────────────────────────────────────────────────────────────
-// These are the ONLY extensions that are scanned when no YAML is present.
-// Users extend or override these via safechat-rules.yaml.
-/** Tier 2: AST-parsed structured configs — key-based masking via server. */
-const DEFAULT_AST_EXTENSIONS = new Set([
-    // Data interchange
-    '.json', '.jsonc', '.jsonl', '.yaml', '.yml',
-    // Environment / Properties
-    '.env', '.properties', '.ini', '.conf', '.cfg', '.config',
-    '.toml', '.npmrc', '.kubeconfig',
-    // Tabular data
-    '.csv', '.tsv',
-    // Auth / Package Managers
-    '.netrc', '.pgpass', '.gemrc', '.yarnrc',
-    // Keys / Certs (key=value structure)
-    '.pem', '.key', '.cert', '.crt', '.pub', '.ppk', '.cer', '.asc',
-    // IaC
-    '.tf', '.hcl', '.terraformrc', '.tfstate', '.tfvars',
-    // Build / Project (XML-based)
-    '.csproj', '.props', '.targets', '.nuspec',
-    '.xml', '.xsd', '.wsdl',
-    // Secrets files
-    '.secret',
-    // Shell scripts (env var assignments)
-    '.sh', '.bash', '.zsh', '.bat', '.cmd', '.ps1', '.psm1',
-    // Docker / Build
-    '.dockerfile', '.gradle', '.kts',
-]);
-/** Tier 3: Full DLP — regex + Shannon entropy + Presidio NLP (server-side). */
-const DEFAULT_FULL_DLP_EXTENSIONS = new Set([
-    '.txt', '.log', '.md',
-    '.sql', '.graphql', '.gql',
-    '.rtf',
-]);
+const DEFAULT_BYPASS = [
+    '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+    '.py', '.pyw',
+    '.java', '.kt', '.kts', '.scala',
+    '.go',
+    '.rs',
+    '.c', '.h', '.cpp', '.hpp', '.cc', '.cxx',
+    '.cs',
+    '.rb',
+    '.php',
+    '.swift',
+    '.m', '.mm',
+    '.dart',
+    '.lua',
+    '.r', '.R',
+    '.pl', '.pm',
+    '.sh', '.bash', '.zsh', '.fish',
+    '.ps1', '.psm1',
+    '.sql',
+    '.vue', '.svelte',
+    '.tf', '.hcl',
+    '.proto',
+    '.graphql', '.gql',
+];
+const DEFAULT_CST_JSON = ['.json', '.jsonc', '.json5'];
+const DEFAULT_CST_YAML = ['.yaml', '.yml'];
+const DEFAULT_CST_TOML = ['.toml'];
+const DEFAULT_CST_XML = ['.xml', '.xsl', '.xslt', '.svg', '.plist'];
+const DEFAULT_FLAT = [
+    '.env', '.ini', '.cfg', '.properties',
+    '.pgpass', '.netrc', '.npmrc',
+    '.env.local', '.env.production', '.env.development',
+];
 // ────────────────────────────────────────────────────────────────────────────
-// AST format detection
+// Mutable Configuration State
 // ────────────────────────────────────────────────────────────────────────────
-/** Map file extensions to the AST parser format they should use. */
-const AST_FORMAT_MAP = {
-    // JSON (jsonc-parser handles comments + trailing commas)
-    '.json': 'json', '.jsonc': 'jsonc', '.jsonl': 'jsonl', '.tfstate': 'json',
-    // YAML
-    '.yaml': 'yaml', '.yml': 'yaml', '.kubeconfig': 'yaml',
-    // ENV
-    '.env': 'env',
-    // Properties / INI
-    '.properties': 'properties', '.ini': 'properties', '.cfg': 'properties',
-    '.npmrc': 'properties', '.netrc': 'properties', '.pgpass': 'properties',
-    '.gemrc': 'properties', '.yarnrc': 'properties',
-    '.conf': 'properties', '.config': 'properties',
-    '.secret': 'properties', '.editorconfig': 'properties',
-    // TOML
-    '.toml': 'toml',
-    // XML
-    '.xml': 'xml', '.csproj': 'xml', '.props': 'xml', '.targets': 'xml',
-    '.nuspec': 'xml', '.xsd': 'xml', '.wsdl': 'xml',
-    // Key file formats (treat as env/properties for key: value lines)
-    '.pem': 'env', '.key': 'env', '.cert': 'env', '.crt': 'env',
-    '.pub': 'env', '.p12': 'env', '.ppk': 'env', '.cer': 'env', '.asc': 'env',
-    // IaC (HCL)
-    '.tf': 'hcl', '.tfvars': 'hcl', '.hcl': 'hcl',
-    '.terraformrc': 'hcl',
-    // CSV / TSV
-    '.csv': 'csv', '.tsv': 'tsv',
-    // Build scripts (shell = env format)
-    '.sh': 'env', '.bash': 'env', '.zsh': 'env', '.bat': 'env',
-    '.cmd': 'env', '.ps1': 'env', '.psm1': 'env',
-    '.dockerfile': 'env', '.gradle': 'properties', '.kts': 'properties',
-};
-/**
- * Returns the AST parser format for a given filename, or undefined if
- * no AST parser is appropriate.
- */
-function getAstFormat(fileName) {
-    const ext = extractExtension(fileName);
-    if (!ext) {
-        return undefined;
+let BYPASS_EXTENSIONS = new Set();
+let CST_JSON_EXTENSIONS = new Set();
+let CST_YAML_EXTENSIONS = new Set();
+let CST_TOML_EXTENSIONS = new Set();
+let CST_XML_EXTENSIONS = new Set();
+let FLAT_EXTENSIONS = new Set();
+function resetToDefaults() {
+    BYPASS_EXTENSIONS = new Set(DEFAULT_BYPASS);
+    CST_JSON_EXTENSIONS = new Set(DEFAULT_CST_JSON);
+    CST_YAML_EXTENSIONS = new Set(DEFAULT_CST_YAML);
+    CST_TOML_EXTENSIONS = new Set(DEFAULT_CST_TOML);
+    CST_XML_EXTENSIONS = new Set(DEFAULT_CST_XML);
+    FLAT_EXTENSIONS = new Set(DEFAULT_FLAT);
+}
+resetToDefaults();
+function updateConfig(config) {
+    if (!config) {
+        console.log('[SafeChat] Config absent or removed. Resetting to defaults.');
+        resetToDefaults();
+        return;
     }
-    return AST_FORMAT_MAP[ext];
+    if (config.routing) {
+        if (Array.isArray(config.routing.bypass)) {
+            BYPASS_EXTENSIONS = new Set(config.routing.bypass);
+        }
+        if (Array.isArray(config.routing.cst_json)) {
+            CST_JSON_EXTENSIONS = new Set(config.routing.cst_json);
+        }
+        if (Array.isArray(config.routing.cst_yaml)) {
+            CST_YAML_EXTENSIONS = new Set(config.routing.cst_yaml);
+        }
+        if (Array.isArray(config.routing.cst_toml)) {
+            CST_TOML_EXTENSIONS = new Set(config.routing.cst_toml);
+        }
+        if (Array.isArray(config.routing.cst_xml)) {
+            CST_XML_EXTENSIONS = new Set(config.routing.cst_xml);
+        }
+        if (Array.isArray(config.routing.flat)) {
+            FLAT_EXTENSIONS = new Set(config.routing.flat);
+        }
+    }
+    else {
+        resetToDefaults();
+    }
 }
 // ────────────────────────────────────────────────────────────────────────────
-// Main Router — Whitelist-Only (Default-Deny)
+// Extension Path Cache (set during init)
 // ────────────────────────────────────────────────────────────────────────────
+let cachedExtensionPath = '';
+let cachedBinaryPath = '';
 /**
- * Normalize a file path for custom_paths matching.
- * Strips leading `./`, collapses separators, lowercases for comparison.
+ * Initialize the router. Must be called once during extension activation.
+ * Sets up Tree-Sitter runtime and resolves Gitleaks binary path.
  */
-function normalizePath(p) {
-    return p.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+async function initRouter(extensionPath) {
+    cachedExtensionPath = extensionPath;
+    cachedBinaryPath = (0, gitleaksEngine_1.getGitleaksBinary)(extensionPath);
+    // Initialize Tree-Sitter WASM runtime
+    await (0, treeSitterEngine_1.initTreeSitter)(extensionPath);
 }
 /**
- * Determines the sanitization tier for a file using strict whitelist logic.
- * Merges built-in defaults with user config from safechat-rules.yaml.
+ * Attempt to detect the content type of untyped text (MCP output, etc.).
+ * Uses trial parsing and heuristic patterns.
+ */
+function detectContentType(text) {
+    const trimmed = text.trimStart();
+    // JSON: starts with { or [
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+            JSON.parse(text);
+            return 'json';
+        }
+        catch {
+            // Not valid JSON; might still be structured
+        }
+    }
+    // XML: starts with < (but not HTML script/style)
+    if (trimmed.startsWith('<') && !trimmed.startsWith('<!DOCTYPE html') && !trimmed.startsWith('<html')) {
+        if (/<\/?[a-zA-Z][\w.-]*[^>]*>/.test(trimmed)) {
+            return 'xml';
+        }
+    }
+    // YAML: starts with --- or has key: value patterns
+    if (trimmed.startsWith('---') || /^[a-zA-Z_][\w.-]*\s*:/m.test(trimmed)) {
+        // Verify with multiple key: value lines
+        const keyValueLines = trimmed.split('\n').filter(l => /^[a-zA-Z_][\w.-]*\s*:/.test(l.trim()));
+        if (keyValueLines.length >= 2) {
+            return 'yaml';
+        }
+    }
+    // TOML: has [section] headers and key = value patterns
+    if (/^\s*\[[a-zA-Z][\w.-]*\]/m.test(trimmed) && /^[a-zA-Z_][\w.-]*\s*=/m.test(trimmed)) {
+        return 'toml';
+    }
+    // Flat key=value: multiple lines with KEY=VALUE or KEY = VALUE
+    const kvLines = trimmed.split('\n').filter(l => /^[A-Za-z_][\w.-]*\s*=/.test(l.trim()));
+    if (kvLines.length >= 2) {
+        return 'flat';
+    }
+    return 'raw';
+}
+// ────────────────────────────────────────────────────────────────────────────
+// Truncation Guard
+// ────────────────────────────────────────────────────────────────────────────
+function truncateIfNeeded(text, redactions) {
+    const byteLen = Buffer.byteLength(text, 'utf-8');
+    if (byteLen <= MAX_BUDGET_BYTES) {
+        return { text, wasTruncated: false };
+    }
+    const buf = Buffer.from(text, 'utf-8');
+    const sliced = buf.subarray(0, MAX_BUDGET_BYTES).toString('utf-8');
+    const lastNl = sliced.lastIndexOf('\n');
+    const safeCut = lastNl > 0 ? lastNl : sliced.length;
+    const truncated = sliced.slice(0, safeCut) +
+        '\n\n[... TRUNCATED: payload exceeded 250KB budget ...]';
+    redactions.push('Payload Truncation (>250KB)');
+    return { text: truncated, wasTruncated: true };
+}
+// ────────────────────────────────────────────────────────────────────────────
+// CST Language Mapping
+// ────────────────────────────────────────────────────────────────────────────
+function getCSTLang(ext) {
+    if (CST_JSON_EXTENSIONS.has(ext)) {
+        return 'json';
+    }
+    if (CST_YAML_EXTENSIONS.has(ext)) {
+        return 'yaml';
+    }
+    if (CST_TOML_EXTENSIONS.has(ext)) {
+        return 'toml';
+    }
+    return null;
+}
+function detectedTypeToCSTLang(detected) {
+    if (detected === 'json') {
+        return 'json';
+    }
+    if (detected === 'yaml') {
+        return 'yaml';
+    }
+    if (detected === 'toml') {
+        return 'toml';
+    }
+    return null;
+}
+// ────────────────────────────────────────────────────────────────────────────
+// The Central Router (public entry point)
+// ────────────────────────────────────────────────────────────────────────────
+/**
+ * Route tool output through the appropriate sanitization pipeline.
  *
- * Routing priority (evaluated in order):
- *   0. Binary blocklist          → bypass (binary safety)
- *   1. custom_paths (path match) → user-defined strategy (AST / FULL_DLP / IGNORE)
- *   2. ast_extensions whitelist  → Tier 2 AST
- *   3. full_dlp_extensions       → Tier 3 Full DLP
- *   4. Default deny              → bypass (not in whitelist = not scanned)
- *
- * @param fileName  — basename or relative path of the file
- * @param _content  — unused (kept for API compatibility; no content sniffing)
- * @param config    — optional rules config with user overrides
+ * Rules (evaluated in order):
+ *   0. Tool error bypass — pass through
+ *   1. Source code bypass — pass through
+ *   2. Flat files (.env, .ini, .properties, .pgpass) → Gitleaks raw scan
+ *   3. Structured files with CST grammar (JSON, YAML, TOML) → Tree-Sitter + Gitleaks
+ *   4. XML files → Gitleaks raw scan (no WASM grammar)
+ *   5. Terminal / MCP / catch-all → heuristic + Gitleaks raw scan
  */
-function getFileCategory(fileName, _content, config) {
-    const ext = extractExtension(fileName);
-    // ── Step 0: Binary blocklist ────────────────────────────────────────
-    if (ext && BINARY_BLOCKLIST.has(ext)) {
-        return 'bypass';
+async function routeAndSanitize(text, fileExtension, toolContext) {
+    const redactions = [];
+    // ── RULE 0: Tool Error Bypass ──────────────────────────────────────
+    if (text.startsWith('Error invoking tool')) {
+        return { cleanText: text, wasModified: false, route: 'bypass:tool-error', redactions };
     }
-    // ── Step 1: custom_paths (highest priority) ─────────────────────────
-    if (config?.custom_paths && config.custom_paths.length > 0) {
-        const normalizedFile = normalizePath(fileName);
-        for (const rule of config.custom_paths) {
-            const normalizedRule = normalizePath(rule.path);
-            // Match if the file path ends with the rule path (supports both
-            // relative and absolute incoming paths matching a relative rule)
-            if (normalizedFile === normalizedRule || normalizedFile.endsWith('/' + normalizedRule)) {
-                switch (rule.strategy) {
-                    case 'AST': return 'ast';
-                    case 'FULL_DLP': return 'full_dlp';
-                    case 'IGNORE': return 'bypass';
-                }
-            }
+    const ext = (fileExtension ?? '').toLowerCase().replace(/^\.?/, '.');
+    // ── RULE 1: Source Code Bypass ─────────────────────────────────────
+    if (BYPASS_EXTENSIONS.has(ext)) {
+        return { cleanText: text, wasModified: false, route: 'bypass:code', redactions };
+    }
+    const strictConfigPath = (0, heuristic_1.getConfigPath)('strict', cachedExtensionPath);
+    // ── RULE 2: Flat Files → Gitleaks Raw Scan ─────────────────────────
+    if (FLAT_EXTENSIONS.has(ext)) {
+        return gitleaksRawScan(text, strictConfigPath, `flat:${ext}`, redactions);
+    }
+    // ── RULE 3: Structured Files with CST Grammar ──────────────────────
+    const cstLang = getCSTLang(ext);
+    if (cstLang) {
+        return cstPipeline(text, cstLang, strictConfigPath, `cst:${cstLang}`, redactions);
+    }
+    // ── RULE 4: XML Files → Gitleaks Raw Scan (no WASM) ────────────────
+    if (CST_XML_EXTENSIONS.has(ext)) {
+        return gitleaksRawScan(text, strictConfigPath, `gitleaks:xml`, redactions);
+    }
+    // ── RULE 5: Terminal / MCP / Catch-All ─────────────────────────────
+    // Try to detect structured content in MCP/terminal output
+    if (!ext || ext === '.') {
+        const detected = detectContentType(text);
+        const detectedLang = detectedTypeToCSTLang(detected);
+        if (detectedLang) {
+            return cstPipeline(text, detectedLang, strictConfigPath, `cst:${detectedLang}:detected`, redactions);
+        }
+        if (detected === 'xml') {
+            return gitleaksRawScan(text, strictConfigPath, 'gitleaks:xml:detected', redactions);
+        }
+        if (detected === 'flat') {
+            return gitleaksRawScan(text, strictConfigPath, 'gitleaks:flat:detected', redactions);
         }
     }
-    // ── Step 2 & 3: Extension whitelist ─────────────────────────────────
-    // Build merged sets: built-in defaults + user YAML additions
-    const astSet = new Set(DEFAULT_AST_EXTENSIONS);
-    const dlpSet = new Set(DEFAULT_FULL_DLP_EXTENSIONS);
-    if (config?.ast_extensions) {
-        for (const e of config.ast_extensions) {
-            astSet.add(e.startsWith('.') ? e.toLowerCase() : '.' + e.toLowerCase());
-        }
-    }
-    if (config?.full_dlp_extensions) {
-        for (const e of config.full_dlp_extensions) {
-            dlpSet.add(e.startsWith('.') ? e.toLowerCase() : '.' + e.toLowerCase());
-        }
-    }
-    // Check extensionless filenames (e.g. "dockerfile", "makefile")
-    const basename = fileName.split(/[/\\]/).pop()?.toLowerCase() ?? '';
-    if (dlpSet.has(basename)) {
-        return 'full_dlp';
-    }
-    if (astSet.has(basename)) {
-        return 'ast';
-    }
-    if (!ext) {
-        // No extension and no basename match → default deny
-        return 'bypass';
-    }
-    // Full DLP wins when an extension is in both sets
-    if (dlpSet.has(ext)) {
-        return 'full_dlp';
-    }
-    if (astSet.has(ext)) {
-        return 'ast';
-    }
-    // ── Step 4: Default deny ────────────────────────────────────────────
-    return 'bypass';
+    // Unstructured text — use heuristic to pick config
+    const command = toolContext?.command ?? extractCommandFromInput(toolContext?.toolInput);
+    const mode = (0, heuristic_1.classifyTerminalMode)(command, text);
+    const configPath = (0, heuristic_1.getConfigPath)(mode, cachedExtensionPath);
+    // Apply truncation guard for large payloads
+    const { text: truncated, wasTruncated } = truncateIfNeeded(text, redactions);
+    return gitleaksRawScan(truncated, configPath, `gitleaks:${mode}`, redactions, wasTruncated);
 }
 // ────────────────────────────────────────────────────────────────────────────
-// YAML Config Reader
+// Pipeline Helpers
 // ────────────────────────────────────────────────────────────────────────────
-/** Maps friendly alias names → canonical Presidio entity type strings. */
-const ENTITY_ALIAS_MAP = {
-    phonenumber: 'PHONE_NUMBER',
-    phone: 'PHONE_NUMBER',
-    accountnumber: 'US_BANK_NUMBER',
-    bankaccount: 'US_BANK_NUMBER',
-    email: 'EMAIL_ADDRESS',
-    emailaddress: 'EMAIL_ADDRESS',
-    emailaddr: 'EMAIL_ADDRESS',
-    creditcard: 'CREDIT_CARD',
-    cc: 'CREDIT_CARD',
-    ssn: 'US_SSN',
-    socialsecuritynumber: 'US_SSN',
-    ipaddress: 'IP_ADDRESS',
-    ip: 'IP_ADDRESS',
-    person: 'PERSON',
-    name: 'PERSON',
-    url: 'URL',
-    location: 'LOCATION',
-    date: 'DATE_TIME',
-    datetime: 'DATE_TIME',
-    iban: 'IBAN_CODE',
-    ibancode: 'IBAN_CODE',
-    crypto: 'CRYPTO',
-    bitcoin: 'CRYPTO',
-    passport: 'US_PASSPORT',
-    drivinglicense: 'US_DRIVER_LICENSE',
-    driverslicense: 'US_DRIVER_LICENSE',
-    medicallicense: 'MEDICAL_LICENSE',
-    nrp: 'NRP',
-};
-function normalizeEntityKey(key) {
-    const slug = key.toLowerCase().replace(/[_\s-]/g, '');
-    return ENTITY_ALIAS_MAP[slug] ?? key.toUpperCase().replace(/[\s-]/g, '_');
-}
-function parseRulesYaml(content) {
-    const rules = {};
-    const astExtensions = [];
-    const fullDlpExtensions = [];
-    const customSecrets = [];
-    const customPaths = [];
-    const customRecognizers = [];
-    const mcpRouting = {
-        default_profile: 'regex-only',
-        timeout_ms: 5000,
-        profiles: { bypass: [], 'json-keys': [], 'regex-only': [], 'nlp-full': [] },
-    };
-    let mcpRoutingFound = false;
-    /** Tracks current sub-profile inside mcp_routing.profiles (e.g. 'bypass', 'json-keys') */
-    let mcpSubProfile = null;
-    let section = 'none';
-    let currentSecret = null;
-    let currentPath = null;
-    let currentRecognizer = null;
-    function flushSecret() {
-        if (currentSecret?.name) {
-            customSecrets.push({
-                name: currentSecret.name,
-                ast_keys: currentSecret.ast_keys,
-                value_prefix: currentSecret.value_prefix,
-                value_charset: currentSecret.value_charset,
-                value_length: currentSecret.value_length,
-            });
-        }
-        currentSecret = null;
-    }
-    function flushPath() {
-        if (currentPath?.path && currentPath?.strategy) {
-            customPaths.push({
-                path: currentPath.path,
-                strategy: currentPath.strategy,
-            });
-        }
-        currentPath = null;
-    }
-    function flushRecognizer() {
-        if (currentRecognizer?.name && currentRecognizer?.pattern) {
-            customRecognizers.push({
-                name: currentRecognizer.name,
-                pattern: currentRecognizer.pattern,
-                score: currentRecognizer.score,
-                context: currentRecognizer.context,
-            });
-        }
-        currentRecognizer = null;
-    }
-    function flushAll() { flushSecret(); flushPath(); flushRecognizer(); }
-    for (const raw of content.split('\n')) {
-        const line = raw.replace(/#.*$/, '').trimEnd();
-        const trimmed = line.trim();
-        if (!trimmed) {
-            continue;
-        }
-        // Top-level section headers (support both flat and nested under scanning_rules:)
-        if (trimmed === 'scanning_rules:') {
-            continue;
-        } // wrapper — skip
-        if (trimmed === 'rules:') {
-            flushAll();
-            section = 'rules';
-            continue;
-        }
-        if (trimmed === 'ast_extensions:') {
-            flushAll();
-            section = 'ast_extensions';
-            continue;
-        }
-        if (trimmed === 'full_dlp_extensions:') {
-            flushAll();
-            section = 'full_dlp_extensions';
-            continue;
-        }
-        if (trimmed === 'custom_secrets:') {
-            flushAll();
-            section = 'custom_secrets';
-            continue;
-        }
-        if (trimmed === 'custom_paths:') {
-            flushAll();
-            section = 'custom_paths';
-            continue;
-        }
-        if (trimmed === 'custom_recognizers:') {
-            flushAll();
-            section = 'custom_recognizers';
-            continue;
-        }
-        if (trimmed === 'mcp_routing:') {
-            flushAll();
-            section = 'mcp_routing';
-            mcpRoutingFound = true;
-            mcpSubProfile = null;
-            continue;
-        }
-        // Must be indented to be inside a section
-        if (!/^\s/.test(line)) {
-            flushAll();
-            section = 'none';
-            continue;
-        }
-        if (section === 'rules') {
-            const m = trimmed.match(/^([A-Za-z0-9_]+)\s*:\s*([A-Za-z]+)/);
-            if (m) {
-                rules[m[1]] = m[2];
-            }
-        }
-        if (section === 'ast_extensions' && trimmed.startsWith('- ')) {
-            const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
-            if (val) {
-                astExtensions.push(val.startsWith('.') ? val.toLowerCase() : '.' + val.toLowerCase());
-            }
-        }
-        if (section === 'full_dlp_extensions' && trimmed.startsWith('- ')) {
-            const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
-            if (val) {
-                fullDlpExtensions.push(val.startsWith('.') ? val.toLowerCase() : '.' + val.toLowerCase());
-            }
-        }
-        if (section === 'custom_paths') {
-            if (trimmed.startsWith('- ')) {
-                flushPath();
-                currentPath = {};
-                const kvMatch = trimmed.slice(2).trim().match(/^(\w+)\s*:\s*(.+)/);
-                if (kvMatch) {
-                    parsePathKV(currentPath, kvMatch[1], kvMatch[2]);
-                }
-            }
-            else if (currentPath) {
-                const kvMatch = trimmed.match(/^(\w+)\s*:\s*(.+)/);
-                if (kvMatch) {
-                    parsePathKV(currentPath, kvMatch[1], kvMatch[2]);
-                }
-            }
-        }
-        if (section === 'custom_secrets') {
-            if (trimmed.startsWith('- ')) {
-                flushSecret();
-                currentSecret = {};
-                const kvMatch = trimmed.slice(2).trim().match(/^(\w+)\s*:\s*(.+)/);
-                if (kvMatch) {
-                    parseSecretKV(currentSecret, kvMatch[1], kvMatch[2]);
-                }
-            }
-            else if (currentSecret) {
-                const kvMatch = trimmed.match(/^(\w+)\s*:\s*(.+)/);
-                if (kvMatch) {
-                    parseSecretKV(currentSecret, kvMatch[1], kvMatch[2]);
-                }
-            }
-        }
-        if (section === 'custom_recognizers') {
-            if (trimmed.startsWith('- ')) {
-                flushRecognizer();
-                currentRecognizer = {};
-                const kvMatch = trimmed.slice(2).trim().match(/^(\w+)\s*:\s*(.+)/);
-                if (kvMatch) {
-                    parseRecognizerKV(currentRecognizer, kvMatch[1], kvMatch[2]);
-                }
-            }
-            else if (currentRecognizer) {
-                const kvMatch = trimmed.match(/^(\w+)\s*:\s*(.+)/);
-                if (kvMatch) {
-                    parseRecognizerKV(currentRecognizer, kvMatch[1], kvMatch[2]);
-                }
-            }
-        }
-        if (section === 'mcp_routing') {
-            // Top-level scalar keys under mcp_routing:
-            const kvMatch = trimmed.match(/^([\w-]+)\s*:\s*(.+)/);
-            if (kvMatch) {
-                const [, key, rawVal] = kvMatch;
-                const val = rawVal.trim().replace(/^["']|["']$/g, '');
-                if (key === 'default_profile') {
-                    const valid = ['bypass', 'json-keys', 'regex-only', 'nlp-full'];
-                    if (valid.includes(val)) {
-                        mcpRouting.default_profile = val;
-                    }
-                }
-                else if (key === 'timeout_ms') {
-                    const n = parseInt(val, 10);
-                    if (!isNaN(n) && n > 0) {
-                        mcpRouting.timeout_ms = n;
-                    }
-                }
-                else if (key === 'profiles') {
-                    // Section header — sub-profiles follow
-                    mcpSubProfile = null;
-                }
-                else if (['bypass', 'json-keys', 'regex-only', 'nlp-full'].includes(key)) {
-                    // Profile header (bypass:, json-keys:, regex-only:, nlp-full:)
-                    mcpSubProfile = key;
-                }
-            }
-            else if (trimmed.startsWith('- ') && mcpSubProfile) {
-                // List item under a profile
-                const val = trimmed.slice(2).trim().replace(/^["']|["']$/g, '');
-                if (val) {
-                    mcpRouting.profiles[mcpSubProfile].push(val);
-                }
-            }
-        }
-    }
-    flushAll();
-    // Normalize rule keys
-    let normalizedRules;
-    if (Object.keys(rules).length > 0) {
-        normalizedRules = {};
-        for (const [k, v] of Object.entries(rules)) {
-            normalizedRules[normalizeEntityKey(k)] = v;
-        }
-    }
-    return {
-        rules: normalizedRules,
-        ast_extensions: astExtensions.length > 0 ? astExtensions : undefined,
-        full_dlp_extensions: fullDlpExtensions.length > 0 ? fullDlpExtensions : undefined,
-        custom_paths: customPaths.length > 0 ? customPaths : undefined,
-        custom_secrets: customSecrets.length > 0 ? customSecrets : undefined,
-        custom_recognizers: customRecognizers.length > 0 ? customRecognizers : undefined,
-        mcp_routing: mcpRoutingFound ? mcpRouting : undefined,
-    };
-}
-function parsePathKV(pathRule, key, rawValue) {
-    const value = rawValue.trim().replace(/^["']|["']$/g, '');
-    switch (key) {
-        case 'path':
-            pathRule.path = value;
-            break;
-        case 'strategy':
-            pathRule.strategy = value.toUpperCase();
-            break;
-    }
-}
-function parseSecretKV(secret, key, rawValue) {
-    const value = rawValue.trim().replace(/^["']|["']$/g, '');
-    switch (key) {
-        case 'name':
-            secret.name = value;
-            break;
-        case 'ast_keys':
-            // Parse YAML inline array: ["acme", "acme_pat"]
-            secret.ast_keys = value.replace(/[\[\]]/g, '').split(',').map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
-            break;
-        case 'value_prefix':
-            secret.value_prefix = value;
-            break;
-        case 'value_charset':
-            secret.value_charset = value;
-            break;
-        case 'value_length':
-            secret.value_length = value;
-            break;
-    }
-}
-function parseRecognizerKV(rec, key, rawValue) {
-    const value = rawValue.trim().replace(/^["']|["']$/g, '');
-    switch (key) {
-        case 'name':
-            rec.name = value;
-            break;
-        case 'pattern':
-            rec.pattern = value;
-            break;
-        case 'score':
-            rec.score = parseFloat(value) || undefined;
-            break;
-        case 'context':
-            // Parse YAML inline array or block sequence
-            rec.context = value.replace(/[\[\]]/g, '').split(',')
-                .map(s => s.trim().replace(/^["'-]?\s*|["']$/g, '')).filter(Boolean);
-            break;
-    }
-}
-// Helper
-function extractExtension(fileName) {
-    const basename = fileName.split(/[/\\]/).pop() ?? '';
-    const lastDot = basename.lastIndexOf('.');
-    if (lastDot <= 0) {
-        return undefined;
-    }
-    return basename.slice(lastDot).toLowerCase();
-}
-/**
- * Reads `.vscode/safechat-rules.yaml` (or the path from VS Code settings),
- * parses it, and returns the rules config.
- *
- * If the YAML file does not exist, returns an empty config (the router
- * falls back to hardcoded DEFAULT_AST_EXTENSIONS / DEFAULT_FULL_DLP_EXTENSIONS).
- */
-async function readRulesConfig() {
-    const config = vscode.workspace.getConfiguration('safechat');
-    const rulesPath = config.get('rulesFile') || '.vscode/safechat-rules.yaml';
-    const folders = vscode.workspace.workspaceFolders;
-    if (!folders?.length) {
-        return {};
-    }
-    const rulesUri = vscode.Uri.joinPath(folders[0].uri, rulesPath);
+async function cstPipeline(text, lang, configPath, route, redactions) {
     try {
-        const bytes = await vscode.workspace.fs.readFile(rulesUri);
-        return parseRulesYaml(Buffer.from(bytes).toString('utf-8'));
+        // Pass 1: Gitleaks scans the FULL raw text (all context preserved)
+        const findings = await (0, gitleaksEngine_1.scanWithGitleaks)(text, configPath, cachedBinaryPath);
+        if (findings.length === 0) {
+            return { cleanText: text, wasModified: false, route, redactions };
+        }
+        // Pass 2: Tree-Sitter verifies each finding is inside a value node
+        const verified = await (0, treeSitterEngine_1.verifyFindings)(text, lang, findings);
+        if (verified.length === 0) {
+            return { cleanText: text, wasModified: false, route, redactions };
+        }
+        // Mask only verified findings
+        const result = (0, gitleaksEngine_1.applyMask)(text, verified, exports.MASK);
+        redactions.push(...result.redactions);
+        return {
+            cleanText: result.cleanText,
+            wasModified: result.wasModified,
+            route,
+            redactions,
+        };
     }
-    catch {
-        return {};
+    catch (err) {
+        console.warn(`[SafeChat] CST pipeline failed for ${route}, falling back to raw scan:`, err);
+        return gitleaksRawScan(text, configPath, `fallback:${route}`, redactions);
     }
+}
+async function gitleaksRawScan(text, configPath, route, redactions, alreadyTruncated = false) {
+    // Apply truncation guard if not already done
+    let current = text;
+    let wasTruncated = alreadyTruncated;
+    if (!alreadyTruncated) {
+        const trunc = truncateIfNeeded(text, redactions);
+        current = trunc.text;
+        wasTruncated = trunc.wasTruncated;
+    }
+    try {
+        const findings = await (0, gitleaksEngine_1.scanWithGitleaks)(current, configPath, cachedBinaryPath);
+        const result = (0, gitleaksEngine_1.applyMask)(current, findings, exports.MASK);
+        redactions.push(...result.redactions);
+        return {
+            cleanText: result.cleanText,
+            wasModified: result.wasModified || wasTruncated,
+            route,
+            redactions,
+        };
+    }
+    catch (err) {
+        console.error(`[SafeChat] Gitleaks scan failed for route ${route}:`, err);
+        // Fail-closed: return text unchanged but log the error
+        return {
+            cleanText: current,
+            wasModified: wasTruncated,
+            route: `error:${route}`,
+            redactions,
+        };
+    }
+}
+// ────────────────────────────────────────────────────────────────────────────
+// Utility
+// ────────────────────────────────────────────────────────────────────────────
+/**
+ * Extract a command string from tool input for heuristic classification.
+ */
+function extractCommandFromInput(input) {
+    if (!input || typeof input !== 'object') {
+        return undefined;
+    }
+    const record = input;
+    if (typeof record['command'] === 'string') {
+        return record['command'];
+    }
+    if (typeof record['cmd'] === 'string') {
+        return record['cmd'];
+    }
+    return undefined;
 }
 //# sourceMappingURL=router.js.map

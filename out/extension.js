@@ -43,12 +43,13 @@ const vscode = __importStar(require("vscode"));
 const yaml = __importStar(require("yaml"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
-const sanitizer_1 = require("./sanitizer");
+const router_1 = require("./router");
 // ────────────────────────────────────────────────────────────────────────────
 // Permanent Disk Logging
 // ────────────────────────────────────────────────────────────────────────────
 function writeAuditToDisk(receiptText) {
     if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+        console.warn('[SafeChat] No workspace folders found — audit log will not be written to disk.');
         return;
     }
     const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
@@ -59,6 +60,7 @@ function writeAuditToDisk(receiptText) {
             fs.mkdirSync(auditDir, { recursive: true });
         }
         fs.appendFileSync(auditFile, receiptText + '\n');
+        console.log(`[SafeChat] Audit entry written to ${auditFile}`);
     }
     catch (err) {
         console.error('[SafeChat] Failed to write to audit log:', err);
@@ -203,20 +205,29 @@ async function loadWorkspaceConfig() {
             const fileData = await vscode.workspace.fs.readFile(uris[0]);
             const text = Buffer.from(fileData).toString('utf-8');
             const parsed = yaml.parse(text);
-            (0, sanitizer_1.updateConfig)(parsed);
+            (0, router_1.updateConfig)(parsed);
         }
         else {
-            (0, sanitizer_1.updateConfig)(null);
+            (0, router_1.updateConfig)(null);
         }
     }
     catch (err) {
         console.error('[SafeChat] Error loading safechat.yml:', err);
-        (0, sanitizer_1.updateConfig)(null);
+        (0, router_1.updateConfig)(null);
     }
 }
-function activate(context) {
+async function activate(context) {
     exports.proxyLog = vscode.window.createOutputChannel('SafeChat Audit');
     exports.proxyLog.appendLine('[SafeChat] Smart Proxy Audit Log Initialized.');
+    // Initialize Gitleaks + Tree-Sitter engines
+    try {
+        await (0, router_1.initRouter)(context.extensionPath);
+        exports.proxyLog.appendLine('[SafeChat] Gitleaks + Tree-Sitter engines ready.');
+    }
+    catch (err) {
+        exports.proxyLog.appendLine(`[SafeChat] Engine init failed: ${err}`);
+        console.error('[SafeChat] Engine init failed:', err);
+    }
     const participant = vscode.chat.createChatParticipant('safecopilot.safeChat', chatRequestHandler);
     participant.iconPath = new vscode.ThemeIcon('shield');
     context.subscriptions.push(participant);
@@ -226,7 +237,7 @@ function activate(context) {
     watcher.onDidCreate(() => loadWorkspaceConfig());
     watcher.onDidDelete(() => {
         console.log('[SafeChat] safechat.yml deleted. Reverting to base config.');
-        (0, sanitizer_1.updateConfig)(null);
+        (0, router_1.updateConfig)(null);
     });
     context.subscriptions.push(watcher);
 }
@@ -295,9 +306,9 @@ async function chatRequestHandler(request, chatContext, stream, token) {
             const toolDesc = vscode.lm.tools.find(t => t.name === call.name)?.description ?? '';
             if (isNativeWriteTool(call.name, toolDesc)) {
                 const inputStr = JSON.stringify(call.input ?? {});
-                if (inputStr.includes(sanitizer_1.MASK)) {
+                if (inputStr.includes(router_1.MASK)) {
                     stream.markdown(`\n> ⚠️ **SafeChat Write-Guard**: Tool \`${call.name}\` was invoked ` +
-                        `with input containing \`${sanitizer_1.MASK}\`. This could corrupt files or ` +
+                        `with input containing \`${router_1.MASK}\`. This could corrupt files or ` +
                         `execute masked credentials in the terminal. Please review the ` +
                         `operation carefully.\n\n`);
                 }
@@ -310,9 +321,14 @@ async function chatRequestHandler(request, chatContext, stream, token) {
             catch (err) {
                 rawOutput = `Error invoking tool ${call.name}: ${err instanceof Error ? err.message : String(err)}`;
             }
-            // ── Context Router: extract extension → smartSanitize ──────────
+            // ── Context Router: extract extension → routeAndSanitize ──────
             const ext = extractFileExtension(call.input);
-            const { cleanText, wasModified, route, redactions } = (0, sanitizer_1.smartSanitize)(rawOutput, ext);
+            const toolContext = {
+                toolName: call.name,
+                toolInput: call.input,
+                command: typeof call.input?.command === 'string' ? call.input.command : undefined,
+            };
+            const { cleanText, wasModified, route, redactions } = await (0, router_1.routeAndSanitize)(rawOutput, ext, toolContext);
             if (wasModified) {
                 const filename = extractFilePath(call.input);
                 const uniqueRedactions = Array.from(new Set(redactions)).join(', ');

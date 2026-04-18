@@ -1,0 +1,193 @@
+# testing.toml — Gitleaks configuration for test/debug output scanning
+# Used for: npm test, jest, pytest, make, stack traces, stderr
+# Same rules as strict.toml but with allowlists for common test fixtures
+
+title = "SafeChat Testing/Debug Scanning Profile"
+
+[extend]
+# Inherit all default Gitleaks rules
+useDefault = true
+
+# ────────────────────────────────────────────────────────────────────────────
+# Custom rules — identical to strict.toml
+# ────────────────────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "safechat-aws-access-key"
+description = "AWS Access Key ID"
+regex = '''\b(AKIA|ASIA|AGPA|AIDA|AROA|AIPA)[A-Z0-9]{16}\b'''
+tags = ["cloud", "aws"]
+
+[[rules]]
+id = "safechat-aws-secret-key"
+description = "AWS Secret Access Key (contextual)"
+regex = '''(?i)(?:aws_secret_access_key|aws_secret_key|secret_access_key|secret[_-]key)\s*[:=]\s*["']?([A-Za-z0-9/+=]{36,})["']?'''
+tags = ["cloud", "aws"]
+secretGroup = 1
+
+[[rules]]
+id = "safechat-stripe-key"
+description = "Stripe API Key"
+regex = '''\b[spr]k_(?:live|test)_[A-Za-z0-9]{24,99}\b'''
+tags = ["api", "payments"]
+
+[[rules]]
+id = "safechat-stripe-webhook-secret"
+description = "Stripe Webhook Secret"
+regex = '''\bwhsec_[A-Za-z0-9]{24,}\b'''
+tags = ["api", "payments"]
+
+[[rules]]
+id = "safechat-slack-token"
+description = "Slack Token"
+regex = '''\bxox[bpas]-[0-9A-Za-z\-]{10,}\b'''
+tags = ["api", "comms"]
+
+[[rules]]
+id = "safechat-github-token"
+description = "GitHub Personal Access Token"
+regex = '''\b(gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{22}_[A-Za-z0-9_]{59})\b'''
+tags = ["api", "scm"]
+
+[[rules]]
+id = "safechat-uri-password"
+description = "Password in URI (protocol://user:PASS@host)"
+regex = '''(?:\w+:\/\/)[^:\s@]*:([^:@\s]{6,})@'''
+tags = ["credentials", "url"]
+secretGroup = 1
+
+[[rules]]
+id = "safechat-connection-string-password"
+description = "Connection String Password (password=, pwd=, secret=)"
+regex = '''(?i)(?:password|pwd|secret)\s*=\s*["']?([^;'"\s\\]{6,})'''
+tags = ["credentials", "database"]
+secretGroup = 1
+
+[[rules]]
+id = "safechat-pgpass-password"
+description = "PostgreSQL .pgpass Password"
+regex = '''^(?:[^:\r\n]+:){4}([^:\r\n]+)$'''
+tags = ["credentials", "database"]
+secretGroup = 1
+
+[[rules]]
+id = "safechat-gitlab-token"
+description = "GitLab Personal Access Token"
+regex = '''\bglpat-[A-Za-z0-9\-_]{20,}\b'''
+tags = ["api", "scm"]
+
+[[rules]]
+id = "safechat-azure-shared-key"
+description = "Azure Storage Account Shared Key"
+regex = '''(?i)(?:AccountKey|SharedAccessKey)\s*=\s*([A-Za-z0-9+/=]{40,})'''
+tags = ["cloud", "azure"]
+secretGroup = 1
+
+[[rules]]
+id = "safechat-gcp-service-account"
+description = "GCP Service Account Key (private_key_id)"
+regex = '''(?i)"private_key_id"\s*:\s*"([a-f0-9]{40})"'''
+tags = ["cloud", "gcp"]
+secretGroup = 1
+
+[[rules]]
+id = "safechat-sendgrid-key"
+description = "SendGrid API Key"
+regex = '''\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{32,}\b'''
+tags = ["api", "email"]
+
+[[rules]]
+id = "safechat-npm-token"
+description = "NPM Access Token"
+regex = '''\bnpm_[A-Za-z0-9]{20,}\b'''
+tags = ["api", "registry"]
+
+[[rules]]
+id = "safechat-vault-token"
+description = "HashiCorp Vault Token"
+regex = '''hvs\.[A-Za-z0-9_\-]{24,}'''
+tags = ["credentials", "vault"]
+
+[[rules]]
+id = "safechat-sonarqube-token"
+description = "SonarQube Token"
+regex = '''\bsq[a-z]_[A-Za-z0-9]{20,}\b'''
+tags = ["api", "ci"]
+
+[[rules]]
+id = "safechat-terraform-cloud-token"
+description = "Terraform Cloud API Token (HCL format)"
+regex = '''(?i)(?:credentials\s+"app\.terraform\.io"\s*\{\s*token\s*=\s*"([^"]+)")'''
+tags = ["api", "ci"]
+secretGroup = 1
+
+[[rules]]
+id = "safechat-terraform-cloud-token-v2"
+description = "Terraform Cloud API Token (pattern-based)"
+regex = '''\b[A-Za-z0-9]{10,}\.atlasv1\.[A-Za-z0-9]{50,}\b'''
+tags = ["api", "ci"]
+
+[[rules]]
+id = "safechat-bitbucket-token"
+description = "Bitbucket App Password"
+regex = '''\bATBB[A-Za-z0-9]{32}\b'''
+tags = ["api", "scm"]
+
+[[rules]]
+id = "safechat-jwt"
+description = "JSON Web Token"
+regex = '''\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'''
+tags = ["credentials", "jwt"]
+
+[[rules]]
+id = "safechat-private-key"
+description = "RSA/PEM Private Key Block"
+regex = '''-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'''
+tags = ["crypto", "key"]
+
+[[rules]]
+id = "safechat-jenkins-token"
+description = "Jenkins API Token"
+regex = '''(?i)(?:jenkins[_-]?(?:api[_-]?)?token|JENKINS_TOKEN)\s*[:=]\s*["']?([A-Za-z0-9]{30,})["']?'''
+tags = ["api", "ci"]
+secretGroup = 1
+
+[[rules]]
+id = "safechat-harness-token"
+description = "Harness Personal Access Token"
+regex = '''\bpat\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{24}\.[A-Za-z0-9_\-]{20,}\b'''
+tags = ["api", "ci"]
+
+[[rules]]
+id = "safechat-netrc-password"
+description = ".netrc machine password"
+regex = '''(?i)machine\s+\S+\s+login\s+\S+\s+password\s+(\S+)'''
+tags = ["credentials"]
+secretGroup = 1
+
+[[rules]]
+id = "safechat-twilio-sid"
+description = "Twilio Account SID"
+regex = '''\bAC[a-f0-9]{32}\b'''
+tags = ["api", "comms"]
+
+[[rules]]
+id = "safechat-nuget-api-key"
+description = "NuGet API Key"
+regex = '''\boy2[A-Za-z0-9]{36,}\b'''
+tags = ["api", "registry"]
+
+# ────────────────────────────────────────────────────────────────────────────
+# Allowlists — lenient for test/debug output
+# ────────────────────────────────────────────────────────────────────────────
+
+[[allowlists]]
+description = "Common test fixture values that are not real secrets"
+regexTarget = "match"
+regexes = [
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''(?i)(?:test|mock|fake|dummy|example|placeholder|sample)[-_]?(?:key|token|secret|password|api)''',
+  '''(?:localhost|127\.0\.0\.1|0\.0\.0\.0|::1)''',
+  '''172\.17\.0\.\d+''',
+  '''(?i)(?:your[-_]?(?:api[-_]?key|token|secret)|changeme|password123|todo|fixme|replace[-_]?me)''',
+]
