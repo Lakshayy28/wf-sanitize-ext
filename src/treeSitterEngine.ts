@@ -107,7 +107,7 @@ export async function parseCST(text: string, lang: SupportedLang): Promise<impor
 // Two-Pass Verification — Gitleaks Finding Verifier
 // ────────────────────────────────────────────────────────────────────────────
 
-import { lineColToByteOffset, type GitleaksFinding } from './gitleaksEngine';
+import { lineColToByteOffset, byteOffsetToCharIndex, type GitleaksFinding } from './gitleaksEngine';
 
 /**
  * Checks whether a byte range [startIndex, endIndex) falls inside a VALUE
@@ -280,7 +280,8 @@ export async function verifyFindings(
 
       // Resolve the secret's byte position in the original text
       // using the same logic as applyMask in gitleaksEngine.ts
-      const approxOffset = lineColToByteOffset(text, finding.StartLine, finding.StartColumn);
+      const approxByteOffset = lineColToByteOffset(text, finding.StartLine, finding.StartColumn);
+      const approxOffset = byteOffsetToCharIndex(text, approxByteOffset);
       const secretStart = locateSecret(text, secret, approxOffset);
 
       if (secretStart < 0) {

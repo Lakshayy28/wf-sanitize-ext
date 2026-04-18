@@ -130,7 +130,15 @@ export function scanWithGitleaks(
     let stdout = '';
     let stderr = '';
 
+    let stdoutBytes = 0;
+    const MAX_STDOUT = 50 * 1024 * 1024; // 50MB
     child.stdout.on('data', (data: Buffer) => {
+      stdoutBytes += data.length;
+      if (stdoutBytes > MAX_STDOUT) {
+        try { child.kill('SIGKILL'); } catch (_) {}
+        reject(new Error('[SafeChat] Gitleaks stdout exceeded 50MB. Aborting.'));
+        return;
+      }
       stdout += data.toString();
     });
 
@@ -144,6 +152,7 @@ export function scanWithGitleaks(
 
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
+      setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} }, 5000);
       cleanupTempFile(tempReportPath);
       reject(new Error(`[SafeChat] Gitleaks timed out after ${timeoutMs}ms`));
     }, timeoutMs);
@@ -225,6 +234,16 @@ function cleanupTempFile(filePath: string | undefined): void {
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
+ * Converts a byte offset (from Gitleaks) to a character index (for JS string ops).
+ * Essential for non-ASCII text (emojis, CJK, etc.) where byte ≠ char.
+ */
+export function byteOffsetToCharIndex(text: string, byteOffset: number): number {
+  const buf = Buffer.from(text, 'utf-8');
+  if (byteOffset >= buf.length) { return text.length; }
+  return buf.subarray(0, byteOffset).toString('utf-8').length;
+}
+
+/**
  * Computes the byte offset for a line:column position in a text string.
  * Gitleaks reports 0-indexed lines and columns.
  */
@@ -291,8 +310,9 @@ export function applyMask(
     const secret = finding.Secret;
     if (!secret || secret.length === 0) { continue; }
 
-    // Use line/column to compute approximate byte offset
-    const approxOffset = lineColToByteOffset(text, finding.StartLine, finding.StartColumn);
+    // Use line/column to compute approximate byte offset, then convert to char index
+    const approxByteOffset = lineColToByteOffset(text, finding.StartLine, finding.StartColumn);
+    const approxOffset = byteOffsetToCharIndex(text, approxByteOffset);
 
     // Search for the secret near the approximate offset (±500 chars to handle encoding variance)
     const searchStart = Math.max(0, approxOffset - 500);

@@ -41,6 +41,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getGitleaksBinary = getGitleaksBinary;
 exports.scanWithGitleaks = scanWithGitleaks;
+exports.byteOffsetToCharIndex = byteOffsetToCharIndex;
 exports.lineColToByteOffset = lineColToByteOffset;
 exports.applyMask = applyMask;
 const child_process_1 = require("child_process");
@@ -114,7 +115,18 @@ function scanWithGitleaks(text, configPath, binaryPath, timeoutMs = DEFAULT_TIME
         });
         let stdout = '';
         let stderr = '';
+        let stdoutBytes = 0;
+        const MAX_STDOUT = 50 * 1024 * 1024; // 50MB
         child.stdout.on('data', (data) => {
+            stdoutBytes += data.length;
+            if (stdoutBytes > MAX_STDOUT) {
+                try {
+                    child.kill('SIGKILL');
+                }
+                catch (_) { }
+                reject(new Error('[SafeChat] Gitleaks stdout exceeded 50MB. Aborting.'));
+                return;
+            }
             stdout += data.toString();
         });
         child.stderr.on('data', (data) => {
@@ -125,6 +137,10 @@ function scanWithGitleaks(text, configPath, binaryPath, timeoutMs = DEFAULT_TIME
         child.stdin.end();
         const timer = setTimeout(() => {
             child.kill('SIGTERM');
+            setTimeout(() => { try {
+                child.kill('SIGKILL');
+            }
+            catch (_) { } }, 5000);
             cleanupTempFile(tempReportPath);
             reject(new Error(`[SafeChat] Gitleaks timed out after ${timeoutMs}ms`));
         }, timeoutMs);
@@ -201,6 +217,17 @@ function cleanupTempFile(filePath) {
 // Masking
 // ────────────────────────────────────────────────────────────────────────────
 /**
+ * Converts a byte offset (from Gitleaks) to a character index (for JS string ops).
+ * Essential for non-ASCII text (emojis, CJK, etc.) where byte ≠ char.
+ */
+function byteOffsetToCharIndex(text, byteOffset) {
+    const buf = Buffer.from(text, 'utf-8');
+    if (byteOffset >= buf.length) {
+        return text.length;
+    }
+    return buf.subarray(0, byteOffset).toString('utf-8').length;
+}
+/**
  * Computes the byte offset for a line:column position in a text string.
  * Gitleaks reports 0-indexed lines and columns.
  */
@@ -248,8 +275,9 @@ function applyMask(text, findings, mask) {
         if (!secret || secret.length === 0) {
             continue;
         }
-        // Use line/column to compute approximate byte offset
-        const approxOffset = lineColToByteOffset(text, finding.StartLine, finding.StartColumn);
+        // Use line/column to compute approximate byte offset, then convert to char index
+        const approxByteOffset = lineColToByteOffset(text, finding.StartLine, finding.StartColumn);
+        const approxOffset = byteOffsetToCharIndex(text, approxByteOffset);
         // Search for the secret near the approximate offset (±500 chars to handle encoding variance)
         const searchStart = Math.max(0, approxOffset - 500);
         const searchEnd = Math.min(text.length, approxOffset + secret.length + 500);

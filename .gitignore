@@ -8,3 +8,5 @@ test.yaml
 .DS_Store
 *.bak
 latest
+enterprise_regression_fixtures
+scripts

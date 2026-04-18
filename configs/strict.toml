@@ -57,11 +57,16 @@ tags = ["credentials", "url"]
 secretGroup = 1
 
 [[rules]]
-id = "safechat-connection-string-password"
-description = "Connection String Password (password=, pwd=, secret=)"
-regex = '''(?i)(?:password|pwd|secret)\s*=\s*["']?([^;'"\s\\]{6,})'''
-tags = ["credentials", "database"]
+id = "safechat-generic-credential"
+description = "Generic credential assignment — keyword-adjacent high-entropy value"
+# Matches: keyword (as full word or as part of var name like DB_PASSWORD, STRIPE_SECRET_KEY)
+#   + separator (= or :, covers .env, YAML, TOML, properties, shell, HCL)
+#   + entropy >= 3.5 bits/char filters out: null, changeme, password123 (all < 3.0 entropy)
+# Does NOT catch: column-name-based SQL (INSERT VALUES), those need format-signature rules.
+regex = '''(?i)[a-z0-9_.]*(?:password|passwd|pwd|secret|passphrase|passkey|credential|api[_-]?key|auth[_-]?key|db[_-]?pass(?:word)?|private[_-]?key|access[_-]?key)[a-z0-9_.]*\s*[:=]+\s*["']?([^\s"'`,;\r\n\\]{8,})["']?'''
+tags = ["credentials", "generic"]
 secretGroup = 1
+entropy = 3.5
 
 [[rules]]
 id = "safechat-pgpass-password"

@@ -256,7 +256,8 @@ async function verifyFindings(text, lang, findings) {
             }
             // Resolve the secret's byte position in the original text
             // using the same logic as applyMask in gitleaksEngine.ts
-            const approxOffset = (0, gitleaksEngine_1.lineColToByteOffset)(text, finding.StartLine, finding.StartColumn);
+            const approxByteOffset = (0, gitleaksEngine_1.lineColToByteOffset)(text, finding.StartLine, finding.StartColumn);
+            const approxOffset = (0, gitleaksEngine_1.byteOffsetToCharIndex)(text, approxByteOffset);
             const secretStart = locateSecret(text, secret, approxOffset);
             if (secretStart < 0) {
                 // Can't locate the secret in text — keep it anyway (fail-closed)

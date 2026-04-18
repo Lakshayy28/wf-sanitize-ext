@@ -41,11 +41,7 @@ const DEFAULT_BYPASS = [
     '.lua',
     '.r', '.R',
     '.pl', '.pm',
-    '.sh', '.bash', '.zsh', '.fish',
-    '.ps1', '.psm1',
-    '.sql',
     '.vue', '.svelte',
-    '.tf', '.hcl',
     '.proto',
     '.graphql', '.gql',
 ];
@@ -57,6 +53,10 @@ const DEFAULT_FLAT = [
     '.env', '.ini', '.cfg', '.properties',
     '.pgpass', '.netrc', '.npmrc',
     '.env.local', '.env.production', '.env.development',
+    '.sh', '.bash', '.zsh', '.fish',
+    '.ps1', '.psm1',
+    '.sql',
+    '.tf', '.hcl',
 ];
 // ────────────────────────────────────────────────────────────────────────────
 // Mutable Configuration State

@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "exclude": ["node_modules", ".vscode-test", "src/sanitizer.ts"]
+  "exclude": ["node_modules", ".vscode-test", "src/sanitizer.ts", "enterprise_regression_fixtures", "scripts"]
 }
