@@ -4,9 +4,9 @@
  * ═══════════════════════════════════════
  * Routes tool outputs through the appropriate sanitization pipeline:
  * - Source code → bypass (no scanning)
- * - Flat files (.env, .ini, .properties) → Gitleaks raw scan
- * - Structured files (JSON, YAML, TOML) → Gitleaks raw scan + Tree-Sitter verification
- * - XML → Gitleaks raw scan (no WASM grammar available)
+ * - Flat files (.properties, .pgpass, .sql, etc.) → Gitleaks raw scan
+ * - Structured files (JSON, YAML, TOML, XML, ENV, INI) → Gitleaks + Tree-Sitter CST verification
+ * - JSONL/NDJSON → Gitleaks + per-line JSON CST verification
  * - Terminal / MCP / unknown → heuristic-based Gitleaks scan
  */
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -22,7 +22,8 @@ const heuristic_1 = require("./heuristic");
 // Constants
 // ────────────────────────────────────────────────────────────────────────────
 exports.MASK = '[MASKED_BY_SAFECHAT]';
-const MAX_BUDGET_BYTES = 250_000; // 250 KB
+const MAX_BUDGET_BYTES = 250_000; // 250 KB truncation threshold
+const MAX_SCAN_BYTES = 2_000_000; // 2 MB hard cap — reject before scanning
 // ────────────────────────────────────────────────────────────────────────────
 // Extension Set Defaults
 // ────────────────────────────────────────────────────────────────────────────
@@ -49,12 +50,12 @@ const DEFAULT_BYPASS = [
 const DEFAULT_CST_JSON = ['.json', '.jsonc', '.json5'];
 const DEFAULT_CST_YAML = ['.yaml', '.yml'];
 const DEFAULT_CST_TOML = ['.toml'];
-const DEFAULT_CST_XML = ['.xml', '.xsl', '.xslt', '.svg', '.plist'];
+const DEFAULT_CST_HTML = ['.xml', '.xsl', '.xslt', '.svg', '.plist'];
+const DEFAULT_CST_BASH = ['.env', '.sh', '.bash', '.zsh', '.fish'];
+const DEFAULT_CST_INI = ['.ini', '.cfg'];
 const DEFAULT_FLAT = [
-    '.env', '.ini', '.cfg', '.properties',
+    '.properties',
     '.pgpass', '.netrc', '.npmrc',
-    '.env.local', '.env.production', '.env.development',
-    '.sh', '.bash', '.zsh', '.fish',
     '.ps1', '.psm1',
     '.sql',
     '.tf', '.hcl',
@@ -66,14 +67,18 @@ let BYPASS_EXTENSIONS = new Set();
 let CST_JSON_EXTENSIONS = new Set();
 let CST_YAML_EXTENSIONS = new Set();
 let CST_TOML_EXTENSIONS = new Set();
-let CST_XML_EXTENSIONS = new Set();
+let CST_HTML_EXTENSIONS = new Set();
+let CST_BASH_EXTENSIONS = new Set();
+let CST_INI_EXTENSIONS = new Set();
 let FLAT_EXTENSIONS = new Set();
 function resetToDefaults() {
     BYPASS_EXTENSIONS = new Set(DEFAULT_BYPASS);
     CST_JSON_EXTENSIONS = new Set(DEFAULT_CST_JSON);
     CST_YAML_EXTENSIONS = new Set(DEFAULT_CST_YAML);
     CST_TOML_EXTENSIONS = new Set(DEFAULT_CST_TOML);
-    CST_XML_EXTENSIONS = new Set(DEFAULT_CST_XML);
+    CST_HTML_EXTENSIONS = new Set(DEFAULT_CST_HTML);
+    CST_BASH_EXTENSIONS = new Set(DEFAULT_CST_BASH);
+    CST_INI_EXTENSIONS = new Set(DEFAULT_CST_INI);
     FLAT_EXTENSIONS = new Set(DEFAULT_FLAT);
 }
 resetToDefaults();
@@ -96,8 +101,14 @@ function updateConfig(config) {
         if (Array.isArray(config.routing.cst_toml)) {
             CST_TOML_EXTENSIONS = new Set(config.routing.cst_toml);
         }
-        if (Array.isArray(config.routing.cst_xml)) {
-            CST_XML_EXTENSIONS = new Set(config.routing.cst_xml);
+        if (Array.isArray(config.routing.cst_html)) {
+            CST_HTML_EXTENSIONS = new Set(config.routing.cst_html);
+        }
+        if (Array.isArray(config.routing.cst_bash)) {
+            CST_BASH_EXTENSIONS = new Set(config.routing.cst_bash);
+        }
+        if (Array.isArray(config.routing.cst_ini)) {
+            CST_INI_EXTENSIONS = new Set(config.routing.cst_ini);
         }
         if (Array.isArray(config.routing.flat)) {
             FLAT_EXTENSIONS = new Set(config.routing.flat);
@@ -199,6 +210,15 @@ function getCSTLang(ext) {
     if (CST_TOML_EXTENSIONS.has(ext)) {
         return 'toml';
     }
+    if (CST_HTML_EXTENSIONS.has(ext)) {
+        return 'html';
+    }
+    if (CST_BASH_EXTENSIONS.has(ext)) {
+        return 'bash';
+    }
+    if (CST_INI_EXTENSIONS.has(ext)) {
+        return 'ini';
+    }
     return null;
 }
 function detectedTypeToCSTLang(detected) {
@@ -211,6 +231,9 @@ function detectedTypeToCSTLang(detected) {
     if (detected === 'toml') {
         return 'toml';
     }
+    if (detected === 'xml') {
+        return 'html';
+    }
     return null;
 }
 // ────────────────────────────────────────────────────────────────────────────
@@ -222,9 +245,9 @@ function detectedTypeToCSTLang(detected) {
  * Rules (evaluated in order):
  *   0. Tool error bypass — pass through
  *   1. Source code bypass — pass through
- *   2. Flat files (.env, .ini, .properties, .pgpass) → Gitleaks raw scan
- *   3. Structured files with CST grammar (JSON, YAML, TOML) → Tree-Sitter + Gitleaks
- *   4. XML files → Gitleaks raw scan (no WASM grammar)
+ *   2. Flat files (.properties, .pgpass, etc.) → Gitleaks raw scan
+ *   3. Structured files with CST grammar (JSON, YAML, TOML, XML, Bash/ENV, INI) → Tree-Sitter + Gitleaks
+ *   4. JSONL/NDJSON → per-line JSON CST pipeline
  *   5. Terminal / MCP / catch-all → heuristic + Gitleaks raw scan
  */
 async function routeAndSanitize(text, fileExtension, toolContext) {
@@ -248,9 +271,9 @@ async function routeAndSanitize(text, fileExtension, toolContext) {
     if (cstLang) {
         return cstPipeline(text, cstLang, strictConfigPath, `cst:${cstLang}`, redactions);
     }
-    // ── RULE 4: XML Files → Gitleaks Raw Scan (no WASM) ────────────────
-    if (CST_XML_EXTENSIONS.has(ext)) {
-        return gitleaksRawScan(text, strictConfigPath, `gitleaks:xml`, redactions);
+    // ── RULE 4: JSONL / NDJSON → per-line JSON CST pipeline ────────────
+    if (ext === '.jsonl' || ext === '.ndjson') {
+        return jsonlPipeline(text, strictConfigPath, `cst:json:jsonl`, redactions);
     }
     // ── RULE 5: Terminal / MCP / Catch-All ─────────────────────────────
     // Try to detect structured content in MCP/terminal output
@@ -260,9 +283,6 @@ async function routeAndSanitize(text, fileExtension, toolContext) {
         if (detectedLang) {
             return cstPipeline(text, detectedLang, strictConfigPath, `cst:${detectedLang}:detected`, redactions);
         }
-        if (detected === 'xml') {
-            return gitleaksRawScan(text, strictConfigPath, 'gitleaks:xml:detected', redactions);
-        }
         if (detected === 'flat') {
             return gitleaksRawScan(text, strictConfigPath, 'gitleaks:flat:detected', redactions);
         }
@@ -271,22 +291,29 @@ async function routeAndSanitize(text, fileExtension, toolContext) {
     const command = toolContext?.command ?? extractCommandFromInput(toolContext?.toolInput);
     const mode = (0, heuristic_1.classifyTerminalMode)(command, text);
     const configPath = (0, heuristic_1.getConfigPath)(mode, cachedExtensionPath);
-    // Apply truncation guard for large payloads
-    const { text: truncated, wasTruncated } = truncateIfNeeded(text, redactions);
-    return gitleaksRawScan(truncated, configPath, `gitleaks:${mode}`, redactions, wasTruncated);
+    return gitleaksRawScan(text, configPath, `gitleaks:${mode}`, redactions);
 }
 // ────────────────────────────────────────────────────────────────────────────
 // Pipeline Helpers
 // ────────────────────────────────────────────────────────────────────────────
 async function cstPipeline(text, lang, configPath, route, redactions) {
     try {
-        // Pass 1: Gitleaks scans the FULL raw text (all context preserved)
-        const findings = await (0, gitleaksEngine_1.scanWithGitleaks)(text, configPath, cachedBinaryPath);
+        // Parallel: Gitleaks scan + Tree-Sitter parse run simultaneously
+        const [findings, tree] = await Promise.all([
+            (0, gitleaksEngine_1.scanWithGitleaks)(text, configPath, cachedBinaryPath),
+            lang !== 'ini' ? (0, treeSitterEngine_1.parseCST)(text, lang) : Promise.resolve(null),
+        ]);
         if (findings.length === 0) {
+            if (tree) {
+                tree.delete();
+            }
             return { cleanText: text, wasModified: false, route, redactions };
         }
-        // Pass 2: Tree-Sitter verifies each finding is inside a value node
-        const verified = await (0, treeSitterEngine_1.verifyFindings)(text, lang, findings);
+        // Verify findings against CST (uses pre-parsed tree when available)
+        const verified = await (0, treeSitterEngine_1.verifyFindings)(text, lang, findings, tree);
+        if (tree) {
+            tree.delete();
+        }
         if (verified.length === 0) {
             return { cleanText: text, wasModified: false, route, redactions };
         }
@@ -305,21 +332,27 @@ async function cstPipeline(text, lang, configPath, route, redactions) {
         return gitleaksRawScan(text, configPath, `fallback:${route}`, redactions);
     }
 }
-async function gitleaksRawScan(text, configPath, route, redactions, alreadyTruncated = false) {
-    // Apply truncation guard if not already done
-    let current = text;
-    let wasTruncated = alreadyTruncated;
-    if (!alreadyTruncated) {
-        const trunc = truncateIfNeeded(text, redactions);
-        current = trunc.text;
-        wasTruncated = trunc.wasTruncated;
+async function gitleaksRawScan(text, configPath, route, redactions) {
+    // 2 MB hard cap — reject oversized payloads before scanning
+    const byteLen = Buffer.byteLength(text, 'utf-8');
+    if (byteLen > MAX_SCAN_BYTES) {
+        redactions.push('Payload Rejected (>2MB)');
+        return {
+            cleanText: '[SafeChat] Payload too large to scan (>2MB). Content blocked.',
+            wasModified: true,
+            route: `rejected:${route}`,
+            redactions,
+        };
     }
     try {
-        const findings = await (0, gitleaksEngine_1.scanWithGitleaks)(current, configPath, cachedBinaryPath);
-        const result = (0, gitleaksEngine_1.applyMask)(current, findings, exports.MASK);
+        // Scan the FULL text first (scan-then-truncate: no secrets escape via truncation)
+        const findings = await (0, gitleaksEngine_1.scanWithGitleaks)(text, configPath, cachedBinaryPath);
+        const result = (0, gitleaksEngine_1.applyMask)(text, findings, exports.MASK);
         redactions.push(...result.redactions);
+        // THEN truncate the masked output if needed
+        const { text: truncated, wasTruncated } = truncateIfNeeded(result.cleanText, redactions);
         return {
-            cleanText: result.cleanText,
+            cleanText: truncated,
             wasModified: result.wasModified || wasTruncated,
             route,
             redactions,
@@ -327,13 +360,40 @@ async function gitleaksRawScan(text, configPath, route, redactions, alreadyTrunc
     }
     catch (err) {
         console.error(`[SafeChat] Gitleaks scan failed for route ${route}:`, err);
-        // Fail-closed: return text unchanged but log the error
         return {
-            cleanText: current,
-            wasModified: wasTruncated,
+            cleanText: text,
+            wasModified: false,
             route: `error:${route}`,
             redactions,
         };
+    }
+}
+/**
+ * JSONL/NDJSON pipeline: scans full text with Gitleaks once,
+ * then verifies findings per-line using JSON CST.
+ */
+async function jsonlPipeline(text, configPath, route, redactions) {
+    try {
+        const findings = await (0, gitleaksEngine_1.scanWithGitleaks)(text, configPath, cachedBinaryPath);
+        if (findings.length === 0) {
+            return { cleanText: text, wasModified: false, route, redactions };
+        }
+        const verified = await (0, treeSitterEngine_1.verifyJsonlFindings)(text, findings);
+        if (verified.length === 0) {
+            return { cleanText: text, wasModified: false, route, redactions };
+        }
+        const result = (0, gitleaksEngine_1.applyMask)(text, verified, exports.MASK);
+        redactions.push(...result.redactions);
+        return {
+            cleanText: result.cleanText,
+            wasModified: result.wasModified,
+            route,
+            redactions,
+        };
+    }
+    catch (err) {
+        console.warn(`[SafeChat] JSONL pipeline failed, falling back to raw scan:`, err);
+        return gitleaksRawScan(text, configPath, `fallback:${route}`, redactions);
     }
 }
 // ────────────────────────────────────────────────────────────────────────────

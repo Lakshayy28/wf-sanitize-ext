@@ -69,6 +69,9 @@ export function getGitleaksBinary(extensionPath: string): string {
     case 'win32':
       platformDir = 'win-x64';
       break;
+    case 'linux':
+      platformDir = arch === 'arm64' ? 'linux-arm64' : 'linux-x64';
+      break;
     default:
       throw new Error(`[SafeChat] Unsupported platform: ${platform}-${arch}. Supported: darwin-arm64, win32-x64`);
   }
@@ -353,6 +356,11 @@ export function applyMask(
     return { cleanText: text, wasModified: false, redactions: [] };
   }
 
+  // Expand multi-line secret regions (PEM blocks, certificates)
+  for (const region of regions) {
+    expandPemRegion(text, region);
+  }
+
   // Sort descending by start position to replace from end → start (avoids offset drift)
   regions.sort((a, b) => b.start - a.start);
 
@@ -377,4 +385,36 @@ export function applyMask(
   }
 
   return { cleanText: result, wasModified: true, redactions };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Multi-Line Secret Expansion
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Expands a masking region to cover the full PEM/certificate block when
+ * a finding falls inside one. Ensures the entire -----BEGIN...-----END-----
+ * block is masked, not just the detected snippet.
+ */
+function expandPemRegion(text: string, region: { start: number; end: number }): void {
+  // Look behind the region for a -----BEGIN marker
+  const lookStart = Math.max(0, region.start - 200);
+  const lookBehind = text.slice(lookStart, region.end);
+  const beginIdx = lookBehind.lastIndexOf('-----BEGIN');
+
+  if (beginIdx < 0) { return; }
+
+  const absoluteBegin = lookStart + beginIdx;
+  if (absoluteBegin > region.start) { return; } // BEGIN is after region start — not enclosing
+
+  // Expand start to the BEGIN marker
+  region.start = absoluteBegin;
+
+  // Find the corresponding -----END line
+  const endMarker = '-----END';
+  const endIdx = text.indexOf(endMarker, region.end);
+  if (endIdx >= 0) {
+    const lineEnd = text.indexOf('\n', endIdx);
+    region.end = lineEnd >= 0 ? lineEnd + 1 : text.length;
+  }
 }

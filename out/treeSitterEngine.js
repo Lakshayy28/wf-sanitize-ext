@@ -46,13 +46,13 @@ exports.initTreeSitter = initTreeSitter;
 exports.parseCST = parseCST;
 exports.verifyFindingIsValueNode = verifyFindingIsValueNode;
 exports.verifyFindings = verifyFindings;
+exports.verifyJsonlFindings = verifyJsonlFindings;
 const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
 // ────────────────────────────────────────────────────────────────────────────
 // State — Parser & Grammar Cache
 // ────────────────────────────────────────────────────────────────────────────
 let Parser = null;
-let parserInstance = null;
 const grammarCache = new Map();
 let extensionBasePath = '';
 // ────────────────────────────────────────────────────────────────────────────
@@ -73,7 +73,6 @@ async function initTreeSitter(extPath) {
         locateFile: (file) => path.join(grammarsDir, file),
     });
     Parser = P;
-    parserInstance = new P();
 }
 /**
  * Load a language grammar WASM. Cached after first load.
@@ -100,15 +99,23 @@ async function loadGrammar(lang) {
 // ────────────────────────────────────────────────────────────────────────────
 /**
  * Parse text into a CST using the specified grammar.
- * Returns null if parsing fails (caller should fall back to raw scan).
+ * Returns null if parsing fails or lang is 'ini' (uses custom verifier).
+ * Creates a fresh Parser per call for concurrency safety.
  */
 async function parseCST(text, lang) {
-    if (!parserInstance) {
+    if (!Parser) {
         throw new Error('[SafeChat] Tree-Sitter not initialized. Call initTreeSitter() first.');
     }
+    // INI has no WASM grammar — uses custom regex-based verifier
+    if (lang === 'ini') {
+        return null;
+    }
     const grammar = await loadGrammar(lang);
-    parserInstance.setLanguage(grammar);
-    return parserInstance.parse(text);
+    const parser = new Parser(); // Fresh instance: no shared mutable state
+    parser.setLanguage(grammar);
+    const tree = parser.parse(text);
+    parser.delete(); // Tree is independent; parser can be freed
+    return tree;
 }
 // ────────────────────────────────────────────────────────────────────────────
 // Two-Pass Verification — Gitleaks Finding Verifier
@@ -136,8 +143,12 @@ function verifyFindingIsValueNode(root, lang, startIndex, endIndex) {
             return isYamlValuePosition(node, startIndex, endIndex);
         case 'toml':
             return isTomlValuePosition(node, startIndex, endIndex);
+        case 'html':
+            return isXmlValuePosition(node, startIndex, endIndex);
+        case 'bash':
+            return isEnvValuePosition(node, startIndex, endIndex);
         default:
-            return true; // unknown lang → fail-closed
+            return true; // unknown lang or 'ini' → fail-closed
     }
 }
 // ── JSON: Is the node inside a pair's value (not key)? ─────────────────────
@@ -147,6 +158,9 @@ function isJsonValuePosition(node, start, end) {
         if (current.type === 'ERROR') {
             return true;
         } // fail-closed
+        if (current.type === 'comment') {
+            return true;
+        } // mask secrets in comments
         if (current.type === 'pair') {
             const keyNode = current.childForFieldName('key');
             // If the secret is entirely within the key node → it's a key, reject
@@ -172,6 +186,9 @@ function isYamlValuePosition(node, start, end) {
         if (current.type === 'ERROR') {
             return true;
         } // fail-closed
+        if (current.type === 'comment') {
+            return true;
+        } // mask secrets in comments
         if (current.type === 'block_mapping_pair' || current.type === 'flow_pair') {
             const keyNode = current.childForFieldName('key');
             if (keyNode && start >= keyNode.startIndex && end <= keyNode.endIndex) {
@@ -194,6 +211,9 @@ function isTomlValuePosition(node, start, end) {
         if (current.type === 'ERROR') {
             return true;
         } // fail-closed
+        if (current.type === 'comment') {
+            return true;
+        } // mask secrets in comments
         if (current.type === 'pair') {
             // TOML grammar: namedChild(0) = key, namedChild(1) = value
             const keyNode = current.namedChild(0);
@@ -219,6 +239,70 @@ function isTomlValuePosition(node, start, end) {
     }
     return true; // fail-closed
 }
+// ── XML/HTML: Is the node inside element text or attribute value? ───────────
+function isXmlValuePosition(node, start, end) {
+    let current = node;
+    while (current) {
+        if (current.type === 'ERROR') {
+            return true;
+        } // fail-closed
+        if (current.type === 'comment') {
+            return true;
+        } // mask secrets in comments
+        // Tag names and attribute names are structural, not values
+        if (current.type === 'tag_name') {
+            return false;
+        }
+        if (current.type === 'attribute_name') {
+            return false;
+        }
+        // Text content between tags is a value
+        if (current.type === 'text') {
+            return true;
+        }
+        // Attribute values are values
+        if (current.type === 'attribute_value' || current.type === 'quoted_attribute_value') {
+            return true;
+        }
+        // Inside an attribute node — if not the name, it's the value
+        if (current.type === 'attribute') {
+            const nameNode = current.namedChild(0);
+            if (nameNode && start >= nameNode.startIndex && end <= nameNode.endIndex) {
+                return false;
+            }
+            return true;
+        }
+        current = current.parent;
+    }
+    return true; // fail-closed
+}
+// ── Bash/ENV: Is the node inside a variable assignment's value? ────────────
+function isEnvValuePosition(node, start, end) {
+    let current = node;
+    while (current) {
+        if (current.type === 'ERROR') {
+            return true;
+        } // fail-closed
+        if (current.type === 'comment') {
+            return true;
+        } // mask secrets in comments
+        // Variable assignment: first named child is variable_name (key)
+        if (current.type === 'variable_assignment') {
+            const nameNode = current.namedChild(0);
+            if (nameNode && nameNode.type === 'variable_name' &&
+                start >= nameNode.startIndex && end <= nameNode.endIndex) {
+                return false; // It's the key name
+            }
+            return true; // It's the value side
+        }
+        // Bare variable_name outside assignment — structural
+        if (current.type === 'variable_name') {
+            return false;
+        }
+        current = current.parent;
+    }
+    return true; // fail-closed
+}
 // ────────────────────────────────────────────────────────────────────────────
 // Bulk Verification — Filter Gitleaks findings through CST
 // ────────────────────────────────────────────────────────────────────────────
@@ -226,20 +310,30 @@ function isTomlValuePosition(node, start, end) {
  * Parses the text once, then verifies each Gitleaks finding falls inside
  * a value node. Returns only findings whose Secret is in a value position.
  *
+ * Accepts an optional pre-parsed tree (for parallel Gitleaks + parse).
+ * When a pre-parsed tree is provided, the caller is responsible for deleting it.
+ *
  * On CST parse failure: returns ALL findings unfiltered (fail-closed —
  * mask everything rather than leak secrets).
  */
-async function verifyFindings(text, lang, findings) {
+async function verifyFindings(text, lang, findings, preParsedTree) {
     if (findings.length === 0) {
         return [];
     }
-    let tree = null;
-    try {
-        tree = await parseCST(text, lang);
+    // INI: custom regex-based verification (no tree-sitter grammar available)
+    if (lang === 'ini') {
+        return verifyIniFindings(text, findings);
     }
-    catch (err) {
-        console.warn(`[SafeChat] CST parse failed for ${lang} during verification, keeping all findings:`, err);
-        return findings; // fail-closed
+    let tree = preParsedTree ?? null;
+    const ownsTree = !preParsedTree;
+    if (!tree) {
+        try {
+            tree = await parseCST(text, lang);
+        }
+        catch (err) {
+            console.warn(`[SafeChat] CST parse failed for ${lang} during verification, keeping all findings:`, err);
+            return findings; // fail-closed
+        }
     }
     if (!tree) {
         console.warn(`[SafeChat] CST parse returned null for ${lang}, keeping all findings`);
@@ -247,39 +341,168 @@ async function verifyFindings(text, lang, findings) {
     }
     try {
         const root = tree.rootNode;
-        const verified = [];
-        for (const finding of findings) {
-            const secret = finding.Secret;
-            if (!secret || secret.length === 0) {
-                verified.push(finding); // no secret to verify → keep (fail-closed)
-                continue;
-            }
-            // Resolve the secret's byte position in the original text
-            // using the same logic as applyMask in gitleaksEngine.ts
-            const approxByteOffset = (0, gitleaksEngine_1.lineColToByteOffset)(text, finding.StartLine, finding.StartColumn);
-            const approxOffset = (0, gitleaksEngine_1.byteOffsetToCharIndex)(text, approxByteOffset);
-            const secretStart = locateSecret(text, secret, approxOffset);
-            if (secretStart < 0) {
-                // Can't locate the secret in text — keep it anyway (fail-closed)
-                verified.push(finding);
-                continue;
-            }
-            const secretEnd = secretStart + secret.length;
-            if (verifyFindingIsValueNode(root, lang, secretStart, secretEnd)) {
-                verified.push(finding);
-            }
-            // else: finding is in a key/structural position — drop it
-        }
-        tree.delete();
-        return verified;
+        return verifyFindingsCore(text, lang, findings, root);
     }
     catch (err) {
         console.warn(`[SafeChat] CST verification failed for ${lang}, keeping all findings:`, err);
-        if (tree) {
-            tree.delete();
-        }
         return findings; // fail-closed
     }
+    finally {
+        if (ownsTree && tree) {
+            tree.delete();
+        }
+    }
+}
+/**
+ * Core verification loop: checks each finding against a pre-parsed CST root.
+ */
+function verifyFindingsCore(text, lang, findings, root) {
+    const verified = [];
+    for (const finding of findings) {
+        const secret = finding.Secret;
+        if (!secret || secret.length === 0) {
+            verified.push(finding); // no secret to verify → keep (fail-closed)
+            continue;
+        }
+        const approxByteOffset = (0, gitleaksEngine_1.lineColToByteOffset)(text, finding.StartLine, finding.StartColumn);
+        const approxOffset = (0, gitleaksEngine_1.byteOffsetToCharIndex)(text, approxByteOffset);
+        const secretStart = locateSecret(text, secret, approxOffset);
+        if (secretStart < 0) {
+            verified.push(finding); // can't locate → keep (fail-closed)
+            continue;
+        }
+        const secretEnd = secretStart + secret.length;
+        if (verifyFindingIsValueNode(root, lang, secretStart, secretEnd)) {
+            verified.push(finding);
+        }
+        // else: finding is in a key/structural position — drop it
+    }
+    return verified;
+}
+// ── INI: Custom regex-based verification (no WASM grammar exists) ──────────
+function verifyIniFindings(text, findings) {
+    const lines = text.split('\n');
+    let offset = 0;
+    const lineInfos = [];
+    for (const line of lines) {
+        const trimmed = line.trimStart();
+        const info = {
+            offset,
+            isComment: false,
+            isSection: false,
+            valueStart: -1,
+        };
+        if (trimmed.startsWith(';') || trimmed.startsWith('#')) {
+            info.isComment = true;
+        }
+        else if (/^\[.+\]/.test(trimmed)) {
+            info.isSection = true;
+        }
+        else {
+            const eqIdx = line.indexOf('=');
+            if (eqIdx >= 0) {
+                info.valueStart = offset + eqIdx + 1;
+            }
+        }
+        lineInfos.push(info);
+        offset += line.length + 1; // +1 for \n
+    }
+    return findings.filter(finding => {
+        const secret = finding.Secret;
+        if (!secret || secret.length === 0) {
+            return true;
+        } // fail-closed
+        const approxByteOffset = (0, gitleaksEngine_1.lineColToByteOffset)(text, finding.StartLine, finding.StartColumn);
+        const approxOffset = (0, gitleaksEngine_1.byteOffsetToCharIndex)(text, approxByteOffset);
+        const secretStart = locateSecret(text, secret, approxOffset);
+        if (secretStart < 0) {
+            return true;
+        } // fail-closed
+        const lineIdx = finding.StartLine;
+        if (lineIdx < 0 || lineIdx >= lineInfos.length) {
+            return true;
+        } // fail-closed
+        const info = lineInfos[lineIdx];
+        // Comments: mask secrets in comments (fail-closed)
+        if (info.isComment) {
+            return true;
+        }
+        // Section headers: structural, not values
+        if (info.isSection) {
+            return false;
+        }
+        // Key=value: secret in value portion → mask; in key → drop
+        if (info.valueStart >= 0) {
+            return secretStart >= info.valueStart;
+        }
+        return true; // fail-closed
+    });
+}
+// ── JSONL: Per-line JSON CST verification ──────────────────────────────────
+/**
+ * Verifies Gitleaks findings against per-line JSON CST for JSONL/NDJSON files.
+ * Scans the full text with Gitleaks once, then verifies each finding by
+ * parsing only the line it falls on as standalone JSON.
+ */
+async function verifyJsonlFindings(text, findings) {
+    if (findings.length === 0) {
+        return [];
+    }
+    const lines = text.split('\n');
+    // Group findings by line for efficient per-line parsing
+    const byLine = new Map();
+    for (const f of findings) {
+        const arr = byLine.get(f.StartLine) ?? [];
+        arr.push(f);
+        byLine.set(f.StartLine, arr);
+    }
+    const verified = [];
+    for (const [lineNum, lineFindings] of byLine) {
+        const lineText = lines[lineNum];
+        if (!lineText?.trim()) {
+            verified.push(...lineFindings); // fail-closed
+            continue;
+        }
+        let tree = null;
+        try {
+            tree = await parseCST(lineText, 'json');
+        }
+        catch {
+            verified.push(...lineFindings); // fail-closed
+            continue;
+        }
+        if (!tree) {
+            verified.push(...lineFindings); // fail-closed
+            continue;
+        }
+        try {
+            const root = tree.rootNode;
+            for (const finding of lineFindings) {
+                const secret = finding.Secret;
+                if (!secret) {
+                    verified.push(finding);
+                    continue;
+                }
+                // Locate secret within the line text using column hint
+                const idx = lineText.indexOf(secret, Math.max(0, finding.StartColumn - 50));
+                const effectiveIdx = idx >= 0 ? idx : lineText.indexOf(secret);
+                if (effectiveIdx < 0) {
+                    verified.push(finding); // fail-closed
+                    continue;
+                }
+                if (verifyFindingIsValueNode(root, 'json', effectiveIdx, effectiveIdx + secret.length)) {
+                    verified.push(finding);
+                }
+            }
+        }
+        catch {
+            verified.push(...lineFindings); // fail-closed
+        }
+        finally {
+            tree.delete();
+        }
+    }
+    return verified;
 }
 /**
  * Locate the exact character offset of a secret string near an approximate

@@ -19,7 +19,7 @@ export type TerminalMode = 'debug' | 'strict';
 // ────────────────────────────────────────────────────────────────────────────
 
 /** Commands that produce test/debug output — use lenient scanning */
-const DEBUG_COMMAND_PATTERNS = /\b(?:npm\s+(?:test|run\s+test)|jest|pytest|mocha|vitest|make\b|cargo\s+test|go\s+test|dotnet\s+test|mvn\s+test|gradle\s+test|rspec|phpunit)\b/i;
+const DEBUG_COMMAND_PATTERNS = /\b(?:npm\s+(?:test|run\s+(?:test|spec|e2e|integration|coverage))|jest|pytest|mocha|vitest|make\b|cargo\s+test|go\s+test|dotnet\s+test|mvn\s+test|gradle\s+test|rspec|phpunit|bun\s+test|deno\s+test|playwright|cypress|nyc|c8|istanbul|tap|ava|jasmine|karma|qunit|prove|ctest|gtest)\b/i;
 
 /** Output patterns indicating test/debug context */
 const DEBUG_OUTPUT_PATTERNS = /(?:^|\n)\s*(?:PASS|FAIL|ERROR|Tests?:\s|✓|✗|✘|✔|Traceback|at\s+\S+\s+\(|assert(?:ion)?(?:Error)?|expect\(|describe\(|it\(|test\(|Test Suite|Test Results|PASSED|FAILED|Error:|Stack trace:)/i;
