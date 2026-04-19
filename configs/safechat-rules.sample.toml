@@ -1,0 +1,312 @@
+# =============================================================================
+# safechat-rules.toml — User-Supplied Gitleaks Rule Overrides
+# =============================================================================
+#
+# HOW TO USE
+# ──────────
+# 1. Copy this file to your workspace root and rename it: safechat-rules.toml
+# 2. Uncomment or add rules for the secret patterns you care about.
+# 3. Save the file — @safechat hot-reloads it automatically (no restart needed).
+#
+# WHAT THIS FILE DOES
+# ───────────────────
+# @safechat uses Gitleaks to scan files you share with Copilot. By default it
+# ships with ~160 built-in rules + 26 SafeChat custom rules. This file lets you
+# EXTEND that coverage with org-specific or industry-specific patterns without
+# modifying the extension itself.
+#
+# KEY GITLEAKS TOML CONCEPTS
+# ──────────────────────────
+#  [[rules]]          — add a new detection rule
+#  id                 — unique identifier (used in reports and logs)
+#  description        — human-readable label
+#  regex              — Go RE2 regex; the full match (or secretGroup) is redacted
+#  secretGroup        — capture group index to redact (default: full match)
+#  entropy            — minimum Shannon entropy (float, e.g. 3.5) — filters
+#                       low-entropy placeholders like "changeme" or "example"
+#  keywords           — fast pre-filter; rule only runs if keyword appears in
+#                       the surrounding ~250 chars (much faster than regex alone)
+#  tags               — arbitrary labels for grouping / filtering
+#  [[rules.allowlists]] — per-rule exclusions (regex, path, or stopword-based)
+#  [[allowlists]]     — global exclusions applied to ALL rules
+#
+# ENTROPY GUIDE
+# ─────────────
+#  No entropy check  → catches everything matching the regex (may be noisy)
+#  entropy = 3.0     → filters very low entropy (e.g. "aaaaaaa", "1234567")
+#  entropy = 3.5     → recommended for generic credentials (filters placeholders)
+#  entropy = 4.0     → high bar — only catches very random-looking values
+#
+# IMPORTANT — this file uses [extend] useDefault = true, which means Gitleaks
+# inherits ALL built-in rules from the bundled binary. Your rules are additive.
+# =============================================================================
+
+title = "SafeChat User Custom Rules"
+
+[extend]
+# Inherit all default Gitleaks rules (~160+) from the bundled binary.
+# Your [[rules]] entries below extend on top of these.
+useDefault = true
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1 — Internal / Proprietary Tokens
+# Copy and adapt these for your org's internal token formats.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Example: internal service tokens that follow a fixed prefix pattern
+# [[rules]]
+# id          = "myorg-service-token"
+# description = "MyOrg Internal Service Token"
+# regex       = '''\bmyorg_svc_[A-Za-z0-9]{32,}\b'''
+# tags        = ["internal", "api"]
+
+# Example: internal CI/CD deploy tokens
+# [[rules]]
+# id          = "myorg-deploy-token"
+# description = "MyOrg Deployment Token"
+# regex       = '''(?i)deploy[_-]?token\s*[:=]\s*["']?([A-Za-z0-9\-_]{24,})["']?'''
+# secretGroup = 1
+# entropy     = 3.5
+# tags        = ["internal", "ci"]
+
+# Example: internal user session tokens (base64url, 64+ chars)
+# [[rules]]
+# id          = "myorg-session-token"
+# description = "MyOrg Session Token"
+# regex       = '''sess_[A-Za-z0-9_\-]{48,}'''
+# tags        = ["internal", "auth"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2 — Database Credentials
+# ─────────────────────────────────────────────────────────────────────────────
+
+# MySQL / MariaDB connection string password
+# [[rules]]
+# id          = "mysql-uri-password"
+# description = "MySQL connection URI with embedded password"
+# regex       = '''mysql(?:2|\+srv)?:\/\/[^:\s@]+:([^:@\s]{8,})@'''
+# secretGroup = 1
+# entropy     = 3.0
+# tags        = ["database", "mysql"]
+
+# Redis connection string with auth password
+# [[rules]]
+# id          = "redis-uri-password"
+# description = "Redis connection URI with embedded password"
+# regex       = '''redis(?:s)?:\/\/[^:\s@]*:([^:@\s]{8,})@'''
+# secretGroup = 1
+# entropy     = 3.0
+# tags        = ["database", "redis"]
+
+# MongoDB connection string with embedded password
+# [[rules]]
+# id          = "mongodb-uri-password"
+# description = "MongoDB connection URI with embedded password"
+# regex       = '''mongodb(?:\+srv)?:\/\/[^:\s@]+:([^:@\s]{8,})@'''
+# secretGroup = 1
+# entropy     = 3.0
+# tags        = ["database", "mongodb"]
+
+# Generic DSN / ODBC password field
+# [[rules]]
+# id          = "dsn-password"
+# description = "ODBC / DSN connection string password"
+# regex       = '''(?i)(?:PWD|Password)\s*=\s*([^;{}\r\n]{8,})'''
+# secretGroup = 1
+# entropy     = 3.5
+# tags        = ["database", "dsn"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3 — Cloud Provider Extras
+# ─────────────────────────────────────────────────────────────────────────────
+
+# AWS Session Token (temporary STS credentials — longer than access keys)
+# [[rules]]
+# id          = "aws-session-token"
+# description = "AWS STS Session Token"
+# regex       = '''(?i)(?:aws_session_token|session_token)\s*[:=]\s*["']?([A-Za-z0-9/+=]{100,})["']?'''
+# secretGroup = 1
+# tags        = ["cloud", "aws"]
+
+# Azure SAS Token (Shared Access Signature)
+# [[rules]]
+# id          = "azure-sas-token"
+# description = "Azure Storage SAS Token"
+# regex       = '''(?i)(?:sig|signature)\s*=\s*([A-Za-z0-9%+/]{40,}={0,2})(?:&|$|\s)'''
+# secretGroup = 1
+# tags        = ["cloud", "azure"]
+
+# GCP OAuth2 Refresh Token
+# [[rules]]
+# id          = "gcp-oauth-refresh-token"
+# description = "GCP OAuth2 Refresh Token"
+# regex       = '''\b1\/\/[A-Za-z0-9_\-]{50,}\b'''
+# tags        = ["cloud", "gcp"]
+
+# DigitalOcean Personal Access Token
+# [[rules]]
+# id          = "digitalocean-pat"
+# description = "DigitalOcean Personal Access Token"
+# regex       = '''\bdop_v1_[A-Za-z0-9]{64}\b'''
+# tags        = ["cloud", "digitalocean"]
+
+# Cloudflare API Token
+# [[rules]]
+# id          = "cloudflare-api-token"
+# description = "Cloudflare API Token"
+# regex       = '''\b[A-Za-z0-9_\-]{40}(?:[A-Za-z0-9_\-]{0,8})\b'''
+# entropy     = 4.0
+# keywords    = ["cloudflare", "cf_token", "CF_API_TOKEN"]
+# tags        = ["cloud", "cloudflare"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4 — Communication & Productivity APIs
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Discord Bot Token
+# [[rules]]
+# id          = "discord-bot-token"
+# description = "Discord Bot Token"
+# regex       = '''\b[MNO][A-Za-z0-9_\-]{23,25}\.[A-Za-z0-9_\-]{6}\.[A-Za-z0-9_\-]{27,}\b'''
+# tags        = ["api", "comms"]
+
+# Telegram Bot Token
+# [[rules]]
+# id          = "telegram-bot-token"
+# description = "Telegram Bot HTTP API Token"
+# regex       = '''\b\d{8,10}:[A-Za-z0-9_\-]{35,}\b'''
+# tags        = ["api", "comms"]
+
+# Twilio Auth Token (paired with Account SID)
+# [[rules]]
+# id          = "twilio-auth-token"
+# description = "Twilio Auth Token"
+# regex       = '''(?i)(?:twilio[_-]?auth[_-]?token|TWILIO_AUTH_TOKEN)\s*[:=]\s*["']?([a-f0-9]{32})["']?'''
+# secretGroup = 1
+# tags        = ["api", "comms"]
+
+# Mailgun API Key
+# [[rules]]
+# id          = "mailgun-api-key"
+# description = "Mailgun API Key"
+# regex       = '''\bkey-[A-Za-z0-9]{32}\b'''
+# tags        = ["api", "email"]
+
+# Postmark Server Token
+# [[rules]]
+# id          = "postmark-server-token"
+# description = "Postmark Server API Token"
+# regex       = '''\b[A-Fa-f0-9]{8}-(?:[A-Fa-f0-9]{4}-){3}[A-Fa-f0-9]{12}\b'''
+# entropy     = 3.5
+# keywords    = ["postmark", "POSTMARK_API_TOKEN", "postmark_token"]
+# tags        = ["api", "email"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5 — Observability & Infrastructure
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Datadog API Key
+# [[rules]]
+# id          = "datadog-api-key"
+# description = "Datadog API Key"
+# regex       = '''(?i)(?:datadog[_-]?api[_-]?key|DD_API_KEY)\s*[:=]\s*["']?([A-Za-z0-9]{32})["']?'''
+# secretGroup = 1
+# tags        = ["api", "observability"]
+
+# Splunk HTTP Event Collector Token
+# [[rules]]
+# id          = "splunk-hec-token"
+# description = "Splunk HTTP Event Collector Token"
+# regex       = '''(?i)(?:splunk[_-]?(?:hec[_-]?)?token|HEC_TOKEN)\s*[:=]\s*["']?([A-Fa-f0-9]{8}-(?:[A-Fa-f0-9]{4}-){3}[A-Fa-f0-9]{12})["']?'''
+# secretGroup = 1
+# tags        = ["api", "observability"]
+
+# PagerDuty Integration Key
+# [[rules]]
+# id          = "pagerduty-integration-key"
+# description = "PagerDuty Events API Integration Key"
+# regex       = '''\b[A-Za-z0-9+/]{32}\b'''
+# entropy     = 4.2
+# keywords    = ["pagerduty", "PAGERDUTY_KEY", "pd_routing_key", "routing_key"]
+# tags        = ["api", "observability"]
+
+# Grafana Cloud API Key
+# [[rules]]
+# id          = "grafana-cloud-token"
+# description = "Grafana Cloud API Token"
+# regex       = '''\bglc_[A-Za-z0-9+/]{32,}(?:={0,2})\b'''
+# tags        = ["api", "observability"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 — Payment & Financial
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Braintree API Keys
+# [[rules]]
+# id          = "braintree-access-token"
+# description = "Braintree Gateway Access Token"
+# regex       = '''\baccess_token\$production\$[A-Za-z0-9]{16}\$[A-Za-z0-9]{32}\b'''
+# tags        = ["api", "payments"]
+
+# Square Access Token
+# [[rules]]
+# id          = "square-access-token"
+# description = "Square OAuth Access Token"
+# regex       = '''\bEAA[A-Za-z0-9]{60,}\b'''
+# tags        = ["api", "payments"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7 — Security & Cryptography
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Symmetric encryption key (hex-encoded AES-128 or AES-256)
+# [[rules]]
+# id          = "aes-hex-key"
+# description = "AES encryption key (hex-encoded, 32 or 64 chars)"
+# regex       = '''(?i)(?:aes[_-]?key|encryption[_-]?key|symmetric[_-]?key)\s*[:=]\s*["']?([A-Fa-f0-9]{32}(?:[A-Fa-f0-9]{32})?)["']?'''
+# secretGroup = 1
+# entropy     = 3.8
+# tags        = ["crypto", "key"]
+
+# HMAC secret
+# [[rules]]
+# id          = "hmac-secret"
+# description = "HMAC signing secret"
+# regex       = '''(?i)(?:hmac[_-]?secret|signing[_-]?(?:key|secret)|webhook[_-]?secret)\s*[:=]\s*["']?([A-Za-z0-9+/=_\-]{24,})["']?'''
+# secretGroup = 1
+# entropy     = 3.5
+# tags        = ["crypto", "hmac"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8 — Global Allowlists
+# Rules in this section suppress false positives across ALL rules.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# [[allowlists]]
+# description = "Organization-specific false positive suppressions"
+# regexTarget = "match"
+# regexes = [
+#   # Suppress known-safe placeholder values your team uses in dev configs
+#   '''(?i)your[_-]?(?:api[_-]?key|token|secret|password)''',
+#   # Suppress CI/CD environment variable references (not actual values)
+#   '''\$\{[A-Z_]+\}''',
+#   '''\$\([A-Z_]+\)''',
+#   # Suppress template/documentation examples
+#   '''(?i)(?:example|placeholder|replace[-_]this|todo[-_]replace)''',
+# ]
+
+# Path-based allowlist — never flag secrets in these paths/files
+# [[allowlists]]
+# description = "Ignore generated and fixture directories"
+# paths = [
+#   '''(?i)(?:^|/)(?:fixtures?|mocks?|stubs?|fake|generated|snapshots?)(?:/|$)''',
+#   '''(?i)\.sample\.(toml|yaml|json|env)$''',
+# ]

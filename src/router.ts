@@ -126,6 +126,13 @@ export function updateConfig(config: any) {
 
 let cachedExtensionPath = '';
 let cachedBinaryPath = '';
+let cachedUserConfigPath = '';
+
+/** Called by extension.ts when the user drops/updates safechat-rules.toml in the workspace root. */
+export function setUserConfigPath(p: string): void {
+  cachedUserConfigPath = p;
+  console.log(`[SafeChat] User Gitleaks config ${p ? `loaded: ${p}` : 'cleared — using bundled strict.toml'}`);
+}
 
 /**
  * Initialize the router. Must be called once during extension activation.
@@ -264,7 +271,7 @@ export async function routeAndSanitize(
     return { cleanText: text, wasModified: false, route: 'bypass:code', redactions };
   }
 
-  const strictConfigPath = getConfigPath('strict', cachedExtensionPath);
+  const strictConfigPath = cachedUserConfigPath || getConfigPath('strict', cachedExtensionPath);
 
   // ── RULE 2: Flat Files → Gitleaks Raw Scan ─────────────────────────
   if (FLAT_EXTENSIONS.has(ext)) {

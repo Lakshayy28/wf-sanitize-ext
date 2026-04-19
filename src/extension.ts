@@ -7,7 +7,7 @@ import * as vscode from 'vscode';
 import * as yaml from 'yaml';
 import * as fs from 'fs';
 import * as path from 'path';
-import { routeAndSanitize, MASK, updateConfig, initRouter, type ToolContext } from './router';
+import { routeAndSanitize, MASK, updateConfig, initRouter, setUserConfigPath, type ToolContext } from './router';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Permanent Disk Logging
@@ -215,8 +215,20 @@ export async function activate(context: vscode.ExtensionContext) {
     console.log('[SafeChat] safechat.yml deleted. Reverting to base config.');
     updateConfig(null);
   });
-
   context.subscriptions.push(watcher);
+
+  // ── User-supplied Gitleaks rule overrides (safechat-rules.toml) ────────────
+  async function loadUserRules() {
+    const uris = await vscode.workspace.findFiles('safechat-rules.toml', '**/node_modules/**', 1);
+    setUserConfigPath(uris.length > 0 ? uris[0].fsPath : '');
+  }
+  await loadUserRules();
+
+  const rulesWatcher = vscode.workspace.createFileSystemWatcher('**/safechat-rules.toml');
+  rulesWatcher.onDidChange(() => loadUserRules());
+  rulesWatcher.onDidCreate(() => loadUserRules());
+  rulesWatcher.onDidDelete(() => setUserConfigPath(''));
+  context.subscriptions.push(rulesWatcher);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
