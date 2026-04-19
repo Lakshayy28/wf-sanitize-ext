@@ -12,6 +12,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.MASK = void 0;
 exports.updateConfig = updateConfig;
+exports.setUserConfigPath = setUserConfigPath;
 exports.initRouter = initRouter;
 exports.routeAndSanitize = routeAndSanitize;
 const gitleaksEngine_1 = require("./gitleaksEngine");
@@ -111,6 +112,12 @@ function updateConfig(config) {
 // ────────────────────────────────────────────────────────────────────────────
 let cachedExtensionPath = '';
 let cachedBinaryPath = '';
+let cachedUserConfigPath = '';
+/** Called by extension.ts when the user drops/updates safechat-rules.toml in the workspace root. */
+function setUserConfigPath(p) {
+    cachedUserConfigPath = p;
+    console.log(`[SafeChat] User Gitleaks config ${p ? `loaded: ${p}` : 'cleared — using bundled strict.toml'}`);
+}
 /**
  * Initialize the router. Must be called once during extension activation.
  * Sets up Tree-Sitter runtime and resolves Gitleaks binary path.
@@ -231,7 +238,7 @@ async function routeAndSanitize(text, fileExtension, toolContext) {
     if (BYPASS_EXTENSIONS.has(ext)) {
         return { cleanText: text, wasModified: false, route: 'bypass:code', redactions };
     }
-    const strictConfigPath = (0, heuristic_1.getConfigPath)('strict', cachedExtensionPath);
+    const strictConfigPath = cachedUserConfigPath || (0, heuristic_1.getConfigPath)('strict', cachedExtensionPath);
     // ── RULE 2: Flat Files → Gitleaks Raw Scan ─────────────────────────
     if (FLAT_EXTENSIONS.has(ext)) {
         return gitleaksRawScan(text, strictConfigPath, `flat:${ext}`, redactions);

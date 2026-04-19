@@ -240,6 +240,17 @@ async function activate(context) {
         (0, router_1.updateConfig)(null);
     });
     context.subscriptions.push(watcher);
+    // ── User-supplied Gitleaks rule overrides (safechat-rules.toml) ────────────
+    async function loadUserRules() {
+        const uris = await vscode.workspace.findFiles('safechat-rules.toml', '**/node_modules/**', 1);
+        (0, router_1.setUserConfigPath)(uris.length > 0 ? uris[0].fsPath : '');
+    }
+    await loadUserRules();
+    const rulesWatcher = vscode.workspace.createFileSystemWatcher('**/safechat-rules.toml');
+    rulesWatcher.onDidChange(() => loadUserRules());
+    rulesWatcher.onDidCreate(() => loadUserRules());
+    rulesWatcher.onDidDelete(() => (0, router_1.setUserConfigPath)(''));
+    context.subscriptions.push(rulesWatcher);
 }
 // ────────────────────────────────────────────────────────────────────────────
 // The Universal Interceptor
