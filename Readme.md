@@ -12,28 +12,32 @@ SafeChat registers as a VS Code Chat Participant (`@safechat`). When Copilot inv
 
 ```
 Tool result → Extract file extension → Router
-  ├─ Source code (.ts, .py, .go, …)     → BYPASS (no scanning)
-  ├─ Flat files (.env, .sh, .tf, .sql, …) → Gitleaks raw scan → mask
-  ├─ Structured (.json, .yaml, .toml)   → Gitleaks scan → Tree-Sitter CST verification → mask
-  ├─ XML (.xml, .svg, .plist, …)        → Gitleaks raw scan → mask
-  └─ Terminal / MCP / unknown            → Content-type detection → heuristic scan → mask
+  ├─ Source code (.ts, .py, .go, …)        → BYPASS (zero-touch)
+  ├─ Structured JSON/YAML/TOML             → Gitleaks + Tree-Sitter CST (parallel)
+  ├─ XML / SVG / Plist                     → Gitleaks + Tree-Sitter CST (html grammar)
+  ├─ ENV / Shell scripts                   → Gitleaks + Tree-Sitter CST (bash grammar)
+  ├─ INI / CFG                             → Gitleaks + custom INI verifier
+  ├─ JSONL / NDJSON                        → Gitleaks scan + per-line CST verification
+  ├─ Flat / IaC (.sql, .tf, .npmrc, …)     → Gitleaks raw scan → mask
+  └─ Terminal / MCP / unknown              → Content detection → heuristic scan → mask
 ```
 
 ### Two-Pass Verification (Structured Files)
 
 1. **Pass 1 — Gitleaks** scans the **raw unmodified text** so every contextual rule (`password=`, `aws_secret_access_key=`, connection strings) fires correctly.
-2. **Pass 2 — Tree-Sitter** parses the file into a Concrete Syntax Tree and verifies each finding falls inside a **value node** (not a key name or structural element like a YAML anchor or TOML section header).
-3. Only **verified findings** are masked. False positives on key names are dropped.
+2. **Pass 2 — Tree-Sitter** parses the file into a Concrete Syntax Tree and verifies each finding falls inside a **value node** — not a key name, structural header, or YAML anchor.
+3. Only **verified findings** are masked. False positives on key names are silently dropped.
 
-This gives 100% of Gitleaks' pattern context + 100% of Tree-Sitter's structural precision.
+Both passes run **in parallel** via `Promise.all`. Latency cost is `max(gitleaks, parse)` rather than the sum.
 
 ### Fail-Closed Design
 
-- CST parse failure → all Gitleaks findings are kept (mask everything).
-- ERROR nodes in CST → treated as values (mask them).
-- Gitleaks crash → error is logged, text passes through unchanged.
-- Payload > 250KB → truncated at nearest newline before scanning.
-- Gitleaks stdout > 50MB → process killed via SIGKILL.
+- CST parse failure → all Gitleaks findings are kept (mask everything rather than miss anything).
+- `ERROR` nodes in CST → treated as values (mask them; ambiguous parse = unsafe).
+- Gitleaks crash → error is logged; text passes through unchanged rather than corrupt.
+- Payload > 2 MB → rejected entirely before scanning (a safe placeholder is shown).
+- Payload > 250 KB → full text is scanned and masked first, then the output is truncated.
+- Gitleaks stdout > 50 MB → process killed via SIGKILL; findings rejected.
 
 ---
 
@@ -41,10 +45,11 @@ This gives 100% of Gitleaks' pattern context + 100% of Tree-Sitter's structural 
 
 | Component | Role |
 |---|---|
-| **Gitleaks v8** | Secret detection via `--pipe` stdin. ~160 built-in rules + 27 custom `safechat-*` rules. |
-| **Tree-Sitter (WASM)** | CST parsing for JSON, YAML, TOML. Verifies findings are in value positions. |
+| **Gitleaks v8.30.1** | Secret detection via `--pipe` stdin. ~160 built-in rules + 26 custom `safechat-*` rules. |
+| **web-tree-sitter (WASM)** | CST parsing for 5 grammars: JSON, YAML, TOML, HTML/XML, Bash/ENV. Verifies findings are in value positions. |
+| **INI verifier** | Lightweight regex-based key/value splitter for `.ini` and `.cfg` (no WASM grammar needed). |
 | **Router** | Extension-based routing with content-type detection fallback for untyped inputs. |
-| **Heuristic Classifier** | Classifies terminal commands as `debug` (relaxed) or `strict` mode for config selection. |
+| **Heuristic Classifier** | Classifies terminal commands as `debug` (lenient) or `strict` mode for Gitleaks config selection. |
 
 ---
 
@@ -53,17 +58,69 @@ This gives 100% of Gitleaks' pattern context + 100% of Tree-Sitter's structural 
 | Priority | Match | Pipeline |
 |---|---|---|
 | 0 | Tool error messages | Bypass |
-| 1 | Source code (`.ts`, `.py`, `.go`, `.rs`, `.java`, …) | Bypass |
-| 2 | Flat / IaC (`.env`, `.sh`, `.tf`, `.sql`, `.ini`, …) | Gitleaks raw scan |
-| 3 | Structured (`.json`, `.yaml`, `.toml`) | Two-Pass: Gitleaks + CST verification |
-| 4 | XML (`.xml`, `.svg`, `.plist`) | Gitleaks raw scan |
-| 5 | Terminal / MCP / unknown | Content detection → heuristic scan |
+| 1 | Source code (`.ts`, `.py`, `.go`, `.rs`, `.java`, 30+ types) | **Bypass** — zero-touch policy |
+| 2 | Flat / IaC (`.properties`, `.pgpass`, `.netrc`, `.npmrc`, `.sql`, `.tf`, `.hcl`, `.ps1`) | Gitleaks raw scan → mask |
+| 3 | Structured (`.json`, `.yaml`, `.toml`, `.xml`, `.svg`, `.plist`, `.env`, `.sh`, `.ini`, `.cfg`) | **Two-pass: Gitleaks + CST verification** |
+| 4 | JSONL / NDJSON (`.jsonl`, `.ndjson`) | Gitleaks scan + per-line CST |
+| 5 | Terminal / MCP / unknown | Content detection → auto-select pipeline |
+
+### Grammar Coverage
+
+| Grammar | File Types |
+|---------|-----------|
+| JSON | `.json`, `.jsonc`, `.json5` |
+| YAML | `.yaml`, `.yml` |
+| TOML | `.toml` |
+| HTML (xml mode) | `.xml`, `.xsl`, `.xslt`, `.svg`, `.plist` |
+| Bash (env mode) | `.env`, `.sh`, `.bash`, `.zsh`, `.fish` |
+| INI (custom) | `.ini`, `.cfg` |
+
+---
+
+## Extensible Rules via `safechat-rules.toml`
+
+Drop a `safechat-rules.toml` file in your workspace root to add org-specific detection rules. The extension **hot-reloads** it automatically — no restart needed.
+
+```toml
+title = "My Org Custom Rules"
+
+[extend]
+useDefault = true   # inherit all ~160 built-in Gitleaks rules
+
+[[rules]]
+id          = "myorg-service-token"
+description = "Internal Service Token"
+regex       = '''myorg_[0-9a-f]{32}'''
+entropy     = 3.5
+keywords    = ["myorg_"]
+
+[[rules]]
+id          = "myorg-db-password"
+description = "Hardcoded DB password"
+regex       = '''(?i)db_pass(?:word)?\s*=\s*['"]?([A-Za-z0-9!@#$%]{8,})'''
+secretGroup = 1
+entropy     = 3.0
+```
+
+See `configs/safechat-rules.sample.toml` for a fully documented template with examples for tokens, connection strings, private keys, and allowlist patterns.
 
 ---
 
 ## Write Guard
 
-If a tool writes to disk or runs a shell command, SafeChat checks whether the input contains `[MASKED_BY_SAFECHAT]` tokens and emits a warning to prevent masked placeholders from corrupting files or being executed.
+Before any write tool or shell command executes, SafeChat checks whether the input contains `[MASKED_BY_SAFECHAT]` tokens and emits a warning to prevent:
+- Masked placeholders being written to files (corrupting configs)
+- Masked values being passed to shell commands (executing garbled input)
+
+---
+
+## Audit Log
+
+Every sanitization event is written to:
+- **VS Code Output panel** (`SafeChat Audit` channel) — live monitoring
+- **`.safechat/audit.log`** in the workspace root — permanent forensic record
+
+Each entry records the file path, route used, number of secrets caught, and secret type IDs — without logging the actual secret values.
 
 ---
 
@@ -71,36 +128,59 @@ If a tool writes to disk or runs a shell command, SafeChat checks whether the in
 
 ```
 src/
-  extension.ts        — Entry point, chat participant, tool interception
-  router.ts           — Central routing controller
-  gitleaksEngine.ts   — Gitleaks binary spawner, findings parser, masking
-  treeSitterEngine.ts — WASM grammar loader, CST verification engine
-  heuristic.ts        — Terminal command classifier
+  extension.ts          — Entry point, chat participant, tool interception, write-guard
+  router.ts             — 6-rule routing dispatch, pipelines, 2MB cap, scan-then-truncate
+  gitleaksEngine.ts     — Binary spawner, findings parser, PEM region expander, masker
+  treeSitterEngine.ts   — WASM grammar loader, CST walkers (JSON/YAML/TOML/HTML/Bash), INI/JSONL verifiers
+  heuristic.ts          — Terminal command classifier (debug vs strict)
 configs/
-  strict.toml         — Gitleaks config (useDefault + 27 custom rules)
-  testing.toml        — Same + allowlists for test fixtures
+  strict.toml           — Production Gitleaks config (useDefault + 26 safechat-* rules)
+  testing.toml          — Same config + lenient allowlists for test runner output
+  safechat-rules.sample.toml — Template for user-supplied custom rules
 server/
-  darwin-arm64/       — macOS Gitleaks binary
-  win-x64/            — Windows Gitleaks binary
-grammars/
-  tree-sitter.wasm    — Tree-Sitter runtime
+  darwin-arm64/gitleaks — Gitleaks v8.30.1 (macOS Apple Silicon)
+  win-x64/gitleaks.exe  — Gitleaks v8.30.1 (Windows x64)
+grammars/               — WASM grammars (copied from node_modules at compile time)
+  tree-sitter.wasm
   tree-sitter-json.wasm
   tree-sitter-yaml.wasm
+  tree-sitter-toml.wasm
+  tree-sitter-html.wasm
+  tree-sitter-bash.wasm
 ```
 
 ---
 
 ## Usage
 
-Invoke within Copilot Chat:
+Invoke within Copilot Chat using the `@safechat` participant:
 
 ```
 @safechat read the database config
-@safechat check the kubernetes secrets
-@safechat run terraform plan
+@safechat show me the kubernetes secrets manifest
+@safechat run terraform plan and explain the output
+@safechat what's in my .env file?
 ```
 
-All native Copilot tools work unimpeded. SafeChat intercepts results transparently. A shield icon appears in chat when data is masked, showing which route was used.
+All native Copilot tools (file read, run terminal, MCP) work unimpeded. SafeChat intercepts results transparently. When data is masked, a shield notice appears in chat showing which route and grammar were used.
+
+---
+
+## Security Properties
+
+- **No network calls.** Gitleaks runs as a local subprocess. Tree-Sitter runs as WASM in-process.
+- **No disk writes.** Tool output is scanned entirely in memory via stdin pipe.
+- **Temp files** are used only for the Gitleaks JSON report — written to `os.tmpdir()` and deleted immediately after reading.
+- **Source code is never scanned.** Zero-touch bypass is hard-coded for `.ts`, `.py`, `.go`, and 30+ other source extensions.
+- **`[MASKED_BY_SAFECHAT]`** is the only mutation SafeChat ever makes to tool output.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a full technical deep-dive.
+
+---
+
+## Installation
+
+See [INSTALLATION.md](INSTALLATION.md) for step-by-step setup from a fresh clone.
 
 ---
 

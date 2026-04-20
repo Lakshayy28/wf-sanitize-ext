@@ -7,6 +7,12 @@ src/**
 scripts/**
 presidio_server/**
 latest/**
+dist/**
+fixtures/**
+enterprise_regression_fixtures/**
+audit/**
+tests/**
+node_modules/**
 **/*.map
 **/*.ts
 !out/**
@@ -14,6 +20,10 @@ tsconfig.json
 package-extension.sh
 PACKAGING.md
 SETUP.md
+ARCHITECTURE.md
+ARCHITECTURE_REVIEW.md
+walkthrough.md
+red_team_audit.md
 prompts/**
 *.yaml
 *.yml
