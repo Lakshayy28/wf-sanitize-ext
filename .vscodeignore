@@ -25,5 +25,6 @@ ARCHITECTURE_REVIEW.md
 walkthrough.md
 red_team_audit.md
 prompts/**
+safechat.yml
 *.yaml
 *.yml

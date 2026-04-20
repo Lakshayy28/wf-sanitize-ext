@@ -1,0 +1,206 @@
+# safechat.yml — SafeChat Routing Configuration
+#
+# Drop this file in your workspace root. @safechat hot-reloads it automatically.
+# No VS Code restart is needed after saving changes here.
+#
+# PURPOSE
+# ───────
+# This file controls which file extensions are scanned and which pipeline
+# is used. The lists below REPLACE the built-in defaults for that key — they
+# do not merge. To extend the defaults, copy the default list and add your
+# extra extensions.
+#
+# PIPELINE REFERENCE
+# ──────────────────
+#  bypass    — Zero-touch. Not scanned, not logged, not modified.
+#              Use for source code and any file type you fully trust.
+#
+#  cst_json  — Two-pass: Gitleaks + Tree-Sitter JSON grammar.
+#              Masks only secrets in JSON value positions (not key names).
+#
+#  cst_yaml  — Two-pass: Gitleaks + Tree-Sitter YAML grammar.
+#              Masks only secrets in YAML mapping values (not keys or anchors).
+#
+#  cst_toml  — Two-pass: Gitleaks + Tree-Sitter TOML grammar.
+#              Masks only secrets in TOML value positions.
+#
+#  cst_html  — Two-pass: Gitleaks + Tree-Sitter HTML grammar (handles XML too).
+#              Masks secrets in element text content and attribute values.
+#              Used for: .xml, .svg, .plist, .xsl, .xslt
+#
+#  cst_bash  — Two-pass: Gitleaks + Tree-Sitter Bash grammar.
+#              Masks secrets in shell variable assignment values (VAR=secret).
+#              Used for: .env, .sh, .bash, .zsh, .fish
+#
+#  cst_ini   — Two-pass: Gitleaks + lightweight INI key/value verifier.
+#              Masks secrets after the '=' in key=value pairs.
+#              (No WASM grammar — custom regex verifier.)
+#
+#  flat      — Gitleaks raw scan only. No CST verification.
+#              Use for files where every match should be masked regardless
+#              of structural position (e.g. SQL, HCL, PowerShell).
+#
+# NOTE: .jsonl / .ndjson are always handled by the JSONL pipeline
+# (Gitleaks once over full text + per-line CST) and cannot be overridden here.
+# ──────────────────────────────────────────────────────────────────────────────
+
+routing:
+
+  # ── BYPASS ────────────────────────────────────────────────────────────────
+  # Source code and other files that must never be scanned or modified.
+  # These extensions are handled with a strict zero-touch policy.
+  bypass:
+    # TypeScript / JavaScript
+    - .ts
+    - .tsx
+    - .js
+    - .jsx
+    - .mjs
+    - .cjs
+    # Python
+    - .py
+    - .pyw
+    # JVM
+    - .java
+    - .kt
+    - .kts
+    - .scala
+    # Go
+    - .go
+    # Rust
+    - .rs
+    # C / C++
+    - .c
+    - .h
+    - .cpp
+    - .hpp
+    - .cc
+    - .cxx
+    # C#
+    - .cs
+    # Ruby
+    - .rb
+    # PHP
+    - .php
+    # Swift / Objective-C
+    - .swift
+    - .m
+    - .mm
+    # Dart
+    - .dart
+    # Lua
+    - .lua
+    # R
+    - .r
+    - .R
+    # Perl
+    - .pl
+    - .pm
+    # Web frameworks
+    - .vue
+    - .svelte
+    # Protocol definitions
+    - .proto
+    - .graphql
+    - .gql
+    # Add your own bypass extensions below, e.g.:
+    # - .ex        # Elixir
+    # - .exs       # Elixir scripts
+    # - .erl       # Erlang
+    # - .hs        # Haskell
+    # - .clj       # Clojure
+    # - .elm       # Elm
+    # - .zig       # Zig
+    # - .nim       # Nim
+
+  # ── CST: JSON ─────────────────────────────────────────────────────────────
+  # Two-pass Gitleaks + Tree-Sitter JSON grammar.
+  # Secrets in JSON values are masked; false positives on key names are dropped.
+  cst_json:
+    - .json
+    - .jsonc
+    - .json5
+    # Add your own JSON-structured extensions below, e.g.:
+    # - .geojson
+    # - .webmanifest
+    # - .sarif
+
+  # ── CST: YAML ─────────────────────────────────────────────────────────────
+  # Two-pass Gitleaks + Tree-Sitter YAML grammar.
+  # Masks secrets in mapping values; drops false positives on key names.
+  cst_yaml:
+    - .yaml
+    - .yml
+    # Add your own YAML-structured extensions below, e.g.:
+    # - .raml
+
+  # ── CST: TOML ─────────────────────────────────────────────────────────────
+  # Two-pass Gitleaks + Tree-Sitter TOML grammar.
+  cst_toml:
+    - .toml
+    # Add your own TOML-structured extensions below, e.g.:
+    # - .cargo    # non-standard, but some editors use this
+
+  # ── CST: HTML / XML ───────────────────────────────────────────────────────
+  # Two-pass Gitleaks + Tree-Sitter HTML grammar (parses XML too).
+  # Masks secrets in element text content and attribute values.
+  cst_html:
+    - .xml
+    - .xsl
+    - .xslt
+    - .svg
+    - .plist
+    # Add your own XML-structured extensions below, e.g.:
+    # - .kdbx    # KeePass XML
+    # - .csproj  # MSBuild XML project files
+    # - .resx    # .NET resource files
+    # - .wsdl    # Web Service Definition Language
+    # - .wadl    # Web Application Description Language
+
+  # ── CST: Bash / ENV ───────────────────────────────────────────────────────
+  # Two-pass Gitleaks + Tree-Sitter Bash grammar.
+  # Masks secrets in variable assignment values (API_KEY=secret).
+  cst_bash:
+    - .env
+    - .sh
+    - .bash
+    - .zsh
+    - .fish
+    # Add your own shell/env extensions below, e.g.:
+    # - .envrc    # direnv
+    # - .profile
+    # - .bashrc
+    # - .zshrc
+    # - .ksh      # Korn shell
+
+  # ── CST: INI / CFG ────────────────────────────────────────────────────────
+  # Gitleaks + lightweight regex-based INI key/value verifier.
+  # Masks secrets in key=value pairs; drops false positives on [section] headers.
+  cst_ini:
+    - .ini
+    - .cfg
+    # Add your own INI-structured extensions below, e.g.:
+    # - .conf
+    # - .editorconfig
+    # - .flake8
+
+  # ── FLAT (raw Gitleaks scan) ───────────────────────────────────────────────
+  # Gitleaks scan only — no CST verification. Every match is masked.
+  # Use for files where structural false-positive filtering is not needed.
+  flat:
+    - .properties
+    - .pgpass
+    - .netrc
+    - .npmrc
+    - .ps1
+    - .psm1
+    - .sql
+    - .tf
+    - .hcl
+    # Add your own flat-scan extensions below, e.g.:
+    # - .kubeconfig
+    # - .dockercfg
+    # - .rdp
+    # - .ovpn      # OpenVPN config
+    # - .htpasswd
+    # - .authinfo  # Emacs auth-source
